@@ -1,75 +1,150 @@
 """
-In this script, I will verify the correctness of matrix multiplication
-- bfloat16
-- W8A8O8: Weight 8-bit, Activation 8-bit, Output 8-bit
+In this script, we verify the correctness of matmul.
 """
 
-import os 
-import numpy as np
+import os
 import torch
+import torch.nn as nn
 import gemm_cutlass
 from utils import *
+from utils_transformer_int8 import *
 
-device = 'cuda'
-d_type = torch.bfloat16
-tolerance = 5.0
 
-M = 2048
-N = 4096
-K = 8192
-
-# Read list X, W from file 
-MODEL_HUD_FOLDER = "/sciclone/home/tnguyen10/Desktop/LLM_Quantization/model/"
-data = torch.load(f"{MODEL_HUD_FOLDER}/debug_data.pt", map_location="cpu")
-list_X = data['activations']
-list_W = data['weights']
-list_X = [x.detach().cpu().to(torch.float16).numpy() for x in list_X]
-list_W = [w.detach().cpu().to(torch.float16).numpy() for w in list_W]
-
-# Pick an index to test
-for _ in range(5):
-    idx = np.random.randint(0, len(list_X))
-    X_torch = torch.from_numpy(list_X[idx]).to(d_type) 
-    W_torch = torch.from_numpy(list_W[idx]).to(d_type)
-    X = X_torch.to(device)
-    W = W_torch.to(device)
-    print(f"Shape X: {X.shape}")
-    print(f"Load X: {X[:5, :5]}\n")
+class Custom_Matmul(nn.Module):
+    def __init__(self, num_heads=1, max_seq_len=1024):
+        super().__init__()
+        self.num_heads = num_heads
+        self.max_seq_len = max_seq_len
+        
+        if self.num_heads == 1:
+            self.out_observer = MinMaxObserverPerLastDim(max_seq_len=self.max_seq_len)
+            self.register_buffer('scale_out', torch.ones(self.max_seq_len)) 
+            
+        elif self.num_heads > 1:
+            self.out_observer = MinMaxObserverPerLastDim(self.num_heads, self.max_seq_len)
+            self.register_buffer('scale_out', torch.ones(self.num_heads, self.max_seq_len)) 
+        else:
+            raise ValueError(f"num_heads should be >= 1, got {num_heads}")
+        self.is_quantized = False
+        
+    def forward(self, A, scale_A, B, scale_B):
+        """
+        A: (M, K)
+        B: (N, K)
+        C = A @ B^T -> (M, N)
+        """
+        
+        if self.is_quantized == False:
+            if A.dim() == 2:
+                C = torch.matmul(A, B.T)
+                self.out_observer(C)
+            elif A.dim() == 3:
+                C = torch.matmul(A, B.transpose(-1, -2))
+                self.out_observer(C)
+            return C, 1.0
+        else:
+            if A.dim() == 2:
+                seq_len = A.shape[0]
+                
+                scale_A = scale_A[:seq_len].to(torch.float32)
+                scale_B = scale_B[:seq_len].to(torch.float32)
+                scale_out_value = self.scale_out[:seq_len].to(torch.float32)
+                
+                C_int8 = gemm_cutlass.func_int8_matmul_out_int8_three_scale(
+                    A, B, scale_A, scale_B, scale_out_value
+                )
+                return C_int8, scale_out_value
+            elif A.dim() == 3:
+                batch_size, seq_len, _ = A.shape
+                
+                scale_A = scale_A[:, :seq_len].to(torch.float32)
+                scale_B = scale_B[:, :seq_len].to(torch.float32)
+                scale_out_value = self.scale_out[:, :seq_len].to(torch.float32)
+                
+                print(f"Shape of scale_B: {scale_B.shape}")
+                
+                C_int8 = gemm_cutlass.func_int8_matmul_out_int8_three_scale_batched(
+                    A, B, scale_A, scale_B, scale_out_value
+                )
+                return C_int8, scale_out_value
+            else:
+                raise ValueError(f"Unsupported input dimensions: {A.dim()}")
+        
+    def finish_calibration(self):
+        self.scale_out = self.out_observer.get_scale().cuda()
+        self.is_quantized = True
     
-    print(f"Shape W: {W.shape}")
-    print(f"Load W: {W[:5, :5]}\n")
 
-    W_t = W.t().contiguous()
-
-    # 1. True matmul
-    Y_true = torch.matmul(X, W_t)
-
-    # 2. Quantization W8A8O8 
-    X_q, X_scale = quantize_tensor(X)
-    W_q, W_scale = quantize_tensor(W)
-
-    # Assume having output scale via calibration
-    _, Y_true_scale = quantize_tensor(Y_true)
-
-    matmul_scale = (X_scale * W_scale) / Y_true_scale
-    Y_q = gemm_cutlass.func_int8_matmul_output_int8(
-        X_q, W_q, matmul_scale.to(d_type)
-    )
-
-    # Verify correctness
-    Y_deq = Y_q.to(d_type) * Y_true_scale
-
-    if torch.allclose(Y_deq.float(), Y_true.float(), atol=tolerance):
-        print("W8A8O8 MatMul test passed!")
-    else:
-        print("===== [ERROR] W8A8O8 MatMul test failed ======")
-
-    max_diff = torch.max(torch.abs(Y_deq.float() - Y_true.float()))
+if __name__ == "__main__":
+    seq_len = 1024
+    emd_dim = 8192
+    device = 'cuda'
+    d_type = torch.bfloat16
+    
+    # =====================
+    # 1. 2D input
+    print(f"Testing 2D input, with shape ({seq_len}, {emd_dim})")
+    
+    A = torch.randn((seq_len, emd_dim), dtype=d_type, device=device)
+    B = torch.randn((seq_len, emd_dim), dtype=d_type, device=device)
+    
+    matmul_layer = Custom_Matmul(max_seq_len=seq_len).to(device)
+    
+    # 1. Calibration
+    C, _ = matmul_layer(A, 1.0, B, 1.0)
+    
+    # 2. Finish calibration
+    matmul_layer.finish_calibration()
+    
+    # 3. Quantized inference
+    A_int8, scale_A = quantize_row_int8_symmetric_nd(A, scale_dtype=torch.float32)
+    B_int8, scale_B = quantize_row_int8_symmetric_nd(B, scale_dtype=torch.float32)
+    
+    print(f"Shape of scale_A: {scale_A.shape}, dtype: {scale_A.dtype}")
+    print(f"Shape of scale_B: {scale_B.shape}, dtype: {scale_B.dtype}")
+    
+    C_int8, scale_C = matmul_layer(A_int8, scale_A, B_int8, scale_B)
+    
+    C_deq = C_int8.float() * scale_C.unsqueeze(-1)
+    print(f"Shape of output C_deq: {C_deq.shape}, dtype: {C_deq.dtype}")
+    
+    max_diff = torch.max(torch.abs(C - C_deq)).item()
     print(f"Max difference: {max_diff}")
-    mse = torch.mean((Y_true.float() - Y_deq.float()) ** 2)
-    print(f"MSE: {mse:.4f}")
-    print()
-    print(f"Y_true: {Y_true[:5, :5]} \n")
-    print(f"Y_deq: {Y_deq[:5, :5]} \n")
+    mse = torch.mean((C - C_deq) ** 2).item()
+    print(f"MSE: {mse}")
     
-    print("\n\n\n")
+    print(f"Output C (float32): {C[:5, :5]}")
+    print(f"Output C_deq (float32): {C_deq[:5, :5]}\n")
+
+    # =====================
+    # 2. 3D input
+    batch_size = 16
+    print(f"Testing 3D input, with shape ({batch_size}, {seq_len}, {emd_dim})")
+    
+    A = torch.randn((batch_size, seq_len, emd_dim), dtype=d_type, device=device)
+    B = torch.randn((batch_size, seq_len, emd_dim), dtype=d_type, device=device)
+    
+    matmul_layer = Custom_Matmul(num_heads=batch_size, max_seq_len=seq_len).to(device)
+    
+    # 1. Calibration
+    C, _ = matmul_layer(A, 1.0, B, 1.0)
+    
+    # 2. Finish calibration
+    matmul_layer.finish_calibration()
+    
+    # 3. Quantized inference
+    A_int8, scale_A = quantize_row_int8_symmetric_nd(A, scale_dtype=torch.float32)
+    B_int8, scale_B = quantize_row_int8_symmetric_nd(B, scale_dtype=torch.float32)
+    
+    C_int8, scale_C = matmul_layer(A_int8, scale_A, B_int8, scale_B)
+    C_deq = C_int8.float() * scale_C.unsqueeze(-1)
+    
+    max_diff = torch.max(torch.abs(C - C_deq)).item()
+    print(f"Max difference: {max_diff}")
+    mse = torch.mean((C - C_deq) ** 2).item()
+    print(f"MSE: {mse}")
+    
+    print(f"Output C (float32): {C[0, :5, :5]}")
+    print(f"Output C_deq (float32): {C_deq[0, :5, :5]}")
+    
+    

@@ -58,76 +58,138 @@ class PerHeadMinMaxObserver(nn.Module):
         scale = max_abs / qmax
         return scale.clamp(min=1e-8)
     
-    
-class MinMaxObserverPerLastDim(nn.Module):
-    def __init__(self, max_seq_len: int):
-        super().__init__()
-        self.max_seq_len = max_seq_len
-
-        # One value per token position
-        self.register_buffer(
-            "max_val", torch.full((max_seq_len,), -torch.inf)
-        )
-        self.register_buffer(
-            "min_val", torch.full((max_seq_len,),  torch.inf)
-        )
-
-    @torch.no_grad()
-    def forward(self, x):
-        # x: (T, H)
-        T, _ = x.shape
-
-        if T > self.max_seq_len:
-            raise ValueError(f"T={T} exceeds max_seq_len={self.max_seq_len}")
-
-        # token-wise stats over hidden dim
-        cur_max = x.detach().amax(dim=-1)  # (T,)
-        cur_min = x.detach().amin(dim=-1)  # (T,)
-
-        # update only prefix [0:T)
-        self.max_val[:T] = torch.maximum(self.max_val[:T], cur_max)
-        self.min_val[:T] = torch.minimum(self.min_val[:T], cur_min)
-
-        return x
-
-    def get_scale(self, T: int):
-        qmax = 127  # symmetric int8
-        max_abs = torch.maximum(
-            self.max_val[:T].abs(),
-            self.min_val[:T].abs()
-        )
-        return (max_abs / qmax).clamp(min=1e-8)  # (T,)
 
 # class MinMaxObserverPerLastDim(nn.Module):
-#     def __init__(self):
+#     def __init__(self, max_batch: int = 1, max_seq_len: int = 1024, eps: float = 1e-8):
 #         super().__init__()
-#         self.register_buffer("max_val", None)
-#         self.register_buffer("min_val", None)
+#         self.max_batch = max_batch
+#         self.max_seq_len = max_seq_len
+#         self.eps = eps
 
-#     def forward(self, x):
-#         x_detached = x.detach()
+#         # Always store as float32, independent of model compute dtype
+#         self.register_buffer(
+#             "max_val",
+#             torch.full((max_batch, max_seq_len), -torch.inf, dtype=torch.float32),
+#         )
+#         self.register_buffer(
+#             "min_val",
+#             torch.full((max_batch, max_seq_len),  torch.inf, dtype=torch.float32),
+#         )
 
-#         # Reduce over all dims except last
-#         reduce_dims = tuple(range(x_detached.ndim - 1))
-#         current_max = x_detached.amax(dim=reduce_dims)
-#         current_min = x_detached.amin(dim=reduce_dims)
-
-#         if self.max_val is None:
-#             self.max_val = current_max.clone()
-#             self.min_val = current_min.clone()
+#     @torch.no_grad()
+#     def forward(self, x: torch.Tensor):
+#         """
+#         x can be:
+#           - (T, H)      -> treated as B=1
+#           - (B, T, H)   -> true token-wise per batch
+#         We track min/max over the last dim (H).
+#         """
+#         if x.ndim == 2:
+#             T, _ = x.shape
+#             B = 1
+#             # Detach and upcast to float32 for stable stats
+#             xd = x.detach().to(torch.float32).unsqueeze(0)  # (1, T, H)
+#         elif x.ndim == 3:
+#             B, T, _ = x.shape
+#             xd = x.detach().to(torch.float32)               # (B, T, H)
 #         else:
-#             self.max_val = torch.maximum(self.max_val, current_max)
-#             self.min_val = torch.minimum(self.min_val, current_min)
+#             raise ValueError(f"Expected 2D or 3D input, got {x.ndim}D with shape {tuple(x.shape)}")
 
+#         if B > self.max_batch:
+#             raise ValueError(f"B={B} exceeds max_batch={self.max_batch}")
+#         if T > self.max_seq_len:
+#             raise ValueError(f"T={T} exceeds max_seq_len={self.max_seq_len}")
+
+#         # token-wise over hidden dim -> (B, T), in float32
+#         cur_max = xd.amax(dim=-1)  # (B, T)
+#         cur_min = xd.amin(dim=-1)  # (B, T)
+
+#         # update only prefix [0:B, 0:T) in float32 buffers
+#         self.max_val[:B, :T] = torch.maximum(self.max_val[:B, :T], cur_max)
+#         self.min_val[:B, :T] = torch.minimum(self.min_val[:B, :T], cur_min)
+
+#         # Return original x unchanged (keeps original dtype)
 #         return x
 
-#     def get_scale(self):
-#         qmax = 127
-#         max_abs = torch.maximum(self.max_val.abs(), self.min_val.abs())
-#         scale = max_abs / qmax
-#         return scale.clamp(min=1e-8)
+#     @torch.no_grad()
+#     def get_scale(self, B: int | None = None, T: int | None = None, qmax: int = 127) -> torch.Tensor:
+#         """
+#         Returns:
+#           - if max_batch == 1 or B is None:  (T,)      float32 scale
+#           - else:                            (B, T)    float32 scale
+#         """
+#         # Default to full length we've reserved
+#         if T is None:
+#             T = self.max_seq_len
 
+#         # Always do computations in float32
+#         max_val = self.max_val.to(torch.float32)
+#         min_val = self.min_val.to(torch.float32)
 
+#         # Per-token max abs
+#         if self.max_batch == 1 or B is None:
+#             # 2D use-case: we only care about batch 0
+#             max_abs = torch.maximum(max_val[0, :T].abs(), min_val[0, :T].abs())  # (T,)
+#         else:
+#             max_abs = torch.maximum(max_val[:B, :T].abs(), min_val[:B, :T].abs())  # (B, T)
+
+#         scale = (max_abs / float(qmax)).clamp(min=self.eps)  # ensure > 0
+#         # Explicitly ensure float32 output
+#         return scale.to(torch.float32)    
+    
+    
+class MinMaxObserverPerLastDim(nn.Module): 
+    def __init__(self, max_batch=1, max_seq_len=1024): 
+        super().__init__() 
+        self.max_batch = max_batch 
+        self.max_seq_len = max_seq_len 
+        
+        # Always store as (max_batch, max_seq_len) 
+        self.register_buffer("max_val", torch.full((max_batch, max_seq_len), -torch.inf)) 
+        self.register_buffer("min_val", torch.full((max_batch, max_seq_len), torch.inf)) 
+        
+    @torch.no_grad() 
+    def forward(self, x: torch.Tensor): 
+        """ 
+        x can be: - (T, H) -> treated as B=1 - (B, T, H) -> true token-wise per batch 
+        """ 
+        if x.ndim == 2: 
+            T, _ = x.shape 
+            B = 1 
+            xd = x.detach().unsqueeze(0) # (1, T, H) 
+        elif x.ndim == 3: 
+            B, T, _ = x.shape 
+            xd = x.detach() 
+        else: raise ValueError(f"Expected 2D or 3D input, got {x.ndim}D with shape {tuple(x.shape)}") 
+        
+        if B > self.max_batch: 
+            raise ValueError(f"B={B} exceeds max_batch={self.max_batch}") 
+        if T > self.max_seq_len: 
+            raise ValueError(f"T={T} exceeds max_seq_len={self.max_seq_len}") 
+        
+        # token-wise over hidden dim -> (B, T) 
+        cur_max = xd.amax(dim=-1) 
+        cur_min = xd.amin(dim=-1) 
+        
+        # update only prefix [0:B, 0:T) 
+        self.max_val[:B, :T] = torch.maximum(self.max_val[:B, :T], cur_max) 
+        self.min_val[:B, :T] = torch.minimum(self.min_val[:B, :T], cur_min) 
+        return x 
+    
+    def get_scale(self, B=None, T=None): 
+        qmax = 127 # symmetric int8 
+        if T == None: 
+            T = self.max_seq_len 
+        
+        # if input 2D, return (T,) scale; 
+        if self.max_batch == None or self.max_batch == 1: 
+            max_abs = torch.maximum(self.max_val[0, :T].abs(), self.min_val[0, :T].abs()) 
+            return (max_abs / qmax).clamp(min=1e-8) # (T,) 
+        # if input 3D, return (B,T) scale; 
+        max_abs = torch.maximum(self.max_val[:B, :T].abs(), self.min_val[:B, :T].abs()) 
+        return (max_abs / qmax).clamp(min=1e-8) # (B, T)
+    
+    
     
 def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=torch.float32):
     assert head_dim % 2 == 0, "Embedding dimension must be even"

@@ -21,14 +21,14 @@ def quantize_tensor(x, dtype=torch.int8, scale_dtype=torch.float32):
     return x_q, scale.to(scale_dtype)
 
 
-def quantize_tensor_batched(x, dtype=torch.int8):
+def quantize_tensor_batched(x, scale_dtype=torch.float32):
     """
     Quantize a batched tensor and return per-batch scaling factors.
     """
     q_min, q_max = -128, 127  # for int8
     scales = x.abs().amax(dim=[1,2], keepdim=True) / q_max  # (B, 1, 1)
-    x_q = torch.clamp((x / scales).round(), q_min, q_max).to(dtype)
-    return x_q, scales.squeeze()
+    x_q = torch.clamp((x / scales).round(), q_min, q_max).to(torch.int8)
+    return x_q, scales.squeeze().to(scale_dtype)
     
     
 def quantize_row_wise_tensor(mat: torch.Tensor, scale_dtype=torch.bfloat16):
@@ -50,7 +50,10 @@ def quantize_row_wise_tensor(mat: torch.Tensor, scale_dtype=torch.bfloat16):
     return q_mat, scales.to(scale_dtype)
 
 
-def quantize_row_int8_symmetric_nd(mat: torch.Tensor, scale_dtype=torch.float32):
+def quantize_row_int8_symmetric_nd(
+    mat: torch.Tensor, 
+    scale_dtype=torch.float32
+):
     """
     Symmetric int8 quantization per row along the last dimension.
 
@@ -65,6 +68,7 @@ def quantize_row_int8_symmetric_nd(mat: torch.Tensor, scale_dtype=torch.float32)
     """
     assert mat.dim() >= 2, "mat must be at least 2D"
 
+    mat = mat.to(scale_dtype) 
     qmin, qmax = -128, 127
 
     orig_shape = mat.shape          # (..., C)
@@ -85,7 +89,7 @@ def quantize_row_int8_symmetric_nd(mat: torch.Tensor, scale_dtype=torch.float32)
     q_mat_2d = torch.clamp(
         torch.round(mat_2d / scales.unsqueeze(1)),
         qmin,
-        qmax,
+        qmax, 
     ).to(torch.int8)                                    # (num_vecs, C)
 
     # Reshape back

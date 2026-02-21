@@ -18,8 +18,9 @@ device = 'cuda'
 # 1. 2D matrix 
 X = torch.randn(M, K, dtype=dtype, device=device)
 
-W = torch.empty(N, K, dtype=dtype, device=device)
-torch.nn.init.kaiming_normal_(W)
+# W = torch.empty(N, K, dtype=dtype, device=device)
+# torch.nn.init.kaiming_normal_(W)
+W = torch.randn(N, K, dtype=dtype, device=device)
 print("="* 50)
 print(f"1. Shapes - X: {X.shape}, W: {W.shape}")
 

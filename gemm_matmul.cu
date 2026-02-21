@@ -1025,3 +1025,142 @@ torch::Tensor int8_matmul_out_int8_per_row_scale_batched_host(
     return out;
 }
 
+
+
+
+__global__ void three_scale_quantize_kernel(
+    const cutlass::bfloat16_t* __restrict__ input,  // (M,N)
+    const float* __restrict__ row_scale,           // (M,)
+    const float* __restrict__ col_scale,           // (N,)
+    const float* __restrict__ out_scale,           // (M,) 
+    int8_t* __restrict__ output,                   // (M,N)
+    int M,
+    int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = M * N;
+
+    if (idx >= total) return;
+
+    int row = idx / N;
+    int col = idx % N;
+
+    float x = static_cast<float>(input[idx]);
+
+    float scaled = x * row_scale[row] * col_scale[col] / out_scale[row];
+
+    // Round to nearest int and clamp to int8 range
+    int q = __float2int_rn(scaled);
+    q = max(-128, min(127, q));
+
+    output[idx] = static_cast<int8_t>(q);
+}
+
+torch::Tensor int8_matmul_out_int8_three_scale_host(
+    torch::Tensor input,    // INT8
+    torch::Tensor weight,   // INT8
+    torch::Tensor row_scale, // float (M,)
+    torch::Tensor col_scale, // float (N,)
+    torch::Tensor out_scale  // float (M,)
+) {
+    int M = input.size(0);
+    int K = input.size(1);
+    int N = weight.size(0);
+
+    using TileShape = cutlass::gemm::GemmShape<128, 128, 64>;
+    using WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
+    constexpr int kStages = 3;
+
+    auto bf16_out = int8_matmul<TileShape, WarpShape, kStages>(
+        input, weight, 1.0f);
+
+    int M_out = bf16_out.size(0);
+    int N_out = bf16_out.size(1);
+
+    auto output_int8 = torch::empty({M_out, N_out}, torch::dtype(torch::kChar).device(input.device()));
+
+    // Launch the rowwise quantization kernel
+    int threads = 256;
+    int blocks = (M_out * N_out + threads - 1) / threads;
+    three_scale_quantize_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<cutlass::bfloat16_t*>(bf16_out.data_ptr<torch::BFloat16>()),
+        row_scale.data_ptr<float>(),
+        col_scale.data_ptr<float>(),
+        out_scale.data_ptr<float>(),
+        output_int8.data_ptr<int8_t>(),
+        M_out, N_out
+    );
+
+    cudaDeviceSynchronize(); // ensure kernel completes
+
+    return output_int8;
+}
+
+torch::Tensor int8_matmul_out_int8_three_scale_batched_host(
+    torch::Tensor A,
+    torch::Tensor B,  // (batch_size, N, K) 
+    torch::Tensor row_scales,  // (batch_size, M)
+    torch::Tensor col_scales,  // (batch_size, N)
+    torch::Tensor out_scales   // (batch_size, M)
+) {
+    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
+    TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
+    TORCH_CHECK(A.dtype() == torch::kChar,
+                "A must be torch.int8 (kChar)");
+    TORCH_CHECK(B.dtype() == torch::kChar,
+                "B must be torch.int8 (kChar)");
+    
+    TORCH_CHECK(A.dim() == 3, "A must be 3D tensor (batched)");
+    const int64_t batch_size = A.size(0);
+    const int64_t M = A.size(1);
+    const int64_t K = A.size(2);
+
+    bool shared_B = false;
+    int64_t N;  
+    N = B.size(1);
+
+    // row_scales: [batch_size, M] float32
+    TORCH_CHECK(row_scales.dim() == 2, "row_scales must be 2D tensor");
+    TORCH_CHECK(row_scales.size(0) == batch_size &&
+                row_scales.size(1) == M,
+                "row_scales shape must match batch size and M of A");
+    TORCH_CHECK(row_scales.dtype() == torch::kFloat32,
+                "row_scales must be float32");
+
+    // col_scales: [batch_size, N] float32
+    TORCH_CHECK(col_scales.dim() == 2, "col_scales must be 2D tensor");
+    TORCH_CHECK(col_scales.size(0) == batch_size &&
+                col_scales.size(1) == N,
+                "col_scales shape must match batch size and N of B");
+    TORCH_CHECK(col_scales.dtype() == torch::kFloat32,
+                "col_scales must be float32");
+
+    // out_scales: [batch_size, M] float32
+    TORCH_CHECK(out_scales.dim() == 2, "out_scales must be 2D tensor");
+    TORCH_CHECK(out_scales.size(0) == batch_size &&
+                out_scales.size(1) == M,
+                "out_scales shape must match batch size and M of A");
+    TORCH_CHECK(out_scales.dtype() == torch::kFloat32,
+                "out_scales must be float32");
+
+    auto out = torch::empty({batch_size, M, N}, A.options().dtype(torch::kChar));
+
+    for (int64_t b = 0; b < batch_size; ++b) {
+        auto A_b = A.select(0, b).contiguous();  // (M, K)
+        torch::Tensor B_b;
+        if (shared_B) {
+            B_b = B;  // shared weight
+        } else {
+            B_b = B.select(0, b).contiguous();  // (N, K)
+        }
+        auto row_scales_b = row_scales.select(0, b).contiguous();  // (M,)
+        auto col_scales_b = col_scales.select(0, b).contiguous();  // (N,)
+        auto out_scales_b = out_scales.select(0, b).contiguous();  // (M,)
+
+        auto out_b_result = int8_matmul_out_int8_three_scale_host(
+            A_b, B_b, row_scales_b, col_scales_b, out_scales_b);
+
+        out.select(0, b).copy_(out_b_result);
+    }
+    return out;
+}

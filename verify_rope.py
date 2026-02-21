@@ -12,14 +12,15 @@ from utils_transformer_int8 import *
 
 
 class Custom_RoPE(nn.Module):
-    def __init__(self, head_dim, max_seq_len=1024):
+    def __init__(self, num_heads, max_seq_len=1024, head_dim=None):
         super(Custom_RoPE, self).__init__()
+        self.num_heads = num_heads
+        self.max_seq_len = max_seq_len
         self.head_dim = head_dim
-        self.sequence_length = max_seq_len
         
-        self.out_observer = MinMaxObserverPerLastDim()
+        self.out_observer = MinMaxObserverPerLastDim(self.num_heads, self.max_seq_len)
         self.register_buffer('scale_out',\
-                    torch.ones(self.head_dim * self.sequence_length)) 
+                    torch.ones(self.num_heads * self.max_seq_len)) 
         self.is_quantized = False
         
     def forward(self, x, scale_x, 
@@ -51,11 +52,15 @@ class Custom_RoPE(nn.Module):
             return out, 1.0
         else:
             assert x.dtype == torch.int8, "Expected int8 input in quantized mode"
-            Y_int8 = gemm_cutlass.func_apply_rope_int8(x, scale_x.to(torch.float32), \
+            seq_len = x.shape[1]
+            scale_x_value = scale_x[:seq_len].to(torch.float32)
+            scale_out_value = self.scale_out[:seq_len].to(torch.float32)
+            
+            Y_int8 = gemm_cutlass.func_apply_rope_int8(x, scale_x_value, \
                             cos, scale_cos,
                             sin, scale_sin,
-                            self.scale_out.to(torch.float32))
-            return Y_int8, self.scale_out
+                            scale_out_value)
+            return Y_int8, scale_out_value
     
     def finish_calibration(self):
         self.scale_out = self.out_observer.get_scale().to('cuda')
@@ -64,7 +69,7 @@ class Custom_RoPE(nn.Module):
         
 if __name__ == "__main__":
     
-    seq_len = 1024 * 16
+    seq_len = 1024
     head_dim = 128
     num_heads = 32
 
@@ -79,7 +84,8 @@ if __name__ == "__main__":
     print(f"Input shape: {X.shape}, Cos shape: {cos.shape}, Sin shape: {sin.shape}")
     
     # 1. Calibration
-    rope_layer = Custom_RoPE(head_dim)
+    rope_layer = Custom_RoPE(num_heads, max_seq_len=seq_len, head_dim=head_dim)
+    rope_layer = rope_layer.to(device).to(dtype)
     Y, _ = rope_layer(X, 1.0, cos, 1.0, sin, 1.0)
     print(f"Output shape: {Y.shape}")
     print(f"Output sample: {Y[0, :5, :5]} \n")

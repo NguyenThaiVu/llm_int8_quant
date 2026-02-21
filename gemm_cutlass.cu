@@ -192,6 +192,31 @@ torch::Tensor func_int8_matmul_out_int8_per_row_scale_batched(
     return int8_matmul_out_int8_per_row_scale_batched_host(input, weight, scale);
 }
 
+// ================================================================
+// Still Testing and verifying
+// ================================================================
+torch::Tensor func_int8_matmul_out_int8_three_scale(
+    torch::Tensor input,   // INT8 - shape (M, K)
+    torch::Tensor weight,  // INT8 - shape (N, K)
+    torch::Tensor row_scale, 
+    torch::Tensor col_scale,
+    torch::Tensor out_scale
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(input.device());
+    return int8_matmul_out_int8_three_scale_host(input, weight, row_scale, col_scale, out_scale);
+}
+
+torch::Tensor func_int8_matmul_out_int8_three_scale_batched(
+    torch::Tensor input,   // INT8 - shape (B, M, K) 
+    torch::Tensor weight,  // INT8 - shape (B, N, K) or (N, K)
+    torch::Tensor row_scale, // FP32 - shape (B, M, 1) or (M, 1)
+    torch::Tensor col_scale, // FP32 - shape (B, N, 1) or (N, 1)
+    torch::Tensor out_scale  // FP32 - shape (B, M, 1) or (M, 1)
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(input.device());
+    return int8_matmul_out_int8_three_scale_batched_host(input, weight, row_scale, col_scale, out_scale);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_int8_matmul",
         &func_int8_matmul,
@@ -256,4 +281,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_int8_matmul_out_int8_per_row_scale_batched",
         &func_int8_matmul_out_int8_per_row_scale_batched,
         "Batched Int8 MatMul with per-row output scale using CUTLASS (INT8 input/weight, FP32 per-row scale, INT8 output)");
+
+    m.def("func_int8_matmul_out_int8_three_scale",
+        &func_int8_matmul_out_int8_three_scale,
+        "Int8 MatMul with three scales using CUTLASS (INT8 input/weight, BFloat16 per-element scale, INT8 output)");
+    
+    m.def("func_int8_matmul_out_int8_three_scale_batched",
+        &func_int8_matmul_out_int8_three_scale_batched,
+        "Batched Int8 MatMul with three scales using CUTLASS (INT8 input/weight, BFloat16 per-element scale, INT8 output)");
 }

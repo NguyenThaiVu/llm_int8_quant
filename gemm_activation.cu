@@ -34,7 +34,7 @@ __global__ void sigmoid_int8_rowwise_scale2d_kernel(
     const int8_t* __restrict__ input,
     const float* __restrict__ scale_in_row,   // (M,)
     int8_t* __restrict__ output,
-    const float* scale_out_row,
+    const float* __restrict__ scale_out_row,  // (M,)
     int64_t M,
     int64_t N
 ) {
@@ -47,11 +47,14 @@ __global__ void sigmoid_int8_rowwise_scale2d_kernel(
 
         float s_in = scale_in_row[row];
         float s_out = scale_out_row[row];
-        float inv_s_out = 1.0f / s_out;
-        float x = (float)input[i] * s_in;
 
-        float y = 1.0f / (1.0f + __expf(-x));
-        int q = __float2int_rn(y * inv_s_out);
+        // ideally guaranteed > 0
+        float inv_s_out = 1.0f / s_out;
+
+        float x = (float)input[i] * s_in;
+        float y = 1.0f / (1.0f + __expf(-x));   // sigmoid
+
+        int q = __float2int_rn(y * inv_s_out);  // y / s_out
         output[i] = clamp_int8(q);
     }
 }
@@ -76,14 +79,17 @@ torch::Tensor sigmoid_int8_rowwise_2d_cuda(
     int64_t N = input.size(1);
     TORCH_CHECK(scale_in_row.size(0) == M, "scale_in_row must have size M");
     TORCH_CHECK(scale_out_row.size(0) == M, "scale_out_row must have size M");
+
     auto output = torch::empty_like(input);
-    
-    int threads = 256;
 
     int64_t total = M * N;
+    if (total == 0) {
+        return output;
+    }
+
+    int threads = 256;
     int blocks = (int)((total + threads - 1) / threads);
 
-    // optional cap like you did
     int device = input.get_device();
     auto props = at::cuda::getDeviceProperties(device);
     int max_blocks = props->multiProcessorCount * 20;
@@ -100,6 +106,7 @@ torch::Tensor sigmoid_int8_rowwise_2d_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
+
 
 __global__ void sigmoid_int8_rowwise_scale3d_kernel(
     const int8_t* __restrict__ input,
@@ -258,7 +265,7 @@ __global__ void silu_int8_rowwise_3d_kernel(
 torch::Tensor silu_int8_cuda_rowwise(
     torch::Tensor input,      // int8, (M,N) or (B,M,N)
     torch::Tensor scale_in,   // float32, (M,) or (B,M)
-    torch::Tensor scale_out
+    torch::Tensor scale_out   // float32, (M,) or (B,M)
 ) {
     TORCH_CHECK(input.is_cuda(), "input must be CUDA");
     TORCH_CHECK(scale_in.is_cuda(), "scale_in must be CUDA");
