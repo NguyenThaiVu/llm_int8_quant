@@ -4,8 +4,12 @@ import zipfile
 import math
 from datasets import load_dataset
 import re
+import random
+import numpy as np
 import torch
-torch.manual_seed(123)
+random.seed(0)
+np.random.seed(0)
+torch.manual_seed(0)
 import torch.nn as nn
 from torch.nn import functional as F
 from importlib.metadata import version
@@ -35,7 +39,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "8B"  # Options:, "4B", "8B"
+CHOOSE_MODEL = "4B"  # Options:, "4B", "8B"
 
 
 class RMSNorm(nn.Module):
@@ -122,10 +126,6 @@ class GroupedQueryAttention(nn.Module):
         b, num_tokens, _ = x.shape
 
         # 1. QKV projections
-        # queries = self.W_query(x)  # (b, num_tokens, num_heads * head_dim)
-        # keys = self.W_key(x)       # (b, num_tokens, num_kv_groups * head_dim)
-        # values = self.W_value(x)   # (b, num_tokens, num_kv_groups * head_dim)
-        
         # ===== Linear layers with quantization support =====
         original_dtype = x.dtype
         x = x.squeeze(0)  # Remove batch dimension for linear layers
@@ -310,8 +310,8 @@ class TransformerBlock(nn.Module):
         
         self.norm1 = Custom_RMSNorm(max_seq_len = 1024, dim=cfg["emb_dim"]).to(cfg["dtype"])
         
-        self.ff = Custom_FeedForward(cfg).to(cfg["dtype"])
-        # self.ff = FeedForward(cfg)
+        # self.ff = Custom_FeedForward(cfg).to(cfg["dtype"])
+        self.ff = FeedForward(cfg)
         
         # self.norm2 = Custom_RMSNorm(max_seq_len = 1024, dim=cfg["emb_dim"]).to(cfg["dtype"])
         self.norm2 = RMSNorm(cfg["emb_dim"], eps=1e-6)
@@ -330,7 +330,6 @@ class TransformerBlock(nn.Module):
         else:
             x_int8, x_scale = quantize_row_int8_symmetric_nd(x)
             x_int8, x_scale = self.norm1(x_int8, x_scale)
-            
             x = x_int8.to(torch.float32) * x_scale.unsqueeze(-1)
         x = x.unsqueeze(0) # Add batch dimension back
         x = x.to(original_dtype)
@@ -344,22 +343,20 @@ class TransformerBlock(nn.Module):
         x = self.norm2(x)
         
         
-        # x = self.ff(x)
-        # === Feed-forward with quantization support ===
-        original_dtype = x.dtype
-        x = x.squeeze(0)  # Remove batch dimension 
+        x = self.ff(x)
+        # # # === Feed-forward with quantization support ===
+        # original_dtype = x.dtype
+        # x = x.squeeze(0)  # Remove batch dimension 
         
-        if self.is_quantized == False: # float computation
-            x, _ = self.ff(x, 1.0)
-        else:
-            x_int8, x_scale = quantize_row_int8_symmetric_nd(x)
-            out_int8, out_scale = self.ff(x_int8, x_scale)
-            
-            # Dequantization and process
-            x = out_int8.to(torch.float32) * out_scale.unsqueeze(-1)
-        x = x.to(original_dtype)
-        x = x.unsqueeze(0) # Add batch dimension back
-        # ========================================
+        # if self.is_quantized == False: # float computation
+        #     x, _ = self.ff(x, 1.0)
+        # else:
+        #     x_int8, x_scale = quantize_row_int8_symmetric_nd(x)
+        #     out_int8, out_scale = self.ff(x_int8, x_scale)
+        #     x = out_int8.to(torch.float32) * out_scale.unsqueeze(-1)
+        # x = x.unsqueeze(0) # Add batch dimension back
+        # x = x.to(original_dtype)
+        # # # ========================================
         
         x = x + shortcut  # Add the original input back
 
@@ -367,7 +364,7 @@ class TransformerBlock(nn.Module):
 
     def finish_calibration(self):
         self.att.finish_calibration()
-        self.ff.finish_calibration()
+        # self.ff.finish_calibration()
         
         self.norm1.finish_calibration()
         # self.norm2.finish_calibration()
@@ -383,12 +380,10 @@ class Qwen3Model(nn.Module):
         self.trf_blocks = nn.ModuleList(  # ModuleList since Sequential can only accept one input, and we need `x, mask, cos, sin`
             [TransformerBlock(cfg) for _ in range(cfg["n_layers"])]
         )
-
-        # self.final_norm = Custom_RMSNorm(max_seq_len = 1024, dim=cfg["emb_dim"]).to(cfg["dtype"])
-        self.final_norm = RMSNorm(cfg["emb_dim"])
         
         self.is_quantized = False
         
+        self.final_norm = RMSNorm(cfg["emb_dim"])
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
 
         # Reusuable utilities
@@ -416,28 +411,14 @@ class Qwen3Model(nn.Module):
         for block in self.trf_blocks:
             x = block(x, mask, self.cos, self.sin)
         
-        x = self.final_norm(x)
-        # # ===== Normalization Layer =====
-        # original_dtype = x.dtype
-        # x = x.squeeze(0)  # Remove batch dimension
-        # if self.is_quantized == False: # float computation
-        #     x, _ = self.final_norm(x, 1.0)
-        # else:
-        #     x_int8, x_scale = quantize_row_int8_symmetric_nd(x)
-        #     x_int8, x_scale = self.final_norm(x_int8, x_scale)
-            
-        #     x = x_int8.to(torch.float32) * x_scale.unsqueeze(-1)
-        # x = x.unsqueeze(0) # Add batch dimension back
-        # x = x.to(original_dtype)
-        # # ===============================
-        
+        x = self.final_norm(x)        
         logits = self.out_head(x.to(self.cfg["dtype"]))
         return logits
 
     def finish_calibration(self):
         for block in self.trf_blocks:
             block.finish_calibration()
-        # self.final_norm.finish_calibration()
+        
         self.is_quantized = True
     
     
@@ -628,13 +609,6 @@ else:
         add_thinking=False
     )
     
-    
-# Test the tokenizer
-prompt = "Give me a short introduction to large language models."
-
-input_token_ids = tokenizer.encode(prompt)
-text = tokenizer.decode(input_token_ids)
-print(text)
 
 
 def generate_text_basic_stream(model, token_ids, max_new_tokens, eos_token_id=None):
@@ -658,7 +632,6 @@ def get_clean_generated_text(generated_text):
         token_id = token.squeeze(0).tolist()
         text = tokenizer.decode(token_id)
         output_text += text
-    # Post-processing to remove incomplete special tokens at the end
     incomplete_special_token_pattern = re.compile(r"<\|[^>]*?$")
     output_text = re.sub(incomplete_special_token_pattern, "", output_text)
     output_text = output_text.strip()
@@ -667,15 +640,17 @@ def get_clean_generated_text(generated_text):
 
 
 MAX_NEW_TOKENS = 128
+MAX_CONTEXT_TOKENS = 64
 
 list_prompt = ["What is the capital of VietNam?",\
-               "Who is the president of VietNam?",\
-               "Who is Son Goku?",\
-               "Who is Ho Chi Minh?",\
-               "Describe the Iphone 14 Pro Max in detail.",\
-               "Which country has a capital city named Paris?",\
-               "Describe the Chinese New Year festival.",\
-               "Please describe British food in detail.",\
+                "Who is the president of VietNam?",\
+                "Who is Son Goku?",\
+                "Who is Ho Chi Minh?",\
+                "Describe the Iphone 14 Pro Max in detail.",\
+                "Which country has a capital city named Paris?",\
+                "What is the capital of France?",\
+                "Describe the Chinese New Year festival.",\
+                "Please describe British food in detail.",\
                 "Tell me a long story about dragons and knights.",\
                 "Explain the Vietnamese food Pho and how to make it at home."]
 
@@ -694,31 +669,45 @@ for idx, prompt in enumerate(list_prompt):
     print(f"{idx}. Generated response: {reponse} \n")
     
 
-num_samples = 10
+num_samples = 15
 
 samples = load_wikitext2_samples(num_samples)
 print(f"Loaded {len(samples)} samples. Computing perplexity...")
 
-per_text, corpus_ppl = compute_ppl(
+corpus_ppl = compute_ppl(
     model=model,
     tokenizer=tokenizer,           
     texts=samples,
-    context_size=MAX_NEW_TOKENS,
+    context_size=MAX_CONTEXT_TOKENS,
+    max_length=MAX_NEW_TOKENS,  # DEBUGGING
     device=device
 )
 
 print("Corpus PPL (before quantization):", corpus_ppl)    
 
+# ========================================================================
+# Forward pass to collect calibration data for quantization
+print("\nCollecting calibration data for quantization...")
+calibration_samples = load_wikitext2_samples()
+for idx, text in enumerate(calibration_samples):
+    input_token_ids = tokenizer.encode(text)
+    
+    if len(input_token_ids) > MAX_SEQ_LEN:
+        input_token_ids = input_token_ids[:MAX_SEQ_LEN]
+    
+    input_token_ids_tensor = torch.tensor(input_token_ids, device=device).unsqueeze(0)
 
+    with torch.no_grad():
+        _ = model(input_token_ids_tensor)
+        
+model.finish_calibration()
+print(f"[INFO] Finished {len(calibration_samples)} calibration samples.")
 
 # ========================================================================
-# Quantization 
-# Loop through all block and call finish_calibration 
-model.finish_calibration()
+# Quantization mode
     
-print("\n===== Finish calibration. Generated text after quantization: =====\n")
+print("\n===== Generated text after quantization: =====\n")
 list_prompt = ["What is the capital of VietNam?",\
-            "Which country has a capital city named Paris?",\
             "Describe the Chinese New Year festival.",\
             "Explain the Vietnamese food Pho and how to make it at home."]
     
@@ -737,18 +726,12 @@ for idx, prompt in enumerate(list_prompt):
     print(f"{idx}. Generated response: {response_quant} \n")
 
 
-
-num_samples = 10
-
-samples = load_wikitext2_samples(num_samples)
-print(f"Loaded {len(samples)} samples. Computing perplexity...")
-
-
-per_text, corpus_ppl = compute_ppl(
+corpus_ppl = compute_ppl(
     model=model,
     tokenizer=tokenizer,           
     texts=samples,
-    context_size=MAX_NEW_TOKENS,
+    context_size=MAX_CONTEXT_TOKENS,
+    max_length=MAX_NEW_TOKENS,  # DEBUGGING
     device=device
 )
 

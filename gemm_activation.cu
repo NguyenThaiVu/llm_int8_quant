@@ -30,6 +30,12 @@ __device__ __forceinline__ int8_t clamp_int8(int v) {
     return static_cast<int8_t>(v);
 }
 
+/*
+- input: int8 (M,N)
+- scale_in_row: float (M,)
+- output: int8 (M,N)
+- scale_out_row: float (M,)
+*/
 __global__ void sigmoid_int8_rowwise_scale2d_kernel(
     const int8_t* __restrict__ input,
     const float* __restrict__ scale_in_row,   // (M,)
@@ -48,13 +54,10 @@ __global__ void sigmoid_int8_rowwise_scale2d_kernel(
         float s_in = scale_in_row[row];
         float s_out = scale_out_row[row];
 
-        // ideally guaranteed > 0
-        float inv_s_out = 1.0f / s_out;
-
         float x = (float)input[i] * s_in;
         float y = 1.0f / (1.0f + __expf(-x));   // sigmoid
 
-        int q = __float2int_rn(y * inv_s_out);  // y / s_out
+        int q = __float2int_rn(y / s_out);  // y / s_out
         output[i] = clamp_int8(q);
     }
 }
@@ -128,11 +131,10 @@ __global__ void sigmoid_int8_rowwise_scale3d_kernel(
 
         float s_in = scale_in_bm[b * M + row];
         float s_out = scale_out_row[b * M + row];
-        float inv_s_out = 1.0f / s_out;
         float x = (float)input[i] * s_in;
 
         float y = 1.0f / (1.0f + __expf(-x));
-        int q = __float2int_rn(y * inv_s_out);
+        int q = __float2int_rn(y / s_out);
         output[i] = clamp_int8(q);
     }
 }

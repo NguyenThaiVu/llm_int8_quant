@@ -8,34 +8,7 @@ torch.set_printoptions(sci_mode=False)
 from utils import *
 import gemm_cutlass
 from utils_transformer_int8 import MinMaxObserverPerLastDim
-
-class Custom_Sigmoid(torch.nn.Module):
-    def __init__(self, max_seq_len=1024):
-        super(Custom_Sigmoid, self).__init__()
-        self.max_seq_len = max_seq_len
-        self.observer = MinMaxObserverPerLastDim(max_seq_len=max_seq_len)
-        self.is_quantized = False
-        self.register_buffer('scale_y', torch.ones(max_seq_len))  
-
-    def forward(self, x, scale_x):
-        if not self.is_quantized:
-            out = torch.sigmoid(x)
-            self.observer(out)
-            return out, 1.0
-        else:
-            assert x.dtype == torch.int8, "Expected int8 input in quantized mode"
-            
-            seq_len = x.shape[0]
-            scale_x = scale_x[:seq_len].to(torch.float32)
-            scale_y_value = self.scale_y[:seq_len].to(torch.float32)
-            
-            Y_q = gemm_cutlass.func_apply_sigmoid_int8(x, scale_x, scale_y_value)
-            return Y_q, scale_y_value
-        
-    def finish_calibration(self):
-        self.scale_y = self.observer.get_scale().to(self.scale_y.device)
-        self.is_quantized = True
-    
+from utils_layer_int8 import Custom_Sigmoid
     
 if __name__ == "__main__":
     

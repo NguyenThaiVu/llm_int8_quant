@@ -320,11 +320,11 @@ class Custom_SiLU(nn.Module):
 class Custom_FeedForward(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.fc1 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
-        self.fc2 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
-        self.fc3 = Custom_Linear(cfg["hidden_dim"], cfg["emb_dim"], max_seq_len=1024)
-        self.custom_silu = Custom_SiLU(max_length=1024)
-        self.custom_elementwise_mul = Custom_Element_Wise(max_length=1024)
+        self.fc1 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=4096)
+        self.fc2 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=4096)
+        self.fc3 = Custom_Linear(cfg["hidden_dim"], cfg["emb_dim"], max_seq_len=4096)
+        self.custom_silu = Custom_SiLU(max_length=4096)
+        self.custom_elementwise_mul = Custom_Element_Wise(max_length=4096)
         
         self.is_quantized = False
 
@@ -340,8 +340,10 @@ class Custom_FeedForward(nn.Module):
             x_fc1, scale_fc1 = self.fc1(x, scale_x)
             x_fc2, scale_fc2 = self.fc2(x, scale_x)
             x_silu, scale_silu = self.custom_silu(x_fc1, scale_fc1)
-            x, scale_mul = self.custom_elementwise_mul(x_silu, scale_silu, x_fc2, scale_fc2)
-            out, scale_out = self.fc3(x, scale_mul)
+            
+            x_mul, scale_mul = self.custom_elementwise_mul(x_silu, scale_silu, x_fc2, scale_fc2)
+            
+            out, scale_out = self.fc3(x_mul, scale_mul)
             return out, scale_out
         
     def finish_calibration(self):
@@ -351,67 +353,6 @@ class Custom_FeedForward(nn.Module):
         self.custom_elementwise_mul.finish_calibration()
         self.fc3.finish_calibration()
         self.is_quantized = True
-
-
-# class Custom_Matmul(nn.Module):
-#     def __init__(self, num_heads=1, max_seq_len=1024):
-#         super().__init__()
-#         self.num_heads = num_heads
-#         self.max_seq_len = max_seq_len
-        
-#         if self.num_heads == 1:
-#             self.out_observer = MinMaxObserverPerLastDim(max_seq_len=self.max_seq_len)
-#             self.register_buffer('scale_out', torch.ones(self.max_seq_len)) 
-            
-#         elif self.num_heads > 1:
-#             self.out_observer = MinMaxObserverPerLastDim(self.num_heads, self.max_seq_len)
-#             self.register_buffer('scale_out', torch.ones(self.num_heads, self.max_seq_len)) 
-#         else:
-#             raise ValueError(f"num_heads should be >= 1, got {num_heads}")
-#         self.is_quantized = False
-        
-#     def forward(self, A, scale_A, B, scale_B):
-#         """
-#         A: (M, K)
-#         B: (N, K)
-#         C = A @ B^T -> (M, N)
-#         """
-        
-#         if self.is_quantized == False:
-#             if A.dim() == 2:
-#                 C = torch.matmul(A, B.T)
-#                 self.out_observer(C)
-#             elif A.dim() == 3:
-#                 C = torch.matmul(A, B.transpose(-1, -2))
-#                 self.out_observer(C)
-#             return C, 1.0
-#         else:
-#             if A.dim() == 2:
-#                 seq_len = A.shape[0]
-                
-#                 scale_A = scale_A[:seq_len].to(torch.float32)
-#                 scale_B = scale_B
-#                 scale_out_value = self.scale_out[:seq_len].to(torch.float32)
-                
-#                 requant_scale = (scale_A * scale_B) / scale_out_value
-#                 C_int8 = gemm_cutlass.func_int8_matmul_out_int8_per_row_scale(A, B, requant_scale)
-#                 return C_int8, scale_out_value
-#             elif A.dim() == 3:
-#                 batch_size, seq_len, emd_dim = A.shape
-                
-#                 scale_A = scale_A[:, :seq_len].to(torch.float32)
-#                 scale_B = scale_B.to(torch.float32)
-#                 scale_out_value = self.scale_out[:, :seq_len].to(torch.float32)
-                
-#                 requant_scale = (scale_A * scale_B.unsqueeze(-1)) / scale_out_value
-#                 C_int8 = gemm_cutlass.func_int8_matmul_out_int8_per_row_scale_batched(A, B, requant_scale)
-#                 return C_int8, scale_out_value
-#             else:
-#                 raise ValueError(f"Unsupported input dimensions: {A.dim()}")
-        
-#     def finish_calibration(self):
-#         self.scale_out = self.out_observer.get_scale().cuda()
-#         self.is_quantized = True
 
 
 class Custom_Matmul(nn.Module):
