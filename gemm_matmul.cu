@@ -24,6 +24,153 @@
 
 
 using namespace torch::indexing;
+// template <typename TileShape, typename WarpShape, int kStages>
+// torch::Tensor int8_matmul(
+//     torch::Tensor input,   // INT8 - shape (M, K)
+//     torch::Tensor weight,  // INT8 - shape (N, K)
+//     float alpha            // FP32
+// ) {
+//   TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+//   TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+
+//   TORCH_CHECK(input.dtype() == torch::kChar,
+//               "input must be torch.int8 (kChar)");
+//   TORCH_CHECK(weight.dtype() == torch::kChar,
+//               "weight must be torch.int8 (kChar)");
+
+//   TORCH_CHECK(input.dim() == 2 && weight.dim() == 2,
+//               "input and weight must be 2D tensors");
+
+//   auto M = input.size(0);
+//   auto K = input.size(1);
+//   auto N = weight.size(0);  // weight is (N, K)
+
+//   TORCH_CHECK(weight.size(1) == K,
+//               "weight shape must be (N, K) with same K as input");
+
+//   // For int8 Tensor Cores (Sm80, mma shape 16x8x32) K should be multiple of 32
+//   TORCH_CHECK(K % 32 == 0,
+//               "K must be a multiple of 32 for int8 Tensor Core GEMM on SM80");
+
+//   input = input.contiguous();
+//   weight = weight.contiguous();
+
+//   // ---- Align N for epilogue (128-bit BF16 stores ⇒ 8 elements) ----
+//   int64_t N_aligned = ((N + 7) / 8) * 8;
+//   bool padN = (N_aligned != N);
+
+//   // Prepare (possibly padded) weight and output tensors
+//   torch::Tensor weight_used;
+//   torch::Tensor out_full;
+
+//   auto out_options = torch::TensorOptions()
+//                          .dtype(torch::kBFloat16)
+//                          .device(input.device());
+
+//   if (padN) {
+//     // weight_padded: (N_aligned, K), int8
+//     weight_used = torch::zeros({N_aligned, K}, weight.options());
+//     // Copy original weights into first N rows
+//     weight_used.index_put_({Slice(0, N), Slice()}, weight);
+//     // Output: (M, N_aligned)
+//     out_full = torch::empty({M, N_aligned}, out_options);
+//   } else {
+//     weight_used = weight;
+//     out_full = torch::empty({M, N}, out_options);
+//   }
+
+//   using ElementOutput = cutlass::bfloat16_t;
+//   using ElementAccumulator = int32_t;
+//   using ElementComputeEpilogue = float;
+//   using ElementInputA = int8_t;
+//   using ElementInputB = int8_t;
+
+//   using LayoutInputA  = cutlass::layout::RowMajor;
+//   using LayoutInputB  = cutlass::layout::ColumnMajor;
+//   using LayoutOutput  = cutlass::layout::RowMajor;
+
+//   using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
+//       ElementOutput,
+//       128 / cutlass::sizeof_bits<ElementOutput>::value,  // 8 BF16 per access
+//       ElementAccumulator,
+//       ElementComputeEpilogue>;
+
+//   using Gemm = cutlass::gemm::device::Gemm<
+//       ElementInputA,
+//       LayoutInputA,
+//       ElementInputB,
+//       LayoutInputB,
+//       ElementOutput,
+//       LayoutOutput,
+//       ElementAccumulator,
+//       cutlass::arch::OpClassTensorOp,
+//       cutlass::arch::Sm80,
+//       TileShape,
+//       WarpShape,
+//       cutlass::gemm::GemmShape<16, 8, 32>,  // int8 Tensor Core MMA
+//       EpilogueOp,
+//       cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+//       kStages>;
+
+//   // Use aligned N for the actual GEMM
+//   int64_t N_gemm = N_aligned;
+
+//   cutlass::gemm::GemmCoord problem_size(M, N_gemm, K);
+
+//   cutlass::MatrixCoord input_size (M, K);
+//   cutlass::MatrixCoord weight_size(K, N_gemm);
+//   cutlass::MatrixCoord output_size(M, N_gemm);
+
+//   cutlass::TensorRef<ElementInputA, LayoutInputA> input_ref(
+//       reinterpret_cast<ElementInputA*>(input.data_ptr<int8_t>()),
+//       LayoutInputA::packed(input_size));
+
+//   // weight_used is (N_gemm, K) row-major, interpreted as (K, N_gemm) col-major
+//   cutlass::TensorRef<ElementInputB, LayoutInputB> weight_ref(
+//       reinterpret_cast<ElementInputB*>(weight_used.data_ptr<int8_t>()),
+//       LayoutInputB::packed(weight_size));
+
+//   cutlass::TensorRef<ElementOutput, LayoutOutput> out_ref(
+//       reinterpret_cast<ElementOutput*>(out_full.data_ptr<torch::BFloat16>()),
+//       LayoutOutput::packed(output_size));
+
+//   typename Gemm::Arguments arguments{
+//       problem_size,
+//       input_ref,
+//       weight_ref,
+//       out_ref,
+//       out_ref,
+//       {alpha, 0.0f},
+//       1  // batch count
+//   };
+
+//   Gemm gemm_op;
+
+//   size_t workspace_size = Gemm::get_workspace_size(arguments);
+//   cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+
+//   cutlass::Status status = gemm_op.can_implement(arguments);
+//   TORCH_CHECK(status == cutlass::Status::kSuccess,
+//               "CUTLASS GEMM configuration not supported");
+
+//   status = gemm_op.initialize(arguments, workspace.get());
+//   TORCH_CHECK(status == cutlass::Status::kSuccess,
+//               "CUTLASS GEMM initialization failed");
+
+//   auto stream = at::cuda::getCurrentCUDAStream();
+//   status = gemm_op(stream.stream());
+//   TORCH_CHECK(status == cutlass::Status::kSuccess,
+//               "CUTLASS GEMM execution failed");
+
+//   // Slice back to (M, N) if we padded
+//   if (padN) {
+//     auto out = out_full.index({Slice(), Slice(0, N)}).contiguous();
+//     return out;
+//   } else {
+//     return out_full;
+//   }
+// }
+
 template <typename TileShape, typename WarpShape, int kStages>
 torch::Tensor int8_matmul(
     torch::Tensor input,   // INT8 - shape (M, K)
@@ -48,18 +195,20 @@ torch::Tensor int8_matmul(
   TORCH_CHECK(weight.size(1) == K,
               "weight shape must be (N, K) with same K as input");
 
-  // For int8 Tensor Cores (Sm80, mma shape 16x8x32) K should be multiple of 32
-  TORCH_CHECK(K % 32 == 0,
-              "K must be a multiple of 32 for int8 Tensor Core GEMM on SM80");
+  // We will pad K up to a multiple of 32 for int8 Tensor Cores (Sm80, mma 16x8x32)
+  TORCH_CHECK(K > 0, "K must be > 0");
+  int64_t K_gemm = ((K + 31) / 32) * 32;  // padded K used for GEMM
 
   input = input.contiguous();
   weight = weight.contiguous();
 
   // ---- Align N for epilogue (128-bit BF16 stores ⇒ 8 elements) ----
-  int64_t N_aligned = ((N + 7) / 8) * 8;
-  bool padN = (N_aligned != N);
+  int64_t N_gemm = ((N + 7) / 8) * 8;     // padded N for GEMM / epilogue
+  bool padN = (N_gemm != N);
+  bool padK = (K_gemm != K);
 
-  // Prepare (possibly padded) weight and output tensors
+  // Prepare (possibly padded) input, weight, and output tensors
+  torch::Tensor input_used;
   torch::Tensor weight_used;
   torch::Tensor out_full;
 
@@ -67,17 +216,26 @@ torch::Tensor int8_matmul(
                          .dtype(torch::kBFloat16)
                          .device(input.device());
 
-  if (padN) {
-    // weight_padded: (N_aligned, K), int8
-    weight_used = torch::zeros({N_aligned, K}, weight.options());
-    // Copy original weights into first N rows
-    weight_used.index_put_({Slice(0, N), Slice()}, weight);
-    // Output: (M, N_aligned)
-    out_full = torch::empty({M, N_aligned}, out_options);
+  // ---- Pad input along K if needed: (M, K_gemm) ----
+  if (padK) {
+    input_used = torch::zeros({M, K_gemm}, input.options());
+    // Copy original data into first K columns
+    input_used.index_put_({Slice(), Slice(0, K)}, input);
+  } else {
+    input_used = input;
+  }
+
+  // ---- Pad weight along N and/or K: (N_gemm, K_gemm) row-major ----
+  if (padN || padK) {
+    weight_used = torch::zeros({N_gemm, K_gemm}, weight.options());
+    // Copy original weight into the top-left (N x K) block
+    weight_used.index_put_({Slice(0, N), Slice(0, K)}, weight);
   } else {
     weight_used = weight;
-    out_full = torch::empty({M, N}, out_options);
   }
+
+  // Output: (M, N_gemm), will slice back to N if we padded N
+  out_full = torch::empty({M, N_gemm}, out_options);
 
   using ElementOutput = cutlass::bfloat16_t;
   using ElementAccumulator = int32_t;
@@ -112,20 +270,18 @@ torch::Tensor int8_matmul(
       cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
       kStages>;
 
-  // Use aligned N for the actual GEMM
-  int64_t N_gemm = N_aligned;
+  // Use padded M x N_gemm x K_gemm for the actual GEMM
+  cutlass::gemm::GemmCoord problem_size(M, N_gemm, K_gemm);
 
-  cutlass::gemm::GemmCoord problem_size(M, N_gemm, K);
-
-  cutlass::MatrixCoord input_size (M, K);
-  cutlass::MatrixCoord weight_size(K, N_gemm);
-  cutlass::MatrixCoord output_size(M, N_gemm);
+  cutlass::MatrixCoord input_size (M,      K_gemm);
+  cutlass::MatrixCoord weight_size(K_gemm, N_gemm);
+  cutlass::MatrixCoord output_size(M,      N_gemm);
 
   cutlass::TensorRef<ElementInputA, LayoutInputA> input_ref(
-      reinterpret_cast<ElementInputA*>(input.data_ptr<int8_t>()),
+      reinterpret_cast<ElementInputA*>(input_used.data_ptr<int8_t>()),
       LayoutInputA::packed(input_size));
 
-  // weight_used is (N_gemm, K) row-major, interpreted as (K, N_gemm) col-major
+  // weight_used is (N_gemm, K_gemm) row-major, interpreted as (K_gemm, N_gemm) col-major
   cutlass::TensorRef<ElementInputB, LayoutInputB> weight_ref(
       reinterpret_cast<ElementInputB*>(weight_used.data_ptr<int8_t>()),
       LayoutInputB::packed(weight_size));
@@ -162,7 +318,7 @@ torch::Tensor int8_matmul(
   TORCH_CHECK(status == cutlass::Status::kSuccess,
               "CUTLASS GEMM execution failed");
 
-  // Slice back to (M, N) if we padded
+  // Slice back to (M, N) if we padded N
   if (padN) {
     auto out = out_full.index({Slice(), Slice(0, N)}).contiguous();
     return out;
@@ -1097,7 +1253,7 @@ torch::Tensor int8_matmul_out_int8_three_scale_host(
 }
 
 torch::Tensor int8_matmul_out_int8_three_scale_batched_host(
-    torch::Tensor A,
+    torch::Tensor A,  // (batch_size, M, K)
     torch::Tensor B,  // (batch_size, N, K) 
     torch::Tensor row_scales,  // (batch_size, M)
     torch::Tensor col_scales,  // (batch_size, N)

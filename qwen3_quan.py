@@ -39,7 +39,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "4B"  # Options:, "4B", "8B"
+CHOOSE_MODEL = "8B"  # Options:, "4B", "8B"
 
 
 class RMSNorm(nn.Module):
@@ -119,21 +119,59 @@ class GroupedQueryAttention(nn.Module):
         
         self.softmax_layer = Custom_Softmax(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)    
         self.qk_score_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)
+        self.context_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)
     
         self.is_quantized = False
 
     def forward(self, x, mask, cos, sin):
         b, num_tokens, _ = x.shape
+        
+        if self.q_norm == None and self.k_norm is None:
+            raise ValueError(f"Qwen3 uses RMSNorm on Q and K before RoPE.")
 
-        # 1. QKV projections
-        # ===== Linear layers with quantization support =====
         original_dtype = x.dtype
         x = x.squeeze(0)  # Remove batch dimension for linear layers
-        if self.is_quantized == False:
+
+        # Float computation (calibration)
+        if self.is_quantized == False:  
             queries, _ = self.W_query(x, 1.0)
             keys, _ = self.W_key(x, 1.0)
             values, _ = self.W_value(x, 1.0)
-        else:
+            
+            # Reshape and transpose for multi-head attention
+            queries = queries.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
+            keys = keys.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+            values = values.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+            
+            # Apply RMSNorm to Q and K
+            queries, _ = self.q_norm(queries, 1.0)
+            keys, _ = self.k_norm(keys, 1.0)
+            
+            # Apply RoPE to Q and K
+            queries, _ = self.query_rope(queries, 1.0, cos, 1.0, sin, 1.0)
+            keys, _ = self.key_rope(keys, 1.0, cos, 1.0, sin, 1.0)
+            
+            keys = keys.repeat_interleave(self.group_size, dim=0)
+            values = values.repeat_interleave(self.group_size, dim=0)
+            
+            # Attention score 
+            attn_scores, _ = self.qk_score_layer(queries, 1.0, keys, 1.0) 
+            
+            # Softmax the attention scores
+            attn_scores = attn_scores.masked_fill(mask, -torch.inf)
+            attn_scores = attn_scores / (self.head_dim ** 0.5)
+            attn_weights, _ = self.softmax_layer(attn_scores, 1.0)         
+            
+            # Compute context
+            values = values.transpose(1, 2)  # Shape: (num_heads, head_dim, num_tokens)
+            context, _ = self.context_layer(attn_weights, 1.0, values, 1.0)
+            
+            # Compute output
+            context = context.transpose(0, 1).reshape(num_tokens, self.d_out) 
+            out, _ = self.out_proj(context, 1.0)
+            
+        else: 
+            # === Quantized computation ===
             x_int8, x_scale = quantize_row_int8_symmetric_nd(x)
             
             queries_int8, queries_scale = self.W_query(x_int8, x_scale)
@@ -143,128 +181,54 @@ class GroupedQueryAttention(nn.Module):
             queries = queries_int8.to(torch.float32) * queries_scale.unsqueeze(-1)
             keys = keys_int8.to(torch.float32) * keys_scale.unsqueeze(-1)
             values = values_int8.to(torch.float32) * values_scale.unsqueeze(-1)
-        
-        queries = queries.unsqueeze(0) # Add batch dimension back
-        keys = keys.unsqueeze(0)
-        values = values.unsqueeze(0)
-        queries = queries.to(original_dtype)
-        keys = keys.to(original_dtype)
-        values = values.to(original_dtype)
-
-        # 2. Reshape and transpose for multi-head attention
-        queries = queries.view(b, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        keys = keys.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
-        values = values.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
-
-        if self.q_norm:
-            original_dtype = queries.dtype
-            queries = queries.squeeze(0)  # Remove batch dimension for normalization
-            if self.is_quantized == False:
-                queries, _ = self.q_norm(queries, 1.0)
-            else:
-                queries_int8, queries_scale = quantize_row_int8_symmetric_nd(queries)
-                queries_int8, queries_scale = self.q_norm(queries_int8, queries_scale)
-                queries = queries_int8.to(torch.float32) * queries_scale.unsqueeze(-1)
-            queries = queries.unsqueeze(0) # Add batch dimension back
-            queries = queries.to(original_dtype)
             
-        if self.k_norm:            
-            original_dtype = keys.dtype
-            keys = keys.squeeze(0)  # Remove batch dimension for normalization
-            if self.is_quantized == False:
-                keys, _ = self.k_norm(keys, 1.0)
-            else:
-                keys_int8, keys_scale = quantize_row_int8_symmetric_nd(keys)
-                keys_int8, keys_scale = self.k_norm(keys_int8, keys_scale)
-                keys = keys_int8.to(torch.float32) * keys_scale.unsqueeze(-1)
-            keys = keys.unsqueeze(0) # Add batch dimension back
-            keys = keys.to(original_dtype)
+            # # Reshape and transpose for multi-head attention
+            queries = queries.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
+            keys = keys.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+            values = values.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)   
             
-
-        # 3. Apply RoPE        
-        # ===== RoPE with quantization support =====
-        original_dtype = queries.dtype
-        queries = queries.squeeze(0)  # Remove batch dimension 
-        keys = keys.squeeze(0)
-        if self.is_quantized == False:
-            queries, _ = self.query_rope(queries, 1.0, cos, 1.0, sin, 1.0)
-            keys, _ = self.key_rope(keys, 1.0, cos, 1.0, sin, 1.0)
-        else:
+            # Apply RMSNorm to quantized Q and K
             queries_int8, queries_scale = quantize_row_int8_symmetric_nd(queries)
+            queries_int8, queries_scale = self.q_norm(queries_int8, queries_scale)
+            
             keys_int8, keys_scale = quantize_row_int8_symmetric_nd(keys)
+            keys_int8, keys_scale = self.k_norm(keys_int8, keys_scale)
+            
+            # Apply RoPE to quantized Q and K
             cos_int8, cos_scale = quantize_tensor(cos)
             sin_int8, sin_scale = quantize_tensor(sin)
             
             queries_int8, queries_scale = self.query_rope(queries_int8, queries_scale, cos_int8, cos_scale, sin_int8, sin_scale)
             keys_int8, keys_scale = self.key_rope(keys_int8, keys_scale, cos_int8, cos_scale, sin_int8, sin_scale)
             
-            queries = queries_int8.to(torch.float32) * queries_scale.unsqueeze(-1)
-            keys = keys_int8.to(torch.float32) * keys_scale.unsqueeze(-1)
-        queries = queries.unsqueeze(0) # Add batch dimension back
-        keys = keys.unsqueeze(0)
-        queries = queries.to(original_dtype)
-        keys = keys.to(original_dtype)
-        # ========================================
-        
-        # 4. Expand K and V to match number of heads
-        keys = keys.repeat_interleave(self.group_size, dim=1)
-        values = values.repeat_interleave(self.group_size, dim=1)
-
-        # 5. Attention
-        # attn_scores = torch.matmul(queries, keys.transpose(2, 3))
-        
-        # # ===== Attention scores with quantization support =====
-        original_dtype = queries.dtype
-        queries = queries.squeeze(0)  # Remove batch dimension
-        keys = keys.squeeze(0)
-        
-        if self.is_quantized == False:
-            attn_scores, _ = self.qk_score_layer(queries, 1.0, keys, 1.0)
-        else:
-            queries_int8, queries_scale = quantize_row_int8_symmetric_nd(queries)
-            keys_int8, keys_scale = quantize_row_int8_symmetric_nd(keys)
+            # Repeat K and V for grouped attention
+            keys_int8 = keys_int8.repeat_interleave(self.group_size, dim=0)
+            keys_scale = keys_scale.repeat_interleave(self.group_size, dim=0)
+            values = values.repeat_interleave(self.group_size, dim=0)
             
+            # Attention score with quantization    
             attn_scores_int8, attn_scores_scale = self.qk_score_layer(queries_int8, queries_scale, keys_int8, keys_scale)
-            attn_scores = attn_scores_int8.to(torch.float32) * attn_scores_scale.unsqueeze(-1)
-        
-        attn_scores = attn_scores.unsqueeze(0) # Add batch dimension back
-        attn_scores = attn_scores.to(original_dtype)
-        # # ========================================
-        
-        # ===== Softmax with quantization support =====
-        original_dtype = attn_scores.dtype
-        attn_scores = attn_scores.squeeze(0)  # Remove batch dimension for softmax
-        
-        if self.is_quantized == False:
-            attn_scores = attn_scores.masked_fill(mask, -torch.inf)
-            attn_scores = attn_scores / (self.head_dim ** 0.5)
-            attn_weights, _ = self.softmax_layer(attn_scores, 1.0)
-        else:
-            attn_scores_int8, attn_scores_scale = quantize_row_int8_symmetric_nd(attn_scores)
+            
+            # Softmax the attention scores with quantization 
             attn_scores_scale = attn_scores_scale.to(torch.float32) / (self.head_dim ** 0.5)  # Adjust scale for softmax
             attn_weights_int8, attn_weights_scale = self.softmax_layer(attn_scores_int8, attn_scores_scale)
-            attn_weights = attn_weights_int8.to(torch.float32) * attn_weights_scale.unsqueeze(-1)
-        
-        attn_weights = attn_weights.unsqueeze(0) # Add batch dimension back
-        attn_weights = attn_weights.to(original_dtype)   
-        # ======================================= 
-
-        # 6. Output
-        context = (attn_weights @ values).transpose(1, 2).reshape(b, num_tokens, self.d_out)
-        
-        # ===== Output projection with quantization support =====
-        # out = self.out_proj(context)
-        original_dtype = context.dtype
-        context = context.squeeze(0)  # Remove batch dimension for linear layer
-        if self.is_quantized == False:
-            out, _ = self.out_proj(context, 1.0)
-        else:
+            
+            # Compute context with quantization
+            values = values.transpose(1, 2)  # Shape: (num_heads, head_dim, num_tokens)
+            values_int8, values_scale = quantize_row_int8_symmetric_nd(values)
+            
+            context_int8, context_scale = self.context_layer(attn_weights_int8, attn_weights_scale,
+                                                             values_int8, values_scale)
+            context = context_int8.to(torch.float32) * context_scale.unsqueeze(-1)
+            
+            # Compute output with quantization
+            context = context.transpose(0, 1).reshape(num_tokens, self.d_out) 
             context_int8, context_scale = quantize_row_int8_symmetric_nd(context)
             out_int8, out_scale = self.out_proj(context_int8, context_scale)
             out = out_int8.to(torch.float32) * out_scale.unsqueeze(-1)
+        
         out = out.unsqueeze(0) # Add batch dimension back
         out = out.to(original_dtype)
-        # =======================================================
         
         return out
     
@@ -279,6 +243,7 @@ class GroupedQueryAttention(nn.Module):
         self.k_norm.finish_calibration() if self.k_norm is not None else None
         self.softmax_layer.finish_calibration()
         self.qk_score_layer.finish_calibration()
+        self.context_layer.finish_calibration()
         self.is_quantized = True
     
     
@@ -310,8 +275,8 @@ class TransformerBlock(nn.Module):
         
         self.norm1 = Custom_RMSNorm(max_seq_len = 1024, dim=cfg["emb_dim"]).to(cfg["dtype"])
         
-        # self.ff = Custom_FeedForward(cfg).to(cfg["dtype"])
-        self.ff = FeedForward(cfg)
+        self.ff = Custom_FeedForward(cfg).to(cfg["dtype"])
+        # self.ff = FeedForward(cfg)
         
         # self.norm2 = Custom_RMSNorm(max_seq_len = 1024, dim=cfg["emb_dim"]).to(cfg["dtype"])
         self.norm2 = RMSNorm(cfg["emb_dim"], eps=1e-6)
@@ -341,22 +306,22 @@ class TransformerBlock(nn.Module):
         # 2. Shortcut for feed-forward block
         shortcut = x
         x = self.norm2(x)
+
         
+        # x = self.ff(x)
+        # # === Feed-forward with quantization support ===
+        original_dtype = x.dtype
+        x = x.squeeze(0)  # Remove batch dimension 
         
-        x = self.ff(x)
-        # # # === Feed-forward with quantization support ===
-        # original_dtype = x.dtype
-        # x = x.squeeze(0)  # Remove batch dimension 
-        
-        # if self.is_quantized == False: # float computation
-        #     x, _ = self.ff(x, 1.0)
-        # else:
-        #     x_int8, x_scale = quantize_row_int8_symmetric_nd(x)
-        #     out_int8, out_scale = self.ff(x_int8, x_scale)
-        #     x = out_int8.to(torch.float32) * out_scale.unsqueeze(-1)
-        # x = x.unsqueeze(0) # Add batch dimension back
-        # x = x.to(original_dtype)
-        # # # ========================================
+        if self.is_quantized == False: # float computation
+            x, _ = self.ff(x, 1.0)
+        else:
+            x_int8, x_scale = quantize_row_int8_symmetric_nd(x)
+            out_int8, out_scale = self.ff(x_int8, x_scale)
+            x = out_int8.to(torch.float32) * out_scale.unsqueeze(-1)
+        x = x.unsqueeze(0) # Add batch dimension back
+        x = x.to(original_dtype)
+        # # ========================================
         
         x = x + shortcut  # Add the original input back
 
@@ -364,7 +329,7 @@ class TransformerBlock(nn.Module):
 
     def finish_calibration(self):
         self.att.finish_calibration()
-        # self.ff.finish_calibration()
+        self.ff.finish_calibration()
         
         self.norm1.finish_calibration()
         # self.norm2.finish_calibration()
@@ -416,16 +381,18 @@ class Qwen3Model(nn.Module):
         return logits
 
     def finish_calibration(self):
-        for block in self.trf_blocks:
+        # for block in self.trf_blocks:
+        #     block.finish_calibration()
+        
+        # Do not calibrate the last 2 blocks 
+        for block in self.trf_blocks[:-2]:
             block.finish_calibration()
         
         self.is_quantized = True
     
     
 QWEN3_CONFIG = get_model_config(CHOOSE_MODEL)
-
 model = Qwen3Model(QWEN3_CONFIG)
-
 print(model)
 
 if torch.cuda.is_available():
@@ -645,8 +612,6 @@ MAX_CONTEXT_TOKENS = 64
 list_prompt = ["What is the capital of VietNam?",\
                 "Who is the president of VietNam?",\
                 "Who is Son Goku?",\
-                "Who is Ho Chi Minh?",\
-                "Describe the Iphone 14 Pro Max in detail.",\
                 "Which country has a capital city named Paris?",\
                 "What is the capital of France?",\
                 "Describe the Chinese New Year festival.",\
@@ -665,8 +630,8 @@ for idx, prompt in enumerate(list_prompt):
         eos_token_id=tokenizer.eos_token_id
     )
 
-    reponse = get_clean_generated_text(generated_text)
-    print(f"{idx}. Generated response: {reponse} \n")
+    response = get_clean_generated_text(generated_text)
+    print(f"{idx}. Generated response: {response} \n")
     
 
 num_samples = 15
@@ -679,13 +644,12 @@ corpus_ppl = compute_ppl(
     tokenizer=tokenizer,           
     texts=samples,
     context_size=MAX_CONTEXT_TOKENS,
-    max_length=MAX_NEW_TOKENS,  # DEBUGGING
     device=device
 )
 
 print("Corpus PPL (before quantization):", corpus_ppl)    
 
-# ========================================================================
+# # ========================================================================
 # Forward pass to collect calibration data for quantization
 print("\nCollecting calibration data for quantization...")
 calibration_samples = load_wikitext2_samples()
@@ -696,12 +660,11 @@ for idx, text in enumerate(calibration_samples):
         input_token_ids = input_token_ids[:MAX_SEQ_LEN]
     
     input_token_ids_tensor = torch.tensor(input_token_ids, device=device).unsqueeze(0)
-
     with torch.no_grad():
         _ = model(input_token_ids_tensor)
         
 model.finish_calibration()
-print(f"[INFO] Finished {len(calibration_samples)} calibration samples.")
+print(f"[INFO] Finished calibration samples.")
 
 # ========================================================================
 # Quantization mode
@@ -731,7 +694,6 @@ corpus_ppl = compute_ppl(
     tokenizer=tokenizer,           
     texts=samples,
     context_size=MAX_CONTEXT_TOKENS,
-    max_length=MAX_NEW_TOKENS,  # DEBUGGING
     device=device
 )
 

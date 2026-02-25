@@ -320,11 +320,11 @@ class Custom_SiLU(nn.Module):
 class Custom_FeedForward(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.fc1 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=4096)
-        self.fc2 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=4096)
-        self.fc3 = Custom_Linear(cfg["hidden_dim"], cfg["emb_dim"], max_seq_len=4096)
-        self.custom_silu = Custom_SiLU(max_length=4096)
-        self.custom_elementwise_mul = Custom_Element_Wise(max_length=4096)
+        self.fc1 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
+        self.fc2 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
+        self.fc3 = Custom_Linear(cfg["hidden_dim"], cfg["emb_dim"], max_seq_len=1024)
+        self.custom_silu = Custom_SiLU(max_length=1024)
+        self.custom_elementwise_mul = Custom_Element_Wise(max_length=1024)
         
         self.is_quantized = False
 
@@ -339,9 +339,11 @@ class Custom_FeedForward(nn.Module):
         else:
             x_fc1, scale_fc1 = self.fc1(x, scale_x)
             x_fc2, scale_fc2 = self.fc2(x, scale_x)
+            
             x_silu, scale_silu = self.custom_silu(x_fc1, scale_fc1)
             
-            x_mul, scale_mul = self.custom_elementwise_mul(x_silu, scale_silu, x_fc2, scale_fc2)
+            x_mul, scale_mul = self.custom_elementwise_mul(x_silu, scale_silu,
+                                                           x_fc2, scale_fc2)
             
             out, scale_out = self.fc3(x_mul, scale_mul)
             return out, scale_out
@@ -391,8 +393,8 @@ class Custom_Matmul(nn.Module):
             if A.dim() == 2:
                 seq_len = A.shape[0]
                 
-                scale_A = scale_A[:seq_len].to(torch.float32)
-                scale_B = scale_B[:seq_len].to(torch.float32)
+                # scale_A = scale_A[:seq_len].to(torch.float32)
+                # scale_B = scale_B[:seq_len].to(torch.float32)
                 scale_out_value = self.scale_out[:seq_len].to(torch.float32)
                 
                 C_int8 = gemm_cutlass.func_int8_matmul_out_int8_three_scale(
@@ -402,8 +404,8 @@ class Custom_Matmul(nn.Module):
             elif A.dim() == 3:
                 batch_size, seq_len, _ = A.shape
                 
-                scale_A = scale_A[:, :seq_len].to(torch.float32)
-                scale_B = scale_B[:, :seq_len].to(torch.float32)
+                # scale_A = scale_A[:, :seq_len].to(torch.float32)
+                # scale_B = scale_B[:, :seq_len].to(torch.float32)
                 scale_out_value = self.scale_out[:, :seq_len].to(torch.float32)
 
                 C_int8 = gemm_cutlass.func_int8_matmul_out_int8_three_scale_batched(

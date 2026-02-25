@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from datasets import load_dataset
 
 @torch.no_grad()
-def compute_ppl(model, tokenizer, texts, context_size, max_length, device="cuda"):
+def compute_ppl(model, tokenizer, texts, context_size, device="cuda"):
 
     model.eval()  
     total_nll = 0.0
@@ -19,10 +19,7 @@ def compute_ppl(model, tokenizer, texts, context_size, max_length, device="cuda"
         ids_t = torch.tensor(ids, dtype=torch.long, device=device)
         L = ids_t.size(0)
 
-        for t in range(1, L):
-            if t > max_length:
-                break
-            
+        for t in range(1, L):            
             start = max(0, t - context_size)
             inp = ids_t[start:t].unsqueeze(0)   # [1, w]
             logits = model(inp)                 # [1, w, V]
