@@ -55,6 +55,51 @@ class Custom_Linear(nn.Module):
         self.scale_y = self.out_observer.get_scale().to(self.scale_w.device)
         self.is_quantized = True  
         
+
+class Custom_Linear_PerRow(nn.Module):
+    def __init__(self, in_features, out_features, max_seq_len=1024):
+        super(Custom_Linear_PerRow, self).__init__()
+        
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.kaiming_normal_(self.weight, mode='fan_in', nonlinearity='relu')
+        
+        self.register_buffer(
+            "weight_q",
+            torch.empty(out_features, in_features, dtype=torch.int8),
+            persistent=False,
+        )
+        
+        self.register_buffer('scale_w', torch.ones(out_features))
+        self.register_buffer('scale_y', torch.ones(max_seq_len))
+
+        self.out_observer = MinMaxObserverPerLastDim(max_seq_len=max_seq_len)
+        self.is_quantized = False
+        
+    def forward(self, x, scale_x):
+        if not self.is_quantized:  # Calibration mode     
+            out = torch.matmul(x, self.weight.t())  
+            self.out_observer(out)
+            return out, 1.0
+        else:
+            assert x.dtype == torch.int8, "Expected int8 input in quantized mode"
+            seq_len = x.shape[0]
+            scale_y_value = self.scale_y[:seq_len].to(torch.float32)  
+            
+            if x.dim() == 2:
+                out_q = gemm_cutlass.func_int8_matmul_out_int8_three_scale(
+                    x, self.weight_q, 
+                    scale_x, self.scale_w, scale_y_value
+                )
+            else:
+                raise ValueError("Input must be 2D tensor")
+            return out_q, scale_y_value
+        
+    def finish_calibration(self):
+        self.weight_q, self.scale_w = quantize_row_int8_symmetric_nd(self.weight)
+        
+        self.scale_y = self.out_observer.get_scale().to(self.scale_w.device)
+        self.is_quantized = True  
+        
         
 class Custom_Softmax(nn.Module):
     def __init__(self, num_heads=1, max_seq_len=1, dim=None):
@@ -317,12 +362,93 @@ class Custom_SiLU(nn.Module):
         self.is_quantized = True
 
 
+# class Custom_FeedForward(nn.Module):
+#     def __init__(self, cfg):
+#         super().__init__()
+#         # self.fc1 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
+#         # self.fc2 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
+#         # self.fc3 = Custom_Linear(cfg["hidden_dim"], cfg["emb_dim"], max_seq_len=1024)
+        
+#         self.fc1 = Custom_Linear_PerRow(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
+#         self.fc2 = Custom_Linear_PerRow(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
+#         self.fc3 = Custom_Linear_PerRow(cfg["hidden_dim"], cfg["emb_dim"], max_seq_len=1024)
+        
+#         self.custom_silu = Custom_SiLU(max_length=1024)
+#         self.custom_elementwise_mul = Custom_Element_Wise(max_length=1024)
+        
+#         self.is_quantized = False
+
+#     def forward(self, x, scale_x):
+#         if not self.is_quantized:
+#             x_fc1, _ = self.fc1(x, 1.0)
+#             x_fc2, _ = self.fc2(x, 1.0)
+#             x_silu, _ = self.custom_silu(x_fc1, 1.0)
+#             x, _ = self.custom_elementwise_mul(x_silu, 1.0, x_fc2, 1.0)
+#             out, _ = self.fc3(x, 1.0)
+#             return out, 1.0
+#         else:
+#             x_fc1, scale_fc1 = self.fc1(x, scale_x)
+#             x_fc2, scale_fc2 = self.fc2(x, scale_x)
+            
+#             x_silu, scale_silu = self.custom_silu(x_fc1, scale_fc1)
+            
+#             x_mul, scale_mul = self.custom_elementwise_mul(x_silu, scale_silu,
+#                                                            x_fc2, scale_fc2)
+            
+#             out, scale_out = self.fc3(x_mul, scale_mul)
+#             return out, scale_out
+        
+#     def finish_calibration(self):
+#         self.fc1.finish_calibration()
+#         self.fc2.finish_calibration()
+#         self.custom_silu.finish_calibration()
+#         self.custom_elementwise_mul.finish_calibration()
+#         self.fc3.finish_calibration()
+#         self.is_quantized = True
+
+
+def compute_smoothquant_alpha(X, W, lambd=0.5, eps=1e-6):
+    """
+    Compute per-input-channel SmoothQuant scaling factors.
+
+    X: (seq_len, in_dims)
+    W: (out_dims, in_dims)
+    lambd: tradeoff parameter in [0, 1]
+    returns alpha: (in_dims,)
+    """
+    
+    assert X.shape[1] == W.shape[1], "Input channels must match between X and W"
+    
+    # activation magnitude per input channel
+    A = X.abs().amax(dim=0)  # shape: (in_dims,)
+
+    # weight magnitude per input channel
+    W_row = W.abs().amax(dim=0)  # shape: (in_dims,)
+
+    # avoid zeros to prevent NaNs/infs
+    A = torch.clamp(A, min=eps)
+    W_row = torch.clamp(W_row, min=eps)
+
+    # SmoothQuant formula alpha_j = A_j^lambda / W_j^(1 - lambda)
+    alpha = (A ** lambd) / (W_row ** (1.0 - lambd))
+
+    # Optional: clamp alpha to avoid crazy scaling
+    alpha = torch.clamp(alpha, min=0.01, max=100.0)
+
+    return alpha
+
+
 class Custom_FeedForward(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.fc1 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
-        self.fc2 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
-        self.fc3 = Custom_Linear(cfg["hidden_dim"], cfg["emb_dim"], max_seq_len=1024)
+        # self.fc1 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
+        # self.fc2 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
+        # self.fc3 = Custom_Linear(cfg["hidden_dim"], cfg["emb_dim"], max_seq_len=1024)
+        
+        self.fc1 = Custom_Linear_PerRow(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
+        self.fc2 = Custom_Linear_PerRow(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
+        self.fc3 = Custom_Linear_PerRow(cfg["hidden_dim"], cfg["emb_dim"], max_seq_len=1024)
+        
         self.custom_silu = Custom_SiLU(max_length=1024)
         self.custom_elementwise_mul = Custom_Element_Wise(max_length=1024)
         
@@ -337,24 +463,78 @@ class Custom_FeedForward(nn.Module):
             out, _ = self.fc3(x, 1.0)
             return out, 1.0
         else:
-            x_fc1, scale_fc1 = self.fc1(x, scale_x)
-            x_fc2, scale_fc2 = self.fc2(x, scale_x)
             
-            x_silu, scale_silu = self.custom_silu(x_fc1, scale_fc1)
+            # ===== 1. Compute FC1 =====
+            x = x.to(self.fc1.weight.dtype) # x is bfloat16
+            w1 = self.fc1.weight
             
-            x_mul, scale_mul = self.custom_elementwise_mul(x_silu, scale_silu,
-                                                           x_fc2, scale_fc2)
+            smooth_factor = compute_smoothquant_alpha(x, w1) # shape: (in_dims,)
+            X_smooth = x / smooth_factor.unsqueeze(0)     
+            W_smooth = w1 * smooth_factor.unsqueeze(0)    
             
-            out, scale_out = self.fc3(x_mul, scale_mul)
-            return out, scale_out
+            # Quantize the smoothed weights
+            X_smooth_q, scale_x_smooth = quantize_row_int8_symmetric_nd(X_smooth)
+            W_smooth_q, scale_w_smooth = quantize_row_int8_symmetric_nd(W_smooth)
+            
+            Y_deq = gemm_cutlass.func_int8_matmul(X_smooth_q, W_smooth_q, 1.0)
+            Y_deq = Y_deq * scale_x_smooth.unsqueeze(-1)\
+                            * scale_w_smooth.unsqueeze(0)            
+            
+            x_fc1 = Y_deq.to(self.fc1.weight.dtype)
+            
+            
+            # ===== 2. Compute FC2 =====
+            w2 = self.fc2.weight
+            
+            smooth_factor = compute_smoothquant_alpha(x, w2) # shape: (in_dims,)
+            X_smooth = x / smooth_factor.unsqueeze(0)     
+            W_smooth = w2 * smooth_factor.unsqueeze(0)    
+            
+            # Quantize the smoothed weights
+            X_smooth_q, scale_x_smooth = quantize_row_int8_symmetric_nd(X_smooth)
+            W_smooth_q, scale_w_smooth = quantize_row_int8_symmetric_nd(W_smooth)
+            
+            Y_deq = gemm_cutlass.func_int8_matmul(X_smooth_q, W_smooth_q, 1.0)
+            Y_deq = Y_deq * scale_x_smooth.unsqueeze(-1)\
+                            * scale_w_smooth.unsqueeze(0)            
+            
+            x_fc2 = Y_deq.to(self.fc2.weight.dtype)
+            
+            # ===== 3. Compute SiLU =====
+            x_silu, _ = self.custom_silu(x_fc1, 1.0)
+            
+            
+            # ==== 4. Element-wise multiplication =====
+            # x, _ = self.custom_elementwise_mul(x_silu, 1.0, x_fc2, 1.0)
+            
+            original_dtype = x_silu.dtype
+            x_silu_int8, scale_silu = quantize_row_int8_symmetric_nd(x_silu)
+            x_fc2_int8, scale_fc2 = quantize_row_int8_symmetric_nd(x_fc2)
+            
+            x = x_silu_int8.to(original_dtype) * x_fc2_int8.to(original_dtype)
+            x = x * scale_silu.unsqueeze(-1) * scale_fc2.unsqueeze(-1)
+            
+            
+            # ===== 5. Compute FC3 ======
+            w3 = self.fc3.weight
+            smooth_factor = compute_smoothquant_alpha(x, w3) 
+            X_smooth = x / smooth_factor.unsqueeze(0)
+            W_smooth = w3 * smooth_factor.unsqueeze(0)
+            
+            X_smooth_q, scale_x_smooth = quantize_row_int8_symmetric_nd(X_smooth)
+            W_smooth_q, scale_w_smooth = quantize_row_int8_symmetric_nd(W_smooth)
+            
+            Y_deq = gemm_cutlass.func_int8_matmul(X_smooth_q, W_smooth_q, 1.0)
+            Y_deq = Y_deq * scale_x_smooth.unsqueeze(-1)\
+                            * scale_w_smooth.unsqueeze(0)            
+            
+            out = Y_deq.to(self.fc3.weight.dtype)
+            
+            return out, 1.0
         
     def finish_calibration(self):
-        self.fc1.finish_calibration()
-        self.fc2.finish_calibration()
-        self.custom_silu.finish_calibration()
-        self.custom_elementwise_mul.finish_calibration()
-        self.fc3.finish_calibration()
         self.is_quantized = True
+
 
 
 class Custom_Matmul(nn.Module):

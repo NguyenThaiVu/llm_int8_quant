@@ -39,7 +39,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "8B"  # Options:, "4B", "8B"
+CHOOSE_MODEL = "4B"  # Options:, "4B", "8B"
 
 
 class RMSNorm(nn.Module):
@@ -260,6 +260,41 @@ class FeedForward(nn.Module):
         x = nn.functional.silu(x_fc1) * x_fc2
         return self.fc3(x)
     
+
+def compute_smoothing_alpha_from_X(
+    X: torch.Tensor,
+    dim: int = 0,
+    lambd: float = 0.5,
+    eps: float = 1e-5,
+    alpha_min: float = 0.01,
+    alpha_max: float = 100.0,
+):
+    """
+    Compute a 'SmoothQuant-like' alpha from a single tensor X.
+
+    X:   e.g. (seq_len, in_dims)
+    dim: dimension over which to compute per-channel stats (0 for seq, 1 for features, etc.)
+    lambd: controls how aggressively to shrink outlier channels (0 = no change, 1 = very aggressive)
+    """
+    # Per-channel max magnitude along the chosen dimension
+    # Example: if X is (seq_len, in_dims) and dim=0,
+    # A has shape (in_dims,)
+    A = X.abs().amax(dim=dim)
+
+    # Avoid zeros
+    A = torch.clamp(A, min=eps)
+
+    # Use a reference scale (median or mean) to define "normal" magnitude
+    A_ref = A.median()  # or A.mean()
+
+    # Channels larger than A_ref get alpha > 1 (shrunk); smaller get alpha < 1
+    alpha = (A / A_ref) ** lambd
+
+    # Clamp to avoid extreme scaling
+    alpha = torch.clamp(alpha, min=alpha_min, max=alpha_max)
+
+    return alpha
+
     
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
@@ -299,7 +334,6 @@ class TransformerBlock(nn.Module):
         x = x.unsqueeze(0) # Add batch dimension back
         x = x.to(original_dtype)
         
-        
         x = self.att(x, mask, cos, sin)  # Shape [batch_size, num_tokens, emb_size]
         x = x + shortcut  
 
@@ -307,7 +341,6 @@ class TransformerBlock(nn.Module):
         shortcut = x
         x = self.norm2(x)
 
-        
         # x = self.ff(x)
         # # === Feed-forward with quantization support ===
         original_dtype = x.dtype
@@ -316,9 +349,13 @@ class TransformerBlock(nn.Module):
         if self.is_quantized == False: # float computation
             x, _ = self.ff(x, 1.0)
         else:
-            x_int8, x_scale = quantize_row_int8_symmetric_nd(x)
-            out_int8, out_scale = self.ff(x_int8, x_scale)
-            x = out_int8.to(torch.float32) * out_scale.unsqueeze(-1)
+            # x_int8, x_scale = quantize_row_int8_symmetric_nd(x, percentile=0.9999)
+            # out_int8, out_scale = self.ff(x_int8, x_scale)
+            # x = out_int8.to(torch.float32) * out_scale.unsqueeze(-1)
+            
+            out, _ = self.ff(x, 1.0)
+            x = out
+        
         x = x.unsqueeze(0) # Add batch dimension back
         x = x.to(original_dtype)
         # # ========================================
@@ -328,11 +365,12 @@ class TransformerBlock(nn.Module):
         return x
 
     def finish_calibration(self):
+        self.norm1.finish_calibration()
         self.att.finish_calibration()
+        
+        # self.norm2.finish_calibration()
         self.ff.finish_calibration()
         
-        self.norm1.finish_calibration()
-        # self.norm2.finish_calibration()
         self.is_quantized = True
         
         
@@ -381,11 +419,7 @@ class Qwen3Model(nn.Module):
         return logits
 
     def finish_calibration(self):
-        # for block in self.trf_blocks:
-        #     block.finish_calibration()
-        
-        # Do not calibrate the last 2 blocks 
-        for block in self.trf_blocks[:-2]:
+        for block in self.trf_blocks:
             block.finish_calibration()
         
         self.is_quantized = True
@@ -577,7 +611,6 @@ else:
     )
     
 
-
 def generate_text_basic_stream(model, token_ids, max_new_tokens, eos_token_id=None):
     model.eval()
     with torch.no_grad():
@@ -612,11 +645,8 @@ MAX_CONTEXT_TOKENS = 64
 list_prompt = ["What is the capital of VietNam?",\
                 "Who is the president of VietNam?",\
                 "Who is Son Goku?",\
-                "Which country has a capital city named Paris?",\
-                "What is the capital of France?",\
                 "Describe the Chinese New Year festival.",\
-                "Please describe British food in detail.",\
-                "Tell me a long story about dragons and knights.",\
+                "Which country has a capital city named Paris?",\
                 "Explain the Vietnamese food Pho and how to make it at home."]
 
 for idx, prompt in enumerate(list_prompt):
@@ -647,7 +677,7 @@ corpus_ppl = compute_ppl(
     device=device
 )
 
-print("Corpus PPL (before quantization):", corpus_ppl)    
+print("Corpus PPL (before quantization):", corpus_ppl)   
 
 # # ========================================================================
 # Forward pass to collect calibration data for quantization
@@ -664,7 +694,7 @@ for idx, text in enumerate(calibration_samples):
         _ = model(input_token_ids_tensor)
         
 model.finish_calibration()
-print(f"[INFO] Finished calibration samples.")
+print(f"[INFO] Finished calibration {len(calibration_samples)} samples.")
 
 # ========================================================================
 # Quantization mode

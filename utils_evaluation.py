@@ -35,7 +35,7 @@ def compute_ppl(model, tokenizer, texts, context_size, device="cuda"):
     return corpus_ppl
 
 
-def load_wikitext2_samples(n=1000, min_length=10):
+def load_wikitext2_samples(n=100, min_length=10):
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
     samples = [x["text"] for x in dataset if len(x["text"].strip()) > min_length]
     if n is not None:

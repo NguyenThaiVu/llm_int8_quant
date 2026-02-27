@@ -1,20 +1,22 @@
+"""
+Test quantization
+"""
+
 import os 
-import torch 
-import gemm_cutlass
-from utils import *
+import torch
+from utils import quantize_row_int8_symmetric_nd
 
-input_dims = 4096
-output_dims = 8192
-dtype = torch.bfloat16
-
-X = torch.randn((input_dims, output_dims), dtype=dtype, device='cuda')
-
-X_int8, scale_x = quantize_row_int8_symmetric_nd(X)
-
-X_deq = X_int8.float() * scale_x.unsqueeze(-1)
-X_deq = X_deq.to(dtype)
-
-max_diff = (X - X_deq).abs().max().item()
-print(f"Max diff: {max_diff:.6f}")
-mse = ((X - X_deq) ** 2).mean().item()
-print(f"MSE: {mse:.6f}")
+if __name__ == "__main__":
+    M = 1024
+    N = 4096
+    dtype = torch.bfloat16
+    
+    X = torch.randn(M, N, dtype=dtype).to("cuda")
+    X_q, scales = quantize_row_int8_symmetric_nd(X, percentile=0.999)
+    
+    X_deq = X_q.to(dtype) * scales.unsqueeze(-1)
+    
+    max_diff = (X - X_deq).abs().max()
+    print(f"Max diff: {max_diff.item():.6f}")
+    mse = ((X - X_deq) ** 2).mean().item()
+    print(f"MSE: {mse:.6f}")

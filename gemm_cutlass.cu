@@ -198,9 +198,9 @@ torch::Tensor func_int8_matmul_out_int8_per_row_scale_batched(
 torch::Tensor func_int8_matmul_out_int8_three_scale(
     torch::Tensor input,   // INT8 - shape (M, K)
     torch::Tensor weight,  // INT8 - shape (N, K)
-    torch::Tensor row_scale, 
-    torch::Tensor col_scale,
-    torch::Tensor out_scale
+    torch::Tensor row_scale, // FP32 - shape (M, 1)
+    torch::Tensor col_scale,  // FP32 - shape (N, 1)
+    torch::Tensor out_scale // FP32 - shape (M, 1)
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
     return int8_matmul_out_int8_three_scale_host(input, weight, row_scale, col_scale, out_scale);

@@ -10,9 +10,9 @@ import gemm_cutlass
 from utils import *
 from utils_transformer_int8 import *
 
-class Custom_Linear(nn.Module):
-    def __init__(self, in_features, out_features):
-        super(Custom_Linear, self).__init__()
+class Custom_Linear_PerRow(nn.Module):
+    def __init__(self, in_features, out_features, max_seq_len=1024):
+        super(Custom_Linear_PerRow, self).__init__()
         
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         nn.init.kaiming_normal_(self.weight, mode='fan_in', nonlinearity='relu')
@@ -23,52 +23,61 @@ class Custom_Linear(nn.Module):
             persistent=False,
         )
         
-        self.register_buffer('scale_w', torch.tensor(1.0))
-        self.register_buffer('scale_y', torch.ones(out_features))
+        self.register_buffer('scale_w', torch.ones(out_features))
+        self.register_buffer('scale_y', torch.ones(max_seq_len))
 
-        self.out_observer = MinMaxObserverPerLastDim()
+        self.out_observer = MinMaxObserverPerLastDim(max_seq_len=max_seq_len)
         self.is_quantized = False
         
     def forward(self, x, scale_x):
         if not self.is_quantized:  # Calibration mode 
+            
+            print(f"[DEBUG] Forward pass in calibration mode")
+            print(f"[DEBUG] Input shape: {x.shape}")
+            print(f"[DEBUG] Weight shape: {self.weight.shape}")
+            
             out = torch.matmul(x, self.weight.t())  
             self.out_observer(out)
             return out, 1.0
         else:
             assert x.dtype == torch.int8, "Expected int8 input in quantized mode"
-            requant_scale = scale_x * self.scale_w / self.scale_y
-            requant_scale = requant_scale.to(torch.float32)
             
-            if x.dim() == 3:
-                out_q = gemm_cutlass.func_int8_matmul_out_int8_per_row_scale_batched(
-                    x, self.weight_q, requant_scale
-                )
-            elif x.dim() == 2:
-                out_q = gemm_cutlass.func_int8_matmul_out_int8_per_row_scale(
-                    x, self.weight_q, requant_scale
+            seq_len = x.shape[0]
+            scale_y_value = self.scale_y[:seq_len].to(torch.float32)  
+            
+            print(f"[DEBUG] Shape scale_x: {scale_x.shape}")
+            print(f"[DEBUG] Shape scale_w: {self.scale_w.shape}")
+            print(f"[DEBUG] Shape scale_y_value: {scale_y_value.shape}")
+            
+            if x.dim() == 2:
+                out_q = gemm_cutlass.func_int8_matmul_out_int8_three_scale(
+                    x, self.weight_q, 
+                    scale_x, self.scale_w, scale_y_value
                 )
             else:
-                raise ValueError("Input must be 2D or 3D tensor")
-            return out_q, self.scale_y
+                raise ValueError("Input must be 2D tensor")
+            return out_q, scale_y_value
         
     def finish_calibration(self):
-        self.weight_q, self.scale_w = quantize_tensor(self.weight)
+        self.weight_q, self.scale_w = quantize_row_int8_symmetric_nd(self.weight)
         
         self.scale_y = self.out_observer.get_scale().to(self.scale_w.device)
         self.is_quantized = True  
 
+
 if __name__ == "__main__":
     
-    seq_len = 1024 * 16
-    emb_dim = 4096
+    seq_len = 1024
+    in_dim = 2560
+    out_dim = 9728
     
     device = 'cuda'
     d_type = torch.bfloat16
     
     # ==========================
     # 1. 2D input 
-    X = torch.randn((seq_len, emb_dim), dtype=d_type, device=device)
-    linear = Custom_Linear(emb_dim, emb_dim).to(device).to(d_type)
+    X = torch.randn((seq_len, in_dim), dtype=d_type, device=device)
+    linear = Custom_Linear_PerRow(in_dim, out_dim).to(device).to(d_type)
     
     # Step 1: Calibration
     with torch.no_grad():
@@ -91,28 +100,3 @@ if __name__ == "__main__":
     print(f"Sample output (float): {out_float[:5, :5]}")
     print(f"Sample output (dequantized): {out_q_dequant[:5, :5]} \n")
     
-    # ==========================
-    # 2. 3D input (batched)
-    batch_size = 4
-    X_batched = torch.randn((batch_size, seq_len, emb_dim), dtype=d_type, device=device)
-    linear_batched = Custom_Linear(emb_dim, emb_dim).to(device).to(d_type)
-    
-    # Step 1: Calibration
-    with torch.no_grad():
-        out_float_batched, _ = linear_batched(X_batched, scale_x=1.0)
-        linear_batched.finish_calibration()
-        
-    # Step 2: Quantized inference
-    with torch.no_grad():
-        X_batched_q, scale_x_batched = quantize_row_int8_symmetric_nd(X_batched)
-        out_q_batched, scale_y_batched = linear_batched(X_batched_q, scale_x=scale_x_batched)
-        
-    # Dequantize output for comparison
-    out_q_batched_dequant = out_q_batched.float() * scale_y_batched.unsqueeze(-1)
-    max_diff_batched = (out_float_batched - out_q_batched_dequant).abs().max().item()
-    print(f"Max diff (batched): {max_diff_batched:.6f}")
-    mse_batched = ((out_float_batched - out_q_batched_dequant) ** 2).mean().item()
-    print(f"MSE (batched): {mse_batched:.6f}")
-    
-    print(f"Sample output (float, batched): {out_float_batched[0, :5, :5]}")
-    print(f"Sample output (dequantized, batched): {out_q_batched_dequant[0, :5, :5]}")

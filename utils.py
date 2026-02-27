@@ -108,6 +108,71 @@ def quantize_row_int8_symmetric_nd(
     return q_mat, scales.to(scale_dtype)
 
 
+def quantize_row_int8_asymmetric_nd(
+    mat: torch.Tensor,
+    scale_dtype=torch.float32,
+    percentile: float | None = None,
+):
+
+    assert mat.dim() >= 2, "mat must be at least 2D"
+
+    mat = mat.to(scale_dtype)
+
+    qmin, qmax = -128, 127
+    dtype = torch.int8
+    q_range = qmax - qmin  # 255
+
+    orig_shape = mat.shape  # (..., C)
+    last_dim = orig_shape[-1]
+    num_vecs = mat.numel() // last_dim
+
+    # Reshape to (num_vecs, C)
+    mat_2d = mat.reshape(num_vecs, last_dim)
+
+    # 1) Determine per-row range [min_vals, max_vals]
+    if percentile is None:
+        min_vals, _ = mat_2d.min(dim=1, keepdim=True)  # (N, 1)
+        max_vals, _ = mat_2d.max(dim=1, keepdim=True)  # (N, 1)
+    else:
+        assert 0.0 < percentile <= 1.0, "percentile must be in (0.0, 1.0]"
+        # For percentile=0.999, lower_q=0.001, upper_q=0.999
+        upper_q = percentile
+        lower_q = 1.0 - percentile
+
+        # Handle degenerate case where lower_q <= 0
+        lower_q = max(lower_q, 0.0)
+
+        # Per-row lower/upper quantiles
+        min_vals = torch.quantile(mat_2d, q=lower_q, dim=1, keepdim=True)
+        max_vals = torch.quantile(mat_2d, q=upper_q, dim=1, keepdim=True)
+
+    # Avoid zero/negative ranges
+    ranges = (max_vals - min_vals).clamp(min=1e-8)
+
+    # 2) Per-row scale
+    scales = (ranges / q_range).squeeze(1)  # (N,)
+
+    # 3) Per-row zero-point (integer)
+    zero_points = qmin - (min_vals.squeeze(1) / scales)  # (N,)
+    zero_points = torch.round(zero_points).clamp(qmin, qmax).to(torch.int32)
+
+    # 4) Optional: clip in float space to [min_vals, max_vals]
+    mat_2d_clipped = mat_2d.clamp(min_vals, max_vals)
+
+    # 5) Quantize: q = round(x / scale + zero_point)
+    q_mat_2d = torch.round(
+        mat_2d_clipped / scales.unsqueeze(1) + zero_points.unsqueeze(1)
+    )
+    q_mat_2d = torch.clamp(q_mat_2d, qmin, qmax).to(dtype)
+
+    # 6) Reshape back
+    q_mat = q_mat_2d.reshape(orig_shape)
+    scales = scales.reshape(orig_shape[:-1])
+    zero_points = zero_points.reshape(orig_shape[:-1])
+
+    return q_mat, scales.to(scale_dtype), zero_points
+
+
 def measure_time(func, *args, repeat=100):
     """
     Measure the average execution time of a function over a number of repetitions.
