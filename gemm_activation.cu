@@ -337,3 +337,204 @@ torch::Tensor silu_int8_cuda_rowwise(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
+
+
+/*
+This kernel compute 
+- Input: fc1 (float, M,N), fc2 (float, M,N)
+- Output: out (float, M,N)
+- Operation: out[i,j] = SiLU(fc1[i,j]) * fc2[i,j]
+*/
+__global__ void silu_mul_kernel(
+    const float* __restrict__ fc1,  // [rows, cols]
+    const float* __restrict__ fc2,  // [rows, cols]
+    float* __restrict__ out,        // [rows, cols]
+    int rows,
+    int cols
+) {
+    int row = blockIdx.x;      // one block per row
+    if (row >= rows) return;
+
+    int tid = threadIdx.x;
+
+    // base pointer for this row
+    int row_offset = row * cols;
+
+    // each thread processes a strided subset of the columns
+    for (int col = tid; col < cols; col += blockDim.x) {
+        int idx = row_offset + col;
+
+        float v = fc1[idx];
+        float silu = v / (1.0f + expf(-v));
+        out[idx] = silu * fc2[idx];
+    }
+}
+
+torch::Tensor silu_mul_cuda(torch::Tensor fc1, torch::Tensor fc2) {
+    TORCH_CHECK(fc1.is_cuda() && fc2.is_cuda(), "Inputs must be CUDA tensors");
+    TORCH_CHECK(fc1.dtype() == torch::kFloat32 && fc2.dtype() == torch::kFloat32, "Inputs must be float32");
+    TORCH_CHECK(fc1.dim() == 2 && fc2.dim() == 2, "Inputs must be 2D");
+    TORCH_CHECK(fc1.sizes() == fc2.sizes(), "Input sizes must match");
+
+    int rows = fc1.size(0);
+    int cols = fc1.size(1);
+
+    auto out = torch::empty_like(fc1);
+
+    int threads = 256;
+    int blocks = std::min(rows, (int)at::cuda::getDeviceProperties(fc1.get_device())->multiProcessorCount * 20);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    silu_mul_kernel<<<blocks, threads, 0, stream>>>(
+        fc1.data_ptr<float>(),
+        fc2.data_ptr<float>(),
+        out.data_ptr<float>(),
+        rows,
+        cols
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+
+/*
+This kernel compute 
+- Input: x1 (int8, M,N),
+        scale_x1 (float, M)
+        x2 (int8, M,N)
+        scale_x2 (float, M)
+- Output: out (int8, M,N)
+            scale_out (float, M)
+- Operation: out[i,j] = SiLU(x1[i,j]) * x2[i
+
+*/
+
+__global__ void silu_mul_int8_kernel(
+    const int8_t* __restrict__ x1_int8,   // [rows, cols]
+    const int8_t* __restrict__ x2_int8,   // [rows, cols]
+    float* __restrict__ scale_x1,  // [rows]
+    float* __restrict__ scale_x2,  // [rows]
+    int8_t* __restrict__ out_int8,        // [rows, cols]
+    float* __restrict__ out_scales,       // [rows]
+    int rows,
+    int cols
+) {
+    int row = blockIdx.x;  // one block per row
+    if (row >= rows) return;
+
+    int tid = threadIdx.x;
+    int row_offset = row * cols;
+    float s_x1 = scale_x1[row];
+    float s_x2 = scale_x2[row];
+
+    extern __shared__ float sdata[];  // shared memory for reduction
+
+    // -------- Pass 1: compute max |y| in this row --------
+    float local_max = 0.0f;
+
+    for (int col = tid; col < cols; col += blockDim.x) {
+        int idx = row_offset + col;
+
+        // dequantize
+        float x1 = static_cast<float>(x1_int8[idx]) * s_x1;
+        float x2 = static_cast<float>(x2_int8[idx]) * s_x2;
+
+        // SiLU(x1) = x1 / (1 + exp(-x1))
+        float silu = x1 / (1.0f + expf(-x1));
+        float y = silu * x2;
+
+        float a = fabsf(y);
+        if (a > local_max) local_max = a;
+    }
+
+    // store local max into shared memory
+    sdata[tid] = local_max;
+    __syncthreads();
+
+    // block-wide reduction to get row_max in sdata[0]
+    // (simple binary tree reduction)
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (sdata[tid + stride] > sdata[tid]) {
+                sdata[tid] = sdata[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+
+    float row_max = sdata[0];
+
+    // Compute per-row output scale (symmetric, using 127)
+    float scale_out;
+    if (row_max > 0.0f) {
+        scale_out = row_max / 127.0f;
+    } else {
+        // avoid division by zero; arbitrary small scale
+        scale_out = 1.0f;
+    }
+
+    if (tid == 0) {
+        out_scales[row] = scale_out;
+    }
+
+    __syncthreads();  // ensure scale_out visible to all threads
+
+    // -------- Pass 2: recompute y and quantize --------
+    for (int col = tid; col < cols; col += blockDim.x) {
+        int idx = row_offset + col;
+
+        float x1 = static_cast<float>(x1_int8[idx]) * s_x1;
+        float x2 = static_cast<float>(x2_int8[idx]) * s_x2;
+
+        float silu = x1 / (1.0f + expf(-x1));
+        float y = silu * x2;
+
+        float q = y / scale_out;
+        // round to nearest int
+        q = rintf(q);
+
+        // clamp to int8 range
+        if (q > 127.0f) q = 127.0f;
+        if (q < -128.0f) q = -128.0f;
+
+        out_int8[idx] = static_cast<int8_t>(q);
+    }
+}
+
+std::tuple<torch::Tensor, torch::Tensor> silu_mul_int8_cuda(
+    torch::Tensor x1_int8, torch::Tensor scale_x1,
+    torch::Tensor x2_int8, torch::Tensor scale_x2
+) {
+    TORCH_CHECK(x1_int8.is_cuda() && x2_int8.is_cuda(), "Input int8 tensors must be CUDA");
+    TORCH_CHECK(scale_x1.is_cuda() && scale_x2.is_cuda(), "Scale tensors must be CUDA");
+    TORCH_CHECK(x1_int8.dtype() == torch::kChar && x2_int8.dtype() == torch::kChar, "Input tensors must be int8");
+    TORCH_CHECK(scale_x1.dtype() == torch::kFloat32 && scale_x2.dtype() == torch::kFloat32, "Scale tensors must be float32");
+    TORCH_CHECK(x1_int8.dim() == 2 && x2_int8.dim() == 2, "Input tensors must be 2D");
+    TORCH_CHECK(x1_int8.sizes() == x2_int8.sizes(), "Input tensor sizes must match");
+    TORCH_CHECK(scale_x1.dim() == 1 && scale_x2.dim() == 1, "Scale tensors must be 1D");
+    TORCH_CHECK(scale_x1.size(0) == x1_int8.size(0) && scale_x2.size(0) == x2_int8.size(0), "Scale tensor size must match input rows");
+
+    int rows = x1_int8.size(0);
+    int cols = x1_int8.size(1);
+
+    auto out_int8 = torch::empty_like(x1_int8);
+    auto out_scales = torch::empty({rows}, torch::dtype(torch::kFloat32).device(x1_int8.device()));
+
+    int threads = 256;
+    int blocks = std::min(rows, (int)at::cuda::getDeviceProperties(x1_int8.get_device())->multiProcessorCount * 20);
+    size_t shared_mem_size = threads * sizeof(float); // for reduction
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    silu_mul_int8_kernel<<<blocks, threads, shared_mem_size, stream>>>(
+        x1_int8.data_ptr<int8_t>(),
+        x2_int8.data_ptr<int8_t>(),
+        scale_x1.data_ptr<float>(),
+        scale_x2.data_ptr<float>(),
+        out_int8.data_ptr<int8_t>(),
+        out_scales.data_ptr<float>(),
+        rows,
+        cols
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return std::make_tuple(out_int8, out_scales);
+}

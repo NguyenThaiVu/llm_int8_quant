@@ -212,9 +212,9 @@ class Qwen3Model(nn.Module):
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
 
         self.trf_blocks = nn.ModuleList(  # ModuleList since Sequential can only accept one input, and we need `x, mask, cos, sin`
-            [TransformerBlock(cfg) for _ in range(cfg["n_layers"])]
+            [TransformerBlock(cfg) for i in range(cfg["n_layers"])]
         )
-
+        
         self.final_norm = RMSNorm(cfg["emb_dim"])
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
 
@@ -338,14 +338,6 @@ else:
         add_generation_prompt=False,
         add_thinking=False
     )
-    
-
-# Test the tokenizer
-prompt = "Give me a short introduction to large language models."
-
-input_token_ids = tokenizer.encode(prompt)
-text = tokenizer.decode(input_token_ids)
-print(f"Text: {text}")
 
 
 def generate_text_basic_stream(model, token_ids, max_new_tokens, eos_token_id=None):
@@ -378,11 +370,15 @@ def get_clean_generated_text(generated_text):
     return output_text
 
 
-MAX_NEW_TOKENS = 128
+MAX_NEW_TOKENS = 256
+MAX_CONTEXT_TOKENS = 128
 
 list_prompt = ["What is the capital of VietNam?",\
-            "Describe the Chinese New Year festival.",\
-                "Who is Son Goku?"]
+                "Who is the president of VietNam?",\
+                "Who is Son Goku?",\
+                "Describe the Chinese New Year festival.",\
+                "Which country has a capital city named Paris?",\
+                "Explain the Vietnamese food Pho and how to make it at home."]
 
 for idx, prompt in enumerate(list_prompt):
     input_token_ids = tokenizer.encode(prompt)
@@ -395,22 +391,21 @@ for idx, prompt in enumerate(list_prompt):
         eos_token_id=tokenizer.eos_token_id
     )
 
-    reponse = get_clean_generated_text(generated_text)
-    print(f"{idx}. Generated response: {reponse} \n")
+    response = get_clean_generated_text(generated_text)
+    print(f"{idx}. Generated response: {response} \n")
+    
 
+# num_samples = 15
 
-num_samples = 10
+# samples = load_wikitext2_samples(num_samples)
+# print(f"Loaded {len(samples)} samples. Computing perplexity...")
 
-samples = load_wikitext2_samples(num_samples)
-print(f"Loaded {len(samples)} samples. Computing perplexity...")
+# corpus_ppl = compute_ppl(
+#     model=model,
+#     tokenizer=tokenizer,           
+#     texts=samples,
+#     context_size=MAX_CONTEXT_TOKENS,
+#     device=device
+# )
 
-
-per_text, corpus_ppl = compute_ppl(
-    model=model,
-    tokenizer=tokenizer,           
-    texts=samples,
-    context_size=MAX_NEW_TOKENS,
-    device=device
-)
-
-print("Corpus PPL:", corpus_ppl)
+# print("Corpus PPL (before quantization):", corpus_ppl)   

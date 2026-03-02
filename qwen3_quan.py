@@ -259,41 +259,6 @@ class FeedForward(nn.Module):
         x_fc2 = self.fc2(x)
         x = nn.functional.silu(x_fc1) * x_fc2
         return self.fc3(x)
-    
-
-def compute_smoothing_alpha_from_X(
-    X: torch.Tensor,
-    dim: int = 0,
-    lambd: float = 0.5,
-    eps: float = 1e-5,
-    alpha_min: float = 0.01,
-    alpha_max: float = 100.0,
-):
-    """
-    Compute a 'SmoothQuant-like' alpha from a single tensor X.
-
-    X:   e.g. (seq_len, in_dims)
-    dim: dimension over which to compute per-channel stats (0 for seq, 1 for features, etc.)
-    lambd: controls how aggressively to shrink outlier channels (0 = no change, 1 = very aggressive)
-    """
-    # Per-channel max magnitude along the chosen dimension
-    # Example: if X is (seq_len, in_dims) and dim=0,
-    # A has shape (in_dims,)
-    A = X.abs().amax(dim=dim)
-
-    # Avoid zeros
-    A = torch.clamp(A, min=eps)
-
-    # Use a reference scale (median or mean) to define "normal" magnitude
-    A_ref = A.median()  # or A.mean()
-
-    # Channels larger than A_ref get alpha > 1 (shrunk); smaller get alpha < 1
-    alpha = (A / A_ref) ** lambd
-
-    # Clamp to avoid extreme scaling
-    alpha = torch.clamp(alpha, min=alpha_min, max=alpha_max)
-
-    return alpha
 
     
 class TransformerBlock(nn.Module):
@@ -639,8 +604,8 @@ def get_clean_generated_text(generated_text):
     return output_text
 
 
-MAX_NEW_TOKENS = 128
-MAX_CONTEXT_TOKENS = 64
+MAX_NEW_TOKENS = 256
+MAX_CONTEXT_TOKENS = 128
 
 list_prompt = ["What is the capital of VietNam?",\
                 "Who is the president of VietNam?",\
@@ -664,7 +629,7 @@ for idx, prompt in enumerate(list_prompt):
     print(f"{idx}. Generated response: {response} \n")
     
 
-num_samples = 15
+num_samples = 30
 
 samples = load_wikitext2_samples(num_samples)
 print(f"Loaded {len(samples)} samples. Computing perplexity...")

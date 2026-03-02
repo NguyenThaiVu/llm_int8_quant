@@ -470,50 +470,51 @@ class Custom_FeedForward(nn.Module):
             
             smooth_factor = compute_smoothquant_alpha(x, w1) # shape: (in_dims,)
             X_smooth = x / smooth_factor.unsqueeze(0)     
-            W_smooth = w1 * smooth_factor.unsqueeze(0)    
+            W1_smooth = w1 * smooth_factor.unsqueeze(0)    
             
-            # Quantize the smoothed weights
             X_smooth_q, scale_x_smooth = quantize_row_int8_symmetric_nd(X_smooth)
-            W_smooth_q, scale_w_smooth = quantize_row_int8_symmetric_nd(W_smooth)
+            W1_smooth_q, scale_w1_smooth = quantize_row_int8_symmetric_nd(W1_smooth)
             
-            Y_deq = gemm_cutlass.func_int8_matmul(X_smooth_q, W_smooth_q, 1.0)
+            Y_deq = gemm_cutlass.func_int8_matmul(X_smooth_q, W1_smooth_q, 1.0)
             Y_deq = Y_deq * scale_x_smooth.unsqueeze(-1)\
-                            * scale_w_smooth.unsqueeze(0)            
+                            * scale_w1_smooth.unsqueeze(0)            
             
             x_fc1 = Y_deq.to(self.fc1.weight.dtype)
             
+            # Quantize x_fc1 for SiLU
+            seq_len = x_fc1.shape[0]
+            scale_fc1 = self.fc1.out_observer.get_scale().to('cuda')
+            scale_fc1 = scale_fc1[:seq_len].to(torch.float32)
+            x_fc1_int8 = torch.clamp((x_fc1 / scale_fc1.unsqueeze(-1)),
+                                    -128, 127).to(torch.int8)
             
             # ===== 2. Compute FC2 =====
             w2 = self.fc2.weight
+            W2_smooth = w2 * smooth_factor.unsqueeze(0)    
+            W2_smooth_q, scale_w2_smooth = quantize_row_int8_symmetric_nd(W2_smooth)
             
-            smooth_factor = compute_smoothquant_alpha(x, w2) # shape: (in_dims,)
-            X_smooth = x / smooth_factor.unsqueeze(0)     
-            W_smooth = w2 * smooth_factor.unsqueeze(0)    
-            
-            # Quantize the smoothed weights
-            X_smooth_q, scale_x_smooth = quantize_row_int8_symmetric_nd(X_smooth)
-            W_smooth_q, scale_w_smooth = quantize_row_int8_symmetric_nd(W_smooth)
-            
-            Y_deq = gemm_cutlass.func_int8_matmul(X_smooth_q, W_smooth_q, 1.0)
+            Y_deq = gemm_cutlass.func_int8_matmul(X_smooth_q, W2_smooth_q, 1.0)
             Y_deq = Y_deq * scale_x_smooth.unsqueeze(-1)\
-                            * scale_w_smooth.unsqueeze(0)            
+                            * scale_w2_smooth.unsqueeze(0)            
             
             x_fc2 = Y_deq.to(self.fc2.weight.dtype)
             
-            # ===== 3. Compute SiLU =====
-            x_silu, _ = self.custom_silu(x_fc1, 1.0)
+            # Quantize x_fc2 for SiLU
+            scale_fc2 = self.fc2.out_observer.get_scale().to('cuda')
+            scale_fc2 = scale_fc2[:seq_len].to(torch.float32)
+            x_fc2_int8 = torch.clamp((x_fc2 / scale_fc2.unsqueeze(-1)),
+                                    -128, 127).to(torch.int8)
             
+            # === 3. Compute SiLU Quantization (x = silu(x_fc1) * x_fc2) === 
+            # x_fc1_int8, scale_fc1 = quantize_row_int8_symmetric_nd(x_fc1)
+            # x_fc2_int8, scale_fc2 = quantize_row_int8_symmetric_nd(x_fc2)
             
-            # ==== 4. Element-wise multiplication =====
-            # x, _ = self.custom_elementwise_mul(x_silu, 1.0, x_fc2, 1.0)
+            x_int8, x_scale = gemm_cutlass.func_silu_mul_int8(
+                                            x_fc1_int8, scale_fc1,
+                                            x_fc2_int8, scale_fc2)
             
-            original_dtype = x_silu.dtype
-            x_silu_int8, scale_silu = quantize_row_int8_symmetric_nd(x_silu)
-            x_fc2_int8, scale_fc2 = quantize_row_int8_symmetric_nd(x_fc2)
-            
-            x = x_silu_int8.to(original_dtype) * x_fc2_int8.to(original_dtype)
-            x = x * scale_silu.unsqueeze(-1) * scale_fc2.unsqueeze(-1)
-            
+            x = x_int8.to(torch.float32) * x_scale.unsqueeze(-1)
+            x = x.to(self.fc3.weight.dtype)
             
             # ===== 5. Compute FC3 ======
             w3 = self.fc3.weight

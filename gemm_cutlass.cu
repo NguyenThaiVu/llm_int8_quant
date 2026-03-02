@@ -63,24 +63,6 @@ torch::Tensor func_int8_matmul_output_int8_batched(
   return int8_matmul_output_int8_batched_host(input, weight, scales);
 }
 
-// torch::Tensor func_int8_gemm_per_output_scale_int8(
-//     torch::Tensor input,   // INT8 - shape (M, K)
-//     torch::Tensor weight,  // INT8 - shape (N, K)
-//     torch::Tensor scale            // BFloat16 (M, N)
-// ) {
-//   const at::cuda::OptionalCUDAGuard device_guard(input.device());
-//   return int8_gemm_per_output_scale_int8_host(input, weight, scale);
-// }   
-
-// torch::Tensor func_int8_gemm_per_output_scale_int8_batched(
-//     torch::Tensor input,   // INT8 - shape (B, M, K) or (M, K)
-//     torch::Tensor weight,  // INT8 - shape (B, N, K) or (N, K)
-//     torch::Tensor scales   // BFloat16 tensor, shape (B, M, N) or (M, N)
-// ) {
-//   const at::cuda::OptionalCUDAGuard device_guard(input.device());
-//   return int8_gemm_per_output_scale_int8_batched_host(input, weight, scales);
-// }
-
 
 torch::Tensor func_softmax_lastdim_int8(
     torch::Tensor x_q,          // int8
@@ -174,6 +156,24 @@ torch::Tensor func_element_add_int8(
     return element_add_int8_cuda(a, scale_a, b, scale_b, scale_out);
 }
 
+torch::Tensor func_silu_mul(
+    torch::Tensor fc1, 
+    torch::Tensor fc2
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(fc1.device());
+    return silu_mul_cuda(fc1, fc2);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> func_silu_mul_int8(
+    torch::Tensor fc1, 
+    torch::Tensor scale_fc1,
+    torch::Tensor fc2,
+    torch::Tensor scale_fc2
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(fc1.device());
+    return silu_mul_int8_cuda(fc1, scale_fc1, fc2, scale_fc2);
+}
+
 torch::Tensor func_int8_matmul_out_int8_per_row_scale(
     torch::Tensor input,   // INT8 - shape (M, K)
     torch::Tensor weight,  // INT8 - shape (N, K)
@@ -230,14 +230,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &func_int8_matmul_output_int8_batched,
         "Batched Int8 MatMul using CUTLASS (INT8 input/weight/output, BFloat16 scale)");
 
-    // m.def("func_int8_gemm_per_output_scale_int8",
-    //     &func_int8_gemm_per_output_scale_int8,
-    //     "Int8 MatMul using CUTLASS (INT8 input/weight/output, BFloat16 per-element scale)");
-
-    // m.def("func_int8_gemm_per_output_scale_int8_batched",
-    //     &func_int8_gemm_per_output_scale_int8_batched,
-    //     "Batched Int8 MatMul using CUTLASS (INT8 input/weight/output, BFloat16 per-element scale)");
-
     m.def("func_softmax_lastdim_int8",
         &func_softmax_lastdim_int8,
         "Softmax along last dimension for 3D int8 with per-row scale");
@@ -273,6 +265,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_element_add_int8",
         &func_element_add_int8,
         "Element-wise add for int8 tensors with scales");
+
+    m.def("func_silu_mul",
+        &func_silu_mul,
+        "Apply SiLU to fc1 and multiply with fc2 (both int8) with proper scaling");
+
+    m.def("func_silu_mul_int8",
+        &func_silu_mul_int8,
+        "Apply SiLU to fc1 and multiply with fc2 (both int8) with proper scaling, return int8 output with scale");
 
     m.def("func_int8_matmul_out_int8_per_row_scale",
         &func_int8_matmul_out_int8_per_row_scale,
