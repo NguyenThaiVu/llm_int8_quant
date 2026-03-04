@@ -107,6 +107,42 @@ def quantize_row_int8_symmetric_nd(
 
     return q_mat, scales.to(scale_dtype)
 
+@torch.no_grad()
+def quantize_row_int8_symmetric_nd_chunked(W, alpha=None, chunk_rows=1024, eps=1e-8):
+    """
+    Row-wise symmetric int8 quantization for W (out_features, in_features).
+    Optionally applies per-column alpha scaling on the fly: W_smooth = W * alpha.
+    Returns (W_q int8, scale_w float32 [out_features]).
+    """
+    device = W.device
+    out_features, in_features = W.shape
+
+    W_q = torch.empty((out_features, in_features), dtype=torch.int8, device=device)
+    scale_w = torch.empty((out_features,), dtype=torch.float32, device=device)
+
+    # Keep alpha on device in float32/float16
+    if alpha is not None:
+        alpha = alpha.to(device=device, dtype=W.dtype)
+
+    for start in range(0, out_features, chunk_rows):
+        end = min(start + chunk_rows, out_features)
+        W_chunk = W[start:end, :]  # view
+
+        # Apply smoothing lazily (creates only chunk-sized tensor)
+        if alpha is not None:
+            W_chunk = W_chunk * alpha.unsqueeze(0)
+
+        # Compute per-row scale: maxabs / 127
+        maxabs = W_chunk.abs().amax(dim=1).to(torch.float32).clamp_min(eps)
+        s = maxabs / 127.0
+        scale_w[start:end] = s
+
+        # Quantize: round(W / s)
+        # Use broadcasting with chunk-sized tensor only
+        q = torch.round(W_chunk / s.unsqueeze(1)).clamp(-127, 127).to(torch.int8)
+        W_q[start:end, :] = q
+
+    return W_q, scale_w
 
 
 

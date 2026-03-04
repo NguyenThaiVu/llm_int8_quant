@@ -23,14 +23,6 @@ from utils_layer_int8 import *
 from utils import *
 from utils_evaluation import load_wikitext2_samples, compute_ppl
 
-pkgs = [
-    "huggingface_hub",  # to download pretrained weights
-    "tokenizers",       # to implement the tokenizer
-    "torch",            # to implement the model
-]
-for p in pkgs:
-    print(f"{p} version: {version(p)}")
-    
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
@@ -39,7 +31,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "4B"  # Options:, "4B", "8B"
+CHOOSE_MODEL = "8B"  # Options:, "4B", "8B"
 
 
 class RMSNorm(nn.Module):
@@ -247,20 +239,6 @@ class GroupedQueryAttention(nn.Module):
         self.is_quantized = True
     
     
-class FeedForward(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.fc1 = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
-        self.fc2 = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
-        self.fc3 = nn.Linear(cfg["hidden_dim"], cfg["emb_dim"], dtype=cfg["dtype"], bias=False)
-
-    def forward(self, x):
-        x_fc1 = self.fc1(x)
-        x_fc2 = self.fc2(x)
-        x = nn.functional.silu(x_fc1) * x_fc2
-        return self.fc3(x)
-
-    
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -273,12 +251,10 @@ class TransformerBlock(nn.Module):
             dtype=cfg["dtype"]
         )
         
-        self.norm1 = Custom_RMSNorm(max_seq_len = 1024, dim=cfg["emb_dim"]).to(cfg["dtype"])
+        self.norm1 = RMSNorm(cfg["emb_dim"], eps=1e-6)
         
         self.ff = Custom_FeedForward(cfg).to(cfg["dtype"])
-        # self.ff = FeedForward(cfg)
         
-        # self.norm2 = Custom_RMSNorm(max_seq_len = 1024, dim=cfg["emb_dim"]).to(cfg["dtype"])
         self.norm2 = RMSNorm(cfg["emb_dim"], eps=1e-6)
         
         self.is_quantized = False
@@ -287,17 +263,7 @@ class TransformerBlock(nn.Module):
     def forward(self, x, mask, cos, sin):
         # 1. Shortcut for attention block
         shortcut = x
-        
-        original_dtype = x.dtype
-        x = x.squeeze(0)  # Remove batch dimension
-        if self.is_quantized == False: # float computation
-            x, _ = self.norm1(x, 1.0)
-        else:
-            x_int8, x_scale = quantize_row_int8_symmetric_nd(x)
-            x_int8, x_scale = self.norm1(x_int8, x_scale)
-            x = x_int8.to(torch.float32) * x_scale.unsqueeze(-1)
-        x = x.unsqueeze(0) # Add batch dimension back
-        x = x.to(original_dtype)
+        x = self.norm1(x)
         
         x = self.att(x, mask, cos, sin)  # Shape [batch_size, num_tokens, emb_size]
         x = x + shortcut  
@@ -306,21 +272,10 @@ class TransformerBlock(nn.Module):
         shortcut = x
         x = self.norm2(x)
 
-        # x = self.ff(x)
         # # === Feed-forward with quantization support ===
         original_dtype = x.dtype
         x = x.squeeze(0)  # Remove batch dimension 
-        
-        if self.is_quantized == False: # float computation
-            x, _ = self.ff(x, 1.0)
-        else:
-            # x_int8, x_scale = quantize_row_int8_symmetric_nd(x, percentile=0.9999)
-            # out_int8, out_scale = self.ff(x_int8, x_scale)
-            # x = out_int8.to(torch.float32) * out_scale.unsqueeze(-1)
-            
-            out, _ = self.ff(x, 1.0)
-            x = out
-        
+        x, _ = self.ff(x, 1.0)
         x = x.unsqueeze(0) # Add batch dimension back
         x = x.to(original_dtype)
         # # ========================================
@@ -330,10 +285,7 @@ class TransformerBlock(nn.Module):
         return x
 
     def finish_calibration(self):
-        self.norm1.finish_calibration()
         self.att.finish_calibration()
-        
-        # self.norm2.finish_calibration()
         self.ff.finish_calibration()
         
         self.is_quantized = True
@@ -651,12 +603,17 @@ calibration_samples = load_wikitext2_samples()
 for idx, text in enumerate(calibration_samples):
     input_token_ids = tokenizer.encode(text)
     
-    if len(input_token_ids) > MAX_SEQ_LEN:
-        input_token_ids = input_token_ids[:MAX_SEQ_LEN]
+    # if len(input_token_ids) > MAX_SEQ_LEN:
+    #     input_token_ids = input_token_ids[:MAX_SEQ_LEN]
     
-    input_token_ids_tensor = torch.tensor(input_token_ids, device=device).unsqueeze(0)
-    with torch.no_grad():
-        _ = model(input_token_ids_tensor)
+    for i in range(0, len(input_token_ids), MAX_CONTEXT_TOKENS):
+        chunk_token_ids = input_token_ids[i:i+MAX_CONTEXT_TOKENS]
+        if len(chunk_token_ids) < 2:  # Skip too short chunks
+            continue
+    
+        input_token_ids_tensor = torch.tensor(chunk_token_ids, device=device).unsqueeze(0)
+        with torch.no_grad():
+            _ = model(input_token_ids_tensor)
         
 model.finish_calibration()
 print(f"[INFO] Finished calibration {len(calibration_samples)} samples.")
