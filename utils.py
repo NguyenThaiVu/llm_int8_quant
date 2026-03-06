@@ -65,7 +65,8 @@ def quantize_row_int8_symmetric_nd(
 
     assert mat.dim() >= 2, "mat must be at least 2D"
 
-    mat = mat.to(scale_dtype)
+    # mat = mat.to(scale_dtype)
+    
     qmin, qmax = -128, 127
 
     orig_shape = mat.shape  # (..., C)
@@ -106,6 +107,7 @@ def quantize_row_int8_symmetric_nd(
     scales = scales.reshape(orig_shape[:-1])
 
     return q_mat, scales.to(scale_dtype)
+
 
 @torch.no_grad()
 def quantize_row_int8_symmetric_nd_chunked(W, alpha=None, chunk_rows=1024, eps=1e-8):

@@ -5,8 +5,10 @@ import gemm_cutlass
 from utils_transformer_int8 import *
 from utils import *
 
+MAX_SEQ_LEN = 1280
+
 class Custom_Linear(nn.Module):
-    def __init__(self, in_features, out_features, max_seq_len=1024):
+    def __init__(self, in_features, out_features, max_seq_len=MAX_SEQ_LEN):
         super(Custom_Linear, self).__init__()
         
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
@@ -99,7 +101,7 @@ class Custom_Softmax(nn.Module):
         
         
 class Custom_RMSNorm(nn.Module):
-    def __init__(self, num_heads=1, max_seq_len=1024, dim=None, eps=1e-6):
+    def __init__(self, num_heads=1, max_seq_len=MAX_SEQ_LEN, dim=None, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim)) # learnable weight of RMSNorm
         self.eps = eps
@@ -153,7 +155,7 @@ class Custom_RMSNorm(nn.Module):
         
         
 class Custom_RoPE(nn.Module):
-    def __init__(self, num_heads, max_seq_len=1024, head_dim=None):
+    def __init__(self, num_heads, max_seq_len=MAX_SEQ_LEN, head_dim=None):
         super(Custom_RoPE, self).__init__()
         self.num_heads = num_heads
         self.max_seq_len = max_seq_len
@@ -212,7 +214,7 @@ class Custom_RoPE(nn.Module):
         
 
 class Custom_Element_Wise(torch.nn.Module):
-    def __init__(self, max_length = 1024):
+    def __init__(self, max_length = MAX_SEQ_LEN):
         super().__init__()
         self.out_observer = MinMaxObserverPerLastDim(max_seq_len=max_length)
         self.register_buffer('scale_out', torch.ones(max_length)) 
@@ -239,7 +241,7 @@ class Custom_Element_Wise(torch.nn.Module):
         self.is_quantized = True
         
 class Custom_Sigmoid(torch.nn.Module):
-    def __init__(self, max_seq_len=1024):
+    def __init__(self, max_seq_len=MAX_SEQ_LEN):
         super(Custom_Sigmoid, self).__init__()
         self.max_seq_len = max_seq_len
         self.observer = MinMaxObserverPerLastDim(max_seq_len=max_seq_len)
@@ -267,7 +269,7 @@ class Custom_Sigmoid(torch.nn.Module):
         
         
 class Custom_SiLU(nn.Module):
-    def __init__(self, max_length=1024):
+    def __init__(self, max_length=MAX_SEQ_LEN):
         super(Custom_SiLU, self).__init__()
         
         self.sigmoid = Custom_Sigmoid(max_seq_len=max_length)
@@ -299,16 +301,16 @@ class Custom_SiLU(nn.Module):
 # class Custom_FeedForward(nn.Module):
 #     def __init__(self, cfg):
 #         super().__init__()
-#         # self.fc1 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
-#         # self.fc2 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
-#         # self.fc3 = Custom_Linear(cfg["hidden_dim"], cfg["emb_dim"], max_seq_len=1024)
+#         # self.fc1 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=MAX_SEQ_LEN)
+#         # self.fc2 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=MAX_SEQ_LEN)
+#         # self.fc3 = Custom_Linear(cfg["hidden_dim"], cfg["emb_dim"], max_seq_len=MAX_SEQ_LEN)
         
-#         self.fc1 = Custom_Linear_PerRow(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
-#         self.fc2 = Custom_Linear_PerRow(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
-#         self.fc3 = Custom_Linear_PerRow(cfg["hidden_dim"], cfg["emb_dim"], max_seq_len=1024)
+#         self.fc1 = Custom_Linear_PerRow(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=MAX_SEQ_LEN)
+#         self.fc2 = Custom_Linear_PerRow(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=MAX_SEQ_LEN)
+#         self.fc3 = Custom_Linear_PerRow(cfg["hidden_dim"], cfg["emb_dim"], max_seq_len=MAX_SEQ_LEN)
         
-#         self.custom_silu = Custom_SiLU(max_length=1024)
-#         self.custom_elementwise_mul = Custom_Element_Wise(max_length=1024)
+#         self.custom_silu = Custom_SiLU(max_length=MAX_SEQ_LEN)
+#         self.custom_elementwise_mul = Custom_Element_Wise(max_length=MAX_SEQ_LEN)
         
 #         self.is_quantized = False
 
@@ -390,7 +392,7 @@ class PerChannelAbsMaxObserver(nn.Module):
 
 
 class Custom_Linear_PerRow(nn.Module):
-    def __init__(self, in_features, out_features, max_seq_len=1024):
+    def __init__(self, in_features, out_features, max_seq_len=MAX_SEQ_LEN):
         super(Custom_Linear_PerRow, self).__init__()
         
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
@@ -457,7 +459,7 @@ class Custom_Linear_PerRow(nn.Module):
         # w_smooth = self.weight * alpha.unsqueeze(0)    
         # self.weight_q, self.scale_w = quantize_row_int8_symmetric_nd(w_smooth)
         self.weight_q, self.scale_w = quantize_row_int8_symmetric_nd_chunked(
-            self.weight, alpha=alpha, chunk_rows=1024)
+            self.weight, alpha=alpha, chunk_rows=MAX_SEQ_LEN)
 
         self.scale_y = self.out_observer.get_scale().to(self.scale_w.device)
         self.is_quantized = True  
@@ -467,12 +469,12 @@ class Custom_FeedForward(nn.Module):
     def __init__(self, cfg):
         super().__init__()
 
-        self.fc1 = Custom_Linear_PerRow(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
-        self.fc2 = Custom_Linear_PerRow(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=1024)
-        self.fc3 = Custom_Linear_PerRow(cfg["hidden_dim"], cfg["emb_dim"], max_seq_len=1024)
+        self.fc1 = Custom_Linear_PerRow(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=MAX_SEQ_LEN)
+        self.fc2 = Custom_Linear_PerRow(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=MAX_SEQ_LEN)
+        self.fc3 = Custom_Linear_PerRow(cfg["hidden_dim"], cfg["emb_dim"], max_seq_len=MAX_SEQ_LEN)
         
-        self.custom_silu = Custom_SiLU(max_length=1024)
-        self.custom_elementwise_mul = Custom_Element_Wise(max_length=1024)
+        self.custom_silu = Custom_SiLU(max_length=MAX_SEQ_LEN)
+        self.custom_elementwise_mul = Custom_Element_Wise(max_length=MAX_SEQ_LEN)
         
         self.is_quantized = False
 
@@ -526,7 +528,7 @@ class Custom_FeedForward(nn.Module):
 
 
 class Custom_Matmul(nn.Module):
-    def __init__(self, num_heads=1, max_seq_len=1024):
+    def __init__(self, num_heads=1, max_seq_len=MAX_SEQ_LEN):
         super().__init__()
         self.num_heads = num_heads
         self.max_seq_len = max_seq_len
@@ -588,182 +590,185 @@ class Custom_Matmul(nn.Module):
         self.is_quantized = True
         
         
-class Custom_GroupQueryAttention(nn.Module):
-    def __init__(self, d_in, num_heads, num_kv_groups, head_dim=None,\
-        qk_norm=True, max_seq_len=1024, dtype=torch.bfloat16):
         
-        super(Custom_GroupQueryAttention, self).__init__()
-        assert num_heads % num_kv_groups == 0, "num_heads must be divisible by num_kv_groups"
-        self.num_heads = num_heads
-        self.num_kv_groups = num_kv_groups
-        self.group_size = num_heads // num_kv_groups
-        if head_dim is None:
-            head_dim = d_in // num_heads
-        self.head_dim = head_dim
-        self.d_out = num_heads * head_dim
-        self.qk_norm = qk_norm
         
-        self.linear_q = Custom_Linear(d_in, self.d_out)
-        self.linear_k = Custom_Linear(d_in, num_kv_groups * head_dim)
-        self.linear_v = Custom_Linear(d_in, num_kv_groups * head_dim)
-        self.out_proj = Custom_Linear(self.d_out, d_in)
         
-        self.query_rope_layer = Custom_RoPE(head_dim, max_seq_len=max_seq_len)
-        self.key_rope_layer = Custom_RoPE(head_dim, max_seq_len=max_seq_len)
+# class Custom_GroupQueryAttention(nn.Module):
+#     def __init__(self, d_in, num_heads, num_kv_groups, head_dim=None,\
+#         qk_norm=True, max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16):
         
-        self.softmax = Custom_Softmax(num_heads, max_seq_len, dim=-1)
+#         super(Custom_GroupQueryAttention, self).__init__()
+#         assert num_heads % num_kv_groups == 0, "num_heads must be divisible by num_kv_groups"
+#         self.num_heads = num_heads
+#         self.num_kv_groups = num_kv_groups
+#         self.group_size = num_heads // num_kv_groups
+#         if head_dim is None:
+#             head_dim = d_in // num_heads
+#         self.head_dim = head_dim
+#         self.d_out = num_heads * head_dim
+#         self.qk_norm = qk_norm
         
-        if qk_norm:
-            self.q_norm = Custom_RMSNorm(num_heads, max_seq_len=max_seq_len, dim=head_dim, eps=1e-6)
-            self.k_norm = Custom_RMSNorm(num_kv_groups, max_seq_len=max_seq_len, dim=head_dim, eps=1e-6)
-        else:
-            self.q_norm = self.k_norm = None
+#         self.linear_q = Custom_Linear(d_in, self.d_out)
+#         self.linear_k = Custom_Linear(d_in, num_kv_groups * head_dim)
+#         self.linear_v = Custom_Linear(d_in, num_kv_groups * head_dim)
+#         self.out_proj = Custom_Linear(self.d_out, d_in)
+        
+#         self.query_rope_layer = Custom_RoPE(head_dim, max_seq_len=max_seq_len)
+#         self.key_rope_layer = Custom_RoPE(head_dim, max_seq_len=max_seq_len)
+        
+#         self.softmax = Custom_Softmax(num_heads, max_seq_len, dim=-1)
+        
+#         if qk_norm:
+#             self.q_norm = Custom_RMSNorm(num_heads, max_seq_len=max_seq_len, dim=head_dim, eps=1e-6)
+#             self.k_norm = Custom_RMSNorm(num_kv_groups, max_seq_len=max_seq_len, dim=head_dim, eps=1e-6)
+#         else:
+#             self.q_norm = self.k_norm = None
             
-        self.q_reshape_head_observer = MinMaxObserverPerLastDim()
-        self.register_buffer('scale_q_reshape_head', torch.ones(num_heads * max_seq_len))
+#         self.q_reshape_head_observer = MinMaxObserverPerLastDim()
+#         self.register_buffer('scale_q_reshape_head', torch.ones(num_heads * max_seq_len))
         
-        self.k_reshape_head_observer = MinMaxObserverPerLastDim()
-        self.register_buffer('scale_k_reshape_head', torch.ones(num_kv_groups * max_seq_len))
+#         self.k_reshape_head_observer = MinMaxObserverPerLastDim()
+#         self.register_buffer('scale_k_reshape_head', torch.ones(num_kv_groups * max_seq_len))
         
-        self.v_reshape_head_observer = MinMaxObserverPerLastDim()
-        self.register_buffer('scale_v_reshape_head', torch.ones(num_kv_groups * max_seq_len))
+#         self.v_reshape_head_observer = MinMaxObserverPerLastDim()
+#         self.register_buffer('scale_v_reshape_head', torch.ones(num_kv_groups * max_seq_len))
         
-        self.qk_observer = MinMaxObserverPerLastDim()
-        self.register_buffer('scale_qk', torch.ones(num_heads * max_seq_len))
+#         self.qk_observer = MinMaxObserverPerLastDim()
+#         self.register_buffer('scale_qk', torch.ones(num_heads * max_seq_len))
         
-        self.atten_observer = MinMaxObserverPerLastDim()
-        self.register_buffer('scale_attn', torch.ones(num_heads * max_seq_len))
+#         self.atten_observer = MinMaxObserverPerLastDim()
+#         self.register_buffer('scale_attn', torch.ones(num_heads * max_seq_len))
         
-        self.out_proj_observer = MinMaxObserverPerLastDim()
-        self.register_buffer('scale_out_proj', torch.ones(max_seq_len))
+#         self.out_proj_observer = MinMaxObserverPerLastDim()
+#         self.register_buffer('scale_out_proj', torch.ones(max_seq_len))
         
-        self.is_quantized = False
+#         self.is_quantized = False
         
-    def forward(self, x, scale_x, mask, cos, scale_cos, sin, scale_sin):
-        if x.dim() == 3:
-            b, num_tokens, _ = x.shape
-        elif x.dim() == 2:
-            num_tokens, _ = x.shape
-        else:
-            raise ValueError("Input must be 2D or 3D tensor")
+#     def forward(self, x, scale_x, mask, cos, scale_cos, sin, scale_sin):
+#         if x.dim() == 3:
+#             b, num_tokens, _ = x.shape
+#         elif x.dim() == 2:
+#             num_tokens, _ = x.shape
+#         else:
+#             raise ValueError("Input must be 2D or 3D tensor")
 
-        q, scale_q = self.linear_q(x, scale_x)
-        k, scale_k = self.linear_k(x, scale_x)
-        v, scale_v = self.linear_v(x, scale_x)
+#         q, scale_q = self.linear_q(x, scale_x)
+#         k, scale_k = self.linear_k(x, scale_x)
+#         v, scale_v = self.linear_v(x, scale_x)
         
-        q = q.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
-        self.q_reshape_head_observer(q)
+#         q = q.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
+#         self.q_reshape_head_observer(q)
         
-        k = k.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
-        self.k_reshape_head_observer(k)
+#         k = k.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+#         self.k_reshape_head_observer(k)
         
-        v = v.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
-        self.v_reshape_head_observer(v)
+#         v = v.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+#         self.v_reshape_head_observer(v)
         
-        if not self.is_quantized:
+#         if not self.is_quantized:
             
-            if self.qk_norm:
-                q, _ = self.q_norm(q, 1.0)
-                k, _ = self.k_norm(k, 1.0)
+#             if self.qk_norm:
+#                 q, _ = self.q_norm(q, 1.0)
+#                 k, _ = self.k_norm(k, 1.0)
                 
-            # 1. Apply RoPE to Q and K
-            q_rope, _ = self.query_rope_layer(q, 1.0, cos, 1.0, sin, 1.0)
-            k_rope, _ = self.key_rope_layer(k, 1.0, cos, 1.0, sin, 1.0)
+#             # 1. Apply RoPE to Q and K
+#             q_rope, _ = self.query_rope_layer(q, 1.0, cos, 1.0, sin, 1.0)
+#             k_rope, _ = self.key_rope_layer(k, 1.0, cos, 1.0, sin, 1.0)
             
-            # Expand K and V to match number of heads
-            k_rope = k_rope.repeat_interleave(self.group_size, dim=0)
-            v = v.repeat_interleave(self.group_size, dim=0)
+#             # Expand K and V to match number of heads
+#             k_rope = k_rope.repeat_interleave(self.group_size, dim=0)
+#             v = v.repeat_interleave(self.group_size, dim=0)
             
-            # 2. Compute attention weights 
-            qk_weights = torch.matmul(q_rope, k_rope.transpose(-2, -1))
-            self.qk_observer(qk_weights)
+#             # 2. Compute attention weights 
+#             qk_weights = torch.matmul(q_rope, k_rope.transpose(-2, -1))
+#             self.qk_observer(qk_weights)
             
-            qk_weights = qk_weights / (self.head_dim ** 0.5)
+#             qk_weights = qk_weights / (self.head_dim ** 0.5)
             
-            qk_weights = qk_weights.masked_fill(mask.unsqueeze(0).to(torch.bool), float('-inf'))
-            softmax_weight, _ = self.softmax(qk_weights, 1.0)
+#             qk_weights = qk_weights.masked_fill(mask.unsqueeze(0).to(torch.bool), float('-inf'))
+#             softmax_weight, _ = self.softmax(qk_weights, 1.0)
             
-            # 3. Compute attention output
-            attn_output = torch.matmul(softmax_weight, v)
-            self.atten_observer(attn_output)
+#             # 3. Compute attention output
+#             attn_output = torch.matmul(softmax_weight, v)
+#             self.atten_observer(attn_output)
             
-            # 4. Final output projection
-            attn_output = attn_output.transpose(0, 1).contiguous().view(num_tokens, self.d_out)
-            self.out_proj_observer(attn_output)
+#             # 4. Final output projection
+#             attn_output = attn_output.transpose(0, 1).contiguous().view(num_tokens, self.d_out)
+#             self.out_proj_observer(attn_output)
             
-            output, _ = self.out_proj(attn_output, 1.0)
-            return output, 1.0
-        else: 
-            # ===== Quantized path =====
+#             output, _ = self.out_proj(attn_output, 1.0)
+#             return output, 1.0
+#         else: 
+#             # ===== Quantized path =====
         
-            if self.qk_norm:
-                q, scale_query = self.q_norm(q, self.scale_q_reshape_head)
-                k, scale_key = self.k_norm(k, self.scale_k_reshape_head)
-            else:  # if not apply RMSNorm, we only pass the scale
-                scale_query = self.scale_q_reshape_head
-                scale_key = self.scale_k_reshape_head
+#             if self.qk_norm:
+#                 q, scale_query = self.q_norm(q, self.scale_q_reshape_head)
+#                 k, scale_key = self.k_norm(k, self.scale_k_reshape_head)
+#             else:  # if not apply RMSNorm, we only pass the scale
+#                 scale_query = self.scale_q_reshape_head
+#                 scale_key = self.scale_k_reshape_head
             
-            # 1. Apply RoPE to Q and K
-            q_rope, scale_q_rope = self.query_rope_layer(q, scale_query,\
-                                        cos, scale_cos,\
-                                        sin, scale_sin)
+#             # 1. Apply RoPE to Q and K
+#             q_rope, scale_q_rope = self.query_rope_layer(q, scale_query,\
+#                                         cos, scale_cos,\
+#                                         sin, scale_sin)
             
-            k_rope, scale_k_rope = self.key_rope_layer(k, scale_key,\
-                                        cos, scale_cos,\
-                                        sin, scale_sin)
+#             k_rope, scale_k_rope = self.key_rope_layer(k, scale_key,\
+#                                         cos, scale_cos,\
+#                                         sin, scale_sin)
             
-            # Expand K and V to match number of heads
-            k_rope = k_rope.repeat_interleave(self.group_size, dim=0)
-            scale_k_rope = scale_k_rope.repeat_interleave(self.group_size, dim=0)
+#             # Expand K and V to match number of heads
+#             k_rope = k_rope.repeat_interleave(self.group_size, dim=0)
+#             scale_k_rope = scale_k_rope.repeat_interleave(self.group_size, dim=0)
             
-            v = v.repeat_interleave(self.group_size, dim=0)
-            scale_v = self.scale_v_reshape_head.repeat_interleave(self.group_size, dim=0)
+#             v = v.repeat_interleave(self.group_size, dim=0)
+#             scale_v = self.scale_v_reshape_head.repeat_interleave(self.group_size, dim=0)
             
-            # 2. Compute attention weights
-            qk_weight_scale = scale_q_rope * scale_k_rope / self.scale_qk
-            qk_weight_scale = qk_weight_scale.to(torch.float32)
-            qk_weights_q = gemm_cutlass.func_int8_matmul_out_int8_per_row_scale_batched(
-                q_rope, k_rope, 
-                qk_weight_scale
-            )
+#             # 2. Compute attention weights
+#             qk_weight_scale = scale_q_rope * scale_k_rope / self.scale_qk
+#             qk_weight_scale = qk_weight_scale.to(torch.float32)
+#             qk_weights_q = gemm_cutlass.func_int8_matmul_out_int8_per_row_scale_batched(
+#                 q_rope, k_rope, 
+#                 qk_weight_scale
+#             )
             
-            scale_qk_value = self.scale_qk / (self.head_dim ** 0.5)
-            softmax_weight_q, scale_softmax = self.softmax(qk_weights_q,\
-                                    scale_x=scale_qk_value)
+#             scale_qk_value = self.scale_qk / (self.head_dim ** 0.5)
+#             softmax_weight_q, scale_softmax = self.softmax(qk_weights_q,\
+#                                     scale_x=scale_qk_value)
             
-            # 3. Compute attention output
-            v = v.transpose(-2, -1).contiguous()
-            scale_attn_out = scale_softmax * scale_v / self.scale_attn
-            attn_output_q = gemm_cutlass.func_int8_matmul_out_int8_per_row_scale_batched(
-                softmax_weight_q, v, scale_attn_out.to(torch.float32)
-            )
+#             # 3. Compute attention output
+#             v = v.transpose(-2, -1).contiguous()
+#             scale_attn_out = scale_softmax * scale_v / self.scale_attn
+#             attn_output_q = gemm_cutlass.func_int8_matmul_out_int8_per_row_scale_batched(
+#                 softmax_weight_q, v, scale_attn_out.to(torch.float32)
+#             )
             
-            # 4. Final output projection
-            attn_output_q = attn_output_q.transpose(0, 1).contiguous().view(num_tokens, self.d_out)
-            output_q, scale_out = self.out_proj(attn_output_q, self.scale_out_proj)
-            return output_q, scale_out
+#             # 4. Final output projection
+#             attn_output_q = attn_output_q.transpose(0, 1).contiguous().view(num_tokens, self.d_out)
+#             output_q, scale_out = self.out_proj(attn_output_q, self.scale_out_proj)
+#             return output_q, scale_out
         
         
-    def finish_calibration(self):
-        self.linear_q.finish_calibration()
-        self.linear_k.finish_calibration()
-        self.linear_v.finish_calibration()
-        self.out_proj.finish_calibration()
-        self.softmax.finish_calibration()
-        self.query_rope_layer.finish_calibration()
-        self.key_rope_layer.finish_calibration()
+#     def finish_calibration(self):
+#         self.linear_q.finish_calibration()
+#         self.linear_k.finish_calibration()
+#         self.linear_v.finish_calibration()
+#         self.out_proj.finish_calibration()
+#         self.softmax.finish_calibration()
+#         self.query_rope_layer.finish_calibration()
+#         self.key_rope_layer.finish_calibration()
         
-        if self.qk_norm:
-            self.q_norm.finish_calibration()
-            self.k_norm.finish_calibration()
+#         if self.qk_norm:
+#             self.q_norm.finish_calibration()
+#             self.k_norm.finish_calibration()
         
-        self.scale_q_reshape_head = self.q_reshape_head_observer.get_scale().to(self.scale_q_reshape_head.device)
-        self.scale_k_reshape_head = self.k_reshape_head_observer.get_scale().to(self.scale_k_reshape_head.device)
-        self.scale_v_reshape_head = self.v_reshape_head_observer.get_scale().to(self.scale_v_reshape_head.device)
+#         self.scale_q_reshape_head = self.q_reshape_head_observer.get_scale().to(self.scale_q_reshape_head.device)
+#         self.scale_k_reshape_head = self.k_reshape_head_observer.get_scale().to(self.scale_k_reshape_head.device)
+#         self.scale_v_reshape_head = self.v_reshape_head_observer.get_scale().to(self.scale_v_reshape_head.device)
         
-        self.scale_qk = self.qk_observer.get_scale().to(self.scale_qk.device)
-        self.scale_attn = self.atten_observer.get_scale().to(self.scale_attn.device)
-        self.scale_out_proj = self.out_proj_observer.get_scale().to(self.scale_out_proj.device)
+#         self.scale_qk = self.qk_observer.get_scale().to(self.scale_qk.device)
+#         self.scale_attn = self.atten_observer.get_scale().to(self.scale_attn.device)
+#         self.scale_out_proj = self.out_proj_observer.get_scale().to(self.scale_out_proj.device)
         
-        self.is_quantized = True
+#         self.is_quantized = True
         

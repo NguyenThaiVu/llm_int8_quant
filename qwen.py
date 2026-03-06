@@ -29,7 +29,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "4B"  # Options: "4B", "8B", 
+CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B"
 
 
 class FeedForward(nn.Module):
@@ -279,8 +279,16 @@ else:
 
 # =================================================================
 # IMPORTANT: Change this path to your desired folder to store model weights
-# MODEL_HUD_FOLDER = "/scratch/tnguyen10/"
-MODEL_HUD_FOLDER = "/sciclone/home/tnguyen10/Desktop/LLM_Quantization/model/"
+MODEL_HUD_FOLDER_1 = "/sciclone/home/tnguyen10/Desktop/LLM_Quantization/model/"
+MODEL_HUD_FOLDER_2 = "/scratch/tnguyen10/"
+
+if os.path.exists(MODEL_HUD_FOLDER_1):
+    MODEL_HUD_FOLDER = MODEL_HUD_FOLDER_1
+elif os.path.exists(MODEL_HUD_FOLDER_2):
+    MODEL_HUD_FOLDER = MODEL_HUD_FOLDER_2
+else:
+    raise ValueError("Please update the MODEL_HUD_FOLDER.")
+
 
 
 local_dir = Path(repo_id).parts[-1]
@@ -370,8 +378,8 @@ def get_clean_generated_text(generated_text):
     return output_text
 
 
-MAX_NEW_TOKENS = 256
-MAX_CONTEXT_TOKENS = 128
+MAX_NEW_TOKENS = 128
+MAX_CONTEXT_TOKENS = 64
 
 list_prompt = ["What is the capital of VietNam?",\
                 "Who is the president of VietNam?",\
@@ -395,17 +403,17 @@ for idx, prompt in enumerate(list_prompt):
     print(f"{idx}. Generated response: {response} \n")
     
 
-# num_samples = 15
+num_samples = 15
 
-# samples = load_wikitext2_samples(num_samples)
-# print(f"Loaded {len(samples)} samples. Computing perplexity...")
+samples = load_wikitext2_samples(num_samples)
+print(f"Loaded {len(samples)} samples. Computing perplexity...")
 
-# corpus_ppl = compute_ppl(
-#     model=model,
-#     tokenizer=tokenizer,           
-#     texts=samples,
-#     context_size=MAX_CONTEXT_TOKENS,
-#     device=device
-# )
+corpus_ppl = compute_ppl(
+    model=model,
+    tokenizer=tokenizer,           
+    texts=samples,
+    context_size=MAX_CONTEXT_TOKENS,
+    device=device
+)
 
-# print("Corpus PPL (before quantization):", corpus_ppl)   
+print("Corpus PPL (before quantization):", corpus_ppl)   

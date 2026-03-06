@@ -21,7 +21,7 @@ from config import get_model_config
 from utils_transformer_int8 import *
 from utils_layer_int8 import *
 from utils import *
-from utils_evaluation import load_wikitext2_samples, compute_ppl
+from utils_evaluation import *
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -31,7 +31,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "8B"  # Options:, "4B", "8B"
+CHOOSE_MODEL = "8B"  # Options:, "4B", "8B", "14B"
 
 
 class RMSNorm(nn.Module):
@@ -76,7 +76,7 @@ def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=
     return cos, sin
 
 
-MAX_SEQ_LEN = 1024
+MAX_SEQ_LEN = 1280
 class GroupedQueryAttention(nn.Module):
     def __init__(
         self, d_in, num_heads, num_kv_groups, head_dim=None, qk_norm=False, dtype=None
@@ -170,20 +170,29 @@ class GroupedQueryAttention(nn.Module):
             keys_int8, keys_scale = self.W_key(x_int8, x_scale)
             values_int8, values_scale = self.W_value(x_int8, x_scale)
             
-            queries = queries_int8.to(torch.float32) * queries_scale.unsqueeze(-1)
-            keys = keys_int8.to(torch.float32) * keys_scale.unsqueeze(-1)
-            values = values_int8.to(torch.float32) * values_scale.unsqueeze(-1)
+            # # Reshape for multi-head attention
+            # queries = queries_int8.to(torch.float32) * queries_scale.unsqueeze(-1)
+            # keys = keys_int8.to(torch.float32) * keys_scale.unsqueeze(-1)
+            # values = values_int8.to(torch.float32) * values_scale.unsqueeze(-1)
             
-            # # Reshape and transpose for multi-head attention
-            queries = queries.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
-            keys = keys.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
-            values = values.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)   
+            # queries = queries.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
+            # keys = keys.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+            # values = values.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)   
             
-            # Apply RMSNorm to quantized Q and K
-            queries_int8, queries_scale = quantize_row_int8_symmetric_nd(queries)
+            # # Apply RMSNorm to quantized Q and K
+            # queries_int8, queries_scale = quantize_row_int8_symmetric_nd(queries)
+            # keys_int8, keys_scale = quantize_row_int8_symmetric_nd(keys)
+            
+            # Reshape for multi-head attention
+            queries_int8 = queries_int8.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
+            keys_int8 = keys_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+            values_int8 = values_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+
+            queries_scale = queries_scale.unsqueeze(0).expand(self.num_heads, -1)
+            keys_scale = keys_scale.unsqueeze(0).expand(self.num_kv_groups, -1)
+            values_scale = values_scale.unsqueeze(0).expand(self.num_kv_groups, -1)
+            
             queries_int8, queries_scale = self.q_norm(queries_int8, queries_scale)
-            
-            keys_int8, keys_scale = quantize_row_int8_symmetric_nd(keys)
             keys_int8, keys_scale = self.k_norm(keys_int8, keys_scale)
             
             # Apply RoPE to quantized Q and K
@@ -196,7 +205,9 @@ class GroupedQueryAttention(nn.Module):
             # Repeat K and V for grouped attention
             keys_int8 = keys_int8.repeat_interleave(self.group_size, dim=0)
             keys_scale = keys_scale.repeat_interleave(self.group_size, dim=0)
-            values = values.repeat_interleave(self.group_size, dim=0)
+            values_int8 = values_int8.repeat_interleave(self.group_size, dim=0)
+            values_scale = values_scale.repeat_interleave(self.group_size, dim=0)
+            # values = values.repeat_interleave(self.group_size, dim=0)
             
             # Attention score with quantization    
             attn_scores_int8, attn_scores_scale = self.qk_score_layer(queries_int8, queries_scale, keys_int8, keys_scale)
@@ -206,8 +217,15 @@ class GroupedQueryAttention(nn.Module):
             attn_weights_int8, attn_weights_scale = self.softmax_layer(attn_scores_int8, attn_scores_scale)
             
             # Compute context with quantization
-            values = values.transpose(1, 2)  # Shape: (num_heads, head_dim, num_tokens)
-            values_int8, values_scale = quantize_row_int8_symmetric_nd(values)
+            # values = values.transpose(1, 2)  # Shape: (num_heads, head_dim, num_tokens)
+            # values_int8, values_scale = quantize_row_int8_symmetric_nd(values)
+            
+            print(f"attn_weights_scale dtype: {attn_weights_scale.dtype}")
+            if attn_weights_scale.dtype != torch.float32:
+                attn_weights_scale = attn_weights_scale.to(torch.float32)
+            print(f"values_scale dtype: {values_scale.dtype}")
+            if values_scale.dtype != torch.float32:
+                values_scale = values_scale.to(torch.float32)
             
             context_int8, context_scale = self.context_layer(attn_weights_int8, attn_weights_scale,
                                                              values_int8, values_scale)
@@ -274,7 +292,7 @@ class TransformerBlock(nn.Module):
 
         # # === Feed-forward with quantization support ===
         original_dtype = x.dtype
-        x = x.squeeze(0)  # Remove batch dimension 
+        x = x.squeeze(0)  # Remove batch dimension
         x, _ = self.ff(x, 1.0)
         x = x.unsqueeze(0) # Add batch dimension back
         x = x.to(original_dtype)
@@ -466,8 +484,15 @@ else:
 
 # =================================================================
 # IMPORTANT: Change this path to your desired folder to store model weights
-# MODEL_HUD_FOLDER = "/scratch/tnguyen10/"
-MODEL_HUD_FOLDER = "/sciclone/home/tnguyen10/Desktop/LLM_Quantization/model/"
+MODEL_HUD_FOLDER_1 = "/sciclone/home/tnguyen10/Desktop/LLM_Quantization/model/"
+MODEL_HUD_FOLDER_2 = "/scratch/tnguyen10/"
+
+if os.path.exists(MODEL_HUD_FOLDER_1):
+    MODEL_HUD_FOLDER = MODEL_HUD_FOLDER_1
+elif os.path.exists(MODEL_HUD_FOLDER_2):
+    MODEL_HUD_FOLDER = MODEL_HUD_FOLDER_2
+else:
+    raise ValueError("Please update the MODEL_HUD_FOLDER.")
 
 
 local_dir = Path(repo_id).parts[-1]
@@ -556,8 +581,8 @@ def get_clean_generated_text(generated_text):
     return output_text
 
 
-MAX_NEW_TOKENS = 256
-MAX_CONTEXT_TOKENS = 128
+MAX_NEW_TOKENS = 512
+PPL_CONTEXT_TOKENS = 512
 
 list_prompt = ["What is the capital of VietNam?",\
                 "Who is the president of VietNam?",\
@@ -581,7 +606,7 @@ for idx, prompt in enumerate(list_prompt):
     print(f"{idx}. Generated response: {response} \n")
     
 
-num_samples = 30
+num_samples = 5
 
 samples = load_wikitext2_samples(num_samples)
 print(f"Loaded {len(samples)} samples. Computing perplexity...")
@@ -590,10 +615,9 @@ corpus_ppl = compute_ppl(
     model=model,
     tokenizer=tokenizer,           
     texts=samples,
-    context_size=MAX_CONTEXT_TOKENS,
+    context_size=PPL_CONTEXT_TOKENS,
     device=device
 )
-
 print("Corpus PPL (before quantization):", corpus_ppl)   
 
 # # ========================================================================
@@ -603,12 +627,9 @@ calibration_samples = load_wikitext2_samples()
 for idx, text in enumerate(calibration_samples):
     input_token_ids = tokenizer.encode(text)
     
-    # if len(input_token_ids) > MAX_SEQ_LEN:
-    #     input_token_ids = input_token_ids[:MAX_SEQ_LEN]
-    
-    for i in range(0, len(input_token_ids), MAX_CONTEXT_TOKENS):
-        chunk_token_ids = input_token_ids[i:i+MAX_CONTEXT_TOKENS]
-        if len(chunk_token_ids) < 2:  # Skip too short chunks
+    for i in range(0, len(input_token_ids), PPL_CONTEXT_TOKENS):
+        chunk_token_ids = input_token_ids[i:i+PPL_CONTEXT_TOKENS]
+        if len(chunk_token_ids) < 2:  # Skip short chunks
             continue
     
         input_token_ids_tensor = torch.tensor(chunk_token_ids, device=device).unsqueeze(0)
@@ -616,7 +637,7 @@ for idx, text in enumerate(calibration_samples):
             _ = model(input_token_ids_tensor)
         
 model.finish_calibration()
-print(f"[INFO] Finished calibration {len(calibration_samples)} samples.")
+print(f"[INFO] Finished calibration .")
 
 # ========================================================================
 # Quantization mode
@@ -645,8 +666,7 @@ corpus_ppl = compute_ppl(
     model=model,
     tokenizer=tokenizer,           
     texts=samples,
-    context_size=MAX_CONTEXT_TOKENS,
+    context_size=PPL_CONTEXT_TOKENS,
     device=device
 )
-
 print("Corpus PPL (after quantization):", corpus_ppl)
