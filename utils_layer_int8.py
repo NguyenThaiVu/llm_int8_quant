@@ -5,7 +5,7 @@ import gemm_cutlass
 from utils_transformer_int8 import *
 from utils import *
 
-MAX_SEQ_LEN = 1280
+MAX_SEQ_LEN = 640 # 640 or 1280 or 2560
 
 class Custom_Linear(nn.Module):
     def __init__(self, in_features, out_features, max_seq_len=MAX_SEQ_LEN):

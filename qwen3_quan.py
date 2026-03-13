@@ -57,7 +57,6 @@ class RMSNorm(nn.Module):
 
         return norm_x.to(input_dtype)
     
-
     
 def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=torch.float32):
     assert head_dim % 2 == 0, "Embedding dimension must be even"
@@ -76,7 +75,6 @@ def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=
     return cos, sin
 
 
-MAX_SEQ_LEN = 1280
 class GroupedQueryAttention(nn.Module):
     def __init__(
         self, d_in, num_heads, num_kv_groups, head_dim=None, qk_norm=False, dtype=None
@@ -174,12 +172,9 @@ class GroupedQueryAttention(nn.Module):
             # queries = queries_int8.to(torch.float32) * queries_scale.unsqueeze(-1)
             # keys = keys_int8.to(torch.float32) * keys_scale.unsqueeze(-1)
             # values = values_int8.to(torch.float32) * values_scale.unsqueeze(-1)
-            
             # queries = queries.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
             # keys = keys.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
             # values = values.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)   
-            
-            # # Apply RMSNorm to quantized Q and K
             # queries_int8, queries_scale = quantize_row_int8_symmetric_nd(queries)
             # keys_int8, keys_scale = quantize_row_int8_symmetric_nd(keys)
             
@@ -192,6 +187,7 @@ class GroupedQueryAttention(nn.Module):
             keys_scale = keys_scale.unsqueeze(0).expand(self.num_kv_groups, -1)
             values_scale = values_scale.unsqueeze(0).expand(self.num_kv_groups, -1)
             
+            # Apply RMSNorm to quantized Q and K
             queries_int8, queries_scale = self.q_norm(queries_int8, queries_scale)
             keys_int8, keys_scale = self.k_norm(keys_int8, keys_scale)
             
@@ -217,25 +213,25 @@ class GroupedQueryAttention(nn.Module):
             attn_weights_int8, attn_weights_scale = self.softmax_layer(attn_scores_int8, attn_scores_scale)
             
             # Compute context with quantization
-            # values = values.transpose(1, 2)  # Shape: (num_heads, head_dim, num_tokens)
-            # values_int8, values_scale = quantize_row_int8_symmetric_nd(values)
-            
-            print(f"attn_weights_scale dtype: {attn_weights_scale.dtype}")
-            if attn_weights_scale.dtype != torch.float32:
-                attn_weights_scale = attn_weights_scale.to(torch.float32)
-            print(f"values_scale dtype: {values_scale.dtype}")
-            if values_scale.dtype != torch.float32:
-                values_scale = values_scale.to(torch.float32)
+            values = values_int8.to(torch.float32) * values_scale.unsqueeze(-1)
+            values = values.transpose(1, 2)  # Shape: (num_heads, head_dim, num_tokens)
+            values_int8, values_scale = quantize_row_int8_symmetric_nd(values)
             
             context_int8, context_scale = self.context_layer(attn_weights_int8, attn_weights_scale,
                                                              values_int8, values_scale)
-            context = context_int8.to(torch.float32) * context_scale.unsqueeze(-1)
             
             # Compute output with quantization
-            context = context.transpose(0, 1).reshape(num_tokens, self.d_out) 
-            context_int8, context_scale = quantize_row_int8_symmetric_nd(context)
-            out_int8, out_scale = self.out_proj(context_int8, context_scale)
-            out = out_int8.to(torch.float32) * out_scale.unsqueeze(-1)
+            # context = context_int8.to(torch.float32) * context_scale.unsqueeze(-1)
+            # context = context.transpose(0, 1).reshape(num_tokens, self.d_out) 
+            # context_int8, context_scale = quantize_row_int8_symmetric_nd(context)
+            # out_int8, out_scale = self.out_proj(context_int8, context_scale)
+            # out = out_int8.to(torch.float32) * out_scale.unsqueeze(-1)
+            
+            context = context_int8.to(torch.float32) * context_scale.unsqueeze(-1)
+            context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
+            context = context.to(self.out_proj.weight.dtype)  
+            
+            out, _ = self.out_proj(context, 1.0)  # Output projection in float for better accuracy
         
         out = out.unsqueeze(0) # Add batch dimension back
         out = out.to(original_dtype)
@@ -248,12 +244,12 @@ class GroupedQueryAttention(nn.Module):
         self.W_value.finish_calibration()
         self.query_rope.finish_calibration()
         self.key_rope.finish_calibration()
-        self.out_proj.finish_calibration()
         self.q_norm.finish_calibration() if self.q_norm is not None else None
         self.k_norm.finish_calibration() if self.k_norm is not None else None
         self.softmax_layer.finish_calibration()
         self.qk_score_layer.finish_calibration()
         self.context_layer.finish_calibration()
+        # self.out_proj.finish_calibration()
         self.is_quantized = True
     
     
@@ -329,6 +325,7 @@ class Qwen3Model(nn.Module):
             head_dim = cfg["emb_dim"] // cfg["n_heads"]
         else:
             head_dim = cfg["head_dim"]
+        
         cos, sin = compute_rope_params(
             head_dim=head_dim,
             theta_base=cfg["rope_base"],
@@ -568,6 +565,7 @@ def generate_text_basic_stream(model, token_ids, max_new_tokens, eos_token_id=No
             
             token_ids = torch.cat([token_ids, next_token], dim=1)
             
+            
 def get_clean_generated_text(generated_text):
     output_text = ""
     for token in generated_text:
@@ -576,8 +574,11 @@ def get_clean_generated_text(generated_text):
         output_text += text
     incomplete_special_token_pattern = re.compile(r"<\|[^>]*?$")
     output_text = re.sub(incomplete_special_token_pattern, "", output_text)
-    output_text = output_text.strip()
     
+    # remove duplicate character at the end caused by tokenization of incomplete special tokens
+    output_text = re.sub(r"(.)\1+$", r"\1", output_text)
+    
+    output_text = output_text.strip()
     return output_text
 
 
@@ -588,8 +589,7 @@ list_prompt = ["What is the capital of VietNam?",\
                 "Who is the president of VietNam?",\
                 "Who is Son Goku?",\
                 "Describe the Chinese New Year festival.",\
-                "Which country has a capital city named Paris?",\
-                "Explain the Vietnamese food Pho and how to make it at home."]
+                "Which country has a capital city named Paris?"]
 
 for idx, prompt in enumerate(list_prompt):
     input_token_ids = tokenizer.encode(prompt)
@@ -606,7 +606,7 @@ for idx, prompt in enumerate(list_prompt):
     print(f"{idx}. Generated response: {response} \n")
     
 
-num_samples = 5
+num_samples = 100
 
 samples = load_wikitext2_samples(num_samples)
 print(f"Loaded {len(samples)} samples. Computing perplexity...")
@@ -637,15 +637,14 @@ for idx, text in enumerate(calibration_samples):
             _ = model(input_token_ids_tensor)
         
 model.finish_calibration()
-print(f"[INFO] Finished calibration .")
+print(f"[INFO] Finished calibration {len(calibration_samples)} samples.")
 
 # ========================================================================
 # Quantization mode
-    
 print("\n===== Generated text after quantization: =====\n")
 list_prompt = ["What is the capital of VietNam?",\
             "Describe the Chinese New Year festival.",\
-            "Explain the Vietnamese food Pho and how to make it at home."]
+            "Who is Son Goku?"]
     
 for idx, prompt in enumerate(list_prompt):
     input_token_ids = tokenizer.encode(prompt)

@@ -1,0 +1,9 @@
+.env
+
+__pycache__/
+*.pyc
+*.pkl
+*.pt
+*.log
+
+llama/Llama-3.2-3B-Instruct
