@@ -5,7 +5,7 @@ import gemm_cutlass
 
 from quant_utils import quantize_row_int8_symmetric_nd, quantize_tensor
 
-MAX_SEQ_LEN = 2100 # 640 or 1280 or 2560
+MAX_SEQ_LEN = 2112 # 640 or 1280 or 2112
 
 class Custom_Linear(nn.Module):
     def __init__(self, in_features, out_features, max_seq_len=MAX_SEQ_LEN):

@@ -185,7 +185,6 @@ class Llama3Model(nn.Module):
     def __init__(self, cfg):
         super().__init__()
 
-        # Main model parameters
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
 
         self.trf_blocks = nn.ModuleList(  # ModuleList since Sequential can only accept one input, and we need `x, mask, cos, sin`

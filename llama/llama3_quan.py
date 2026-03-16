@@ -1,8 +1,8 @@
 import os 
 from pathlib import Path
-from safetensors.torch import load_file
 
 import torch
+from safetensors.torch import load_file
 
 from utils_evaluation import load_wikitext2_samples
 torch.manual_seed(123)
@@ -22,6 +22,20 @@ from model_quan_utils import *
 
 LLAMA_SIZE_STR = "3B" # "1B" or "3B"
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
+
+MODEL_FOLDER = f"Llama-3.2-{LLAMA_SIZE_STR}-Instruct"
+
+MODEL_HUD_FOLDER_1 = "/sciclone/home/tnguyen10/Desktop/LLM_Quantization/model/"
+MODEL_HUD_FOLDER_2 = "/scratch/tnguyen10/"
+
+if os.path.exists(MODEL_HUD_FOLDER_1):
+    MODEL_HUB = MODEL_HUD_FOLDER_1
+elif os.path.exists(MODEL_HUD_FOLDER_2):
+    MODEL_HUB = MODEL_HUD_FOLDER_2
+else:
+    raise ValueError("Model hub folder not found. Please check the paths.")
+
+LOCAL_DIR = os.path.join(MODEL_HUB, MODEL_FOLDER)
 
 
 # ===============================================
@@ -173,21 +187,14 @@ class Custom_GroupedQueryAttention(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        # self.att = GroupedQueryAttention(
-        #     d_in=cfg["emb_dim"],
-        #     d_out=cfg["emb_dim"],
-        #     num_heads=cfg["n_heads"],
-        #     num_kv_groups=cfg["n_kv_groups"],
-        #     dtype=cfg["dtype"]
-        # )
+
         self.att = Custom_GroupedQueryAttention(
             d_in=cfg["emb_dim"],
             num_heads=cfg["n_heads"],
             num_kv_groups=cfg["n_kv_groups"],
             dtype=cfg["dtype"]
         )
-        
-        
+                
         # self.ff = FeedForward(cfg)
         self.ff = Custom_FeedForward(cfg).to(cfg["dtype"])
         
@@ -284,7 +291,7 @@ model.to(device);
 tokenizer_file_path = hf_hub_download(
     repo_id=f"meta-llama/Llama-3.2-{LLAMA_SIZE_STR}-Instruct",
     filename="original/tokenizer.model",
-    local_dir=f"Llama-3.2-{LLAMA_SIZE_STR}-Instruct"
+    local_dir=LOCAL_DIR
 )
 
 tokenizer = Tokenizer(tokenizer_file_path)
@@ -297,7 +304,7 @@ if LLAMA_SIZE_STR == "1B":
     weights_file = hf_hub_download(
         repo_id=f"meta-llama/Llama-3.2-{LLAMA_SIZE_STR}-Instruct",
         filename="model.safetensors",
-        local_dir=f"Llama-3.2-{LLAMA_SIZE_STR}-Instruct"
+        local_dir=LOCAL_DIR
     )
     combined_weights = load_file(weights_file)
 else:
@@ -306,7 +313,7 @@ else:
         weights_file = hf_hub_download(
             repo_id=f"meta-llama/Llama-3.2-{LLAMA_SIZE_STR}-Instruct",
             filename=f"model-0000{i}-of-00002.safetensors",
-            local_dir=f"Llama-3.2-{LLAMA_SIZE_STR}-Instruct"
+            local_dir=LOCAL_DIR
         )
         current_weights = load_file(weights_file)
         combined_weights.update(current_weights)
@@ -317,17 +324,17 @@ model.to(device)
 del combined_weights  # free up memory
 
 
-
 # ===============================================
 # 4. Generate Text
 # ===============================================
+MAX_GENERATED_TOKENS = 2000
+PPL_CONTEXT_TOKENS = 2000
+PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
+EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
 
-MAX_GENERATED_TOKENS = 2048
-PPL_CONTEXT_TOKENS = 2048
-
-list_prompt = ["What is the capital of VietNam?",\
+list_prompt = ["What is Vietnam?",\
                 "Who is Son Goku?",\
-                "Describe the Chinese New Year festival.",\
+                # "Describe the Chinese New Year festival.",\
                 "Which country has a capital city named Paris?"]
 
 for prompt in list_prompt:
@@ -336,57 +343,48 @@ for prompt in list_prompt:
         idx=text_to_token_ids(prompt, tokenizer).to(device),
         max_new_tokens=MAX_GENERATED_TOKENS,
         context_size=LLAMA32_CONFIG["context_length"],
-        top_k=1,
-        temperature=0.
-    )
+        top_k=1)
 
     output_text = token_ids_to_text(token_ids, tokenizer)
     print("\nResponse:\n", clean_text(output_text))
     
 
-num_samples = 500
+samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
 
-samples = load_wikitext2_samples(num_samples)
-print(f"Loaded {len(samples)} samples. Computing perplexity...")
-
-corpus_ppl = compute_ppl(
-    model=model,
-    tokenizer=tokenizer,           
-    texts=samples,
-    context_size=PPL_CONTEXT_TOKENS,
-    device=device
-)
-print("Corpus PPL (before quantization):", corpus_ppl)   
+ppl = compute_ppl_single_text(model,
+                            tokenizer, 
+                            samples,
+                            context_size=PPL_CONTEXT_TOKENS,
+                            stride=PPL_STRIDE)
+print("PPL:", ppl)   
     
 
 # ===============================================
-# 5. Quantization Utilities
+# 5. Quantization
 # ===============================================
 
-# Forward pass to collect calibration data for quantization
 print("\nCollecting calibration data for quantization...")
-calibration_samples = load_wikitext2_samples()
-for idx, text in enumerate(calibration_samples):
-    input_token_ids = tokenizer.encode(text)
-    
-    for i in range(0, len(input_token_ids), PPL_CONTEXT_TOKENS):
-        chunk_token_ids = input_token_ids[i:i+PPL_CONTEXT_TOKENS]
-        if len(chunk_token_ids) < 2:  # Skip short chunks
-            continue
-    
-        input_token_ids_tensor = torch.tensor(chunk_token_ids, device=device).unsqueeze(0)
-        with torch.no_grad():
-            _ = model(input_token_ids_tensor)
+calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
+                                                split="train", n=10_000)
+calibrate_tokens = tokenizer.encode(calibrate_samples)
+print(f"[INFO] Load training calibration with {len(calibrate_tokens)} tokens.")
+        
+for i in range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE):
+    chunk_tokens = calibrate_tokens[i:i + PPL_CONTEXT_TOKENS]
+
+    input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device).unsqueeze(0)
+
+    with torch.no_grad():
+        _ = model(input_ids)
         
 model.finish_calibration()
-print(f"[INFO] Finished calibration {len(calibration_samples)} samples.")
+print(f"[INFO] Finished calibration.")
 
 
 # ========================================================================
 # Quantization mode
 print("\n===== Generated text after quantization: =====\n")
 list_prompt = ["What is the capital of VietNam?",\
-            "Describe the Chinese New Year festival.",\
             "Who is Son Goku?"]
 
 for prompt in list_prompt:
@@ -395,18 +393,16 @@ for prompt in list_prompt:
         idx=text_to_token_ids(prompt, tokenizer).to(device),
         max_new_tokens=MAX_GENERATED_TOKENS,
         context_size=LLAMA32_CONFIG["context_length"],
-        top_k=1,
-        temperature=0.
-    )
+        top_k=1)
 
     output_text = token_ids_to_text(token_ids, tokenizer)
     print("\nResponse:\n", clean_text(output_text)) 
     
-corpus_ppl = compute_ppl(
-    model=model,
-    tokenizer=tokenizer,           
-    texts=samples,
-    context_size=PPL_CONTEXT_TOKENS,
-    device=device
-)
-print("Corpus PPL (after quantization):", corpus_ppl)
+
+ppl = compute_ppl_single_text(model,
+                            tokenizer, 
+                            samples,
+                            context_size=PPL_CONTEXT_TOKENS,
+                            stride=PPL_STRIDE)
+print("PPL:", ppl)   
+    

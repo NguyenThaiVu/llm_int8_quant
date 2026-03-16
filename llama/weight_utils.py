@@ -75,4 +75,4 @@ def load_weights_into_llama(model, param_config, params):
         model.out_head.weight = assign(model.out_head.weight, params["lm_head.weight"], "lm_head.weight")
     else:
         model.out_head.weight = model.tok_emb.weight
-        print("Model uses weight tying.")
+        print("[INFO] Sharing output head weights with token embedding weights.")
