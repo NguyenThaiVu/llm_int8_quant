@@ -7,11 +7,11 @@ torch.manual_seed(123)
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
 
-from model_utils import Llama3Model
+from utils_model import Llama3Model
 from config import get_llama_config
 from tokenizer import Tokenizer
-from weight_utils import load_weights_into_llama    
-from generation_utils import *
+from utils_weight import load_weights_into_llama    
+from utils_generation import *
 from utils_evaluation import *
 
 

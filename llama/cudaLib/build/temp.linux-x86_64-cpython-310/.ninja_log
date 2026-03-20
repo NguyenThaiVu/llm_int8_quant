@@ -1,0 +1,5 @@
+# ninja log v7
+2	71137	1774027955746195592	/home/tnguyen10/Desktop/llm_int8_quant/llama/cudaLib/build/temp.linux-x86_64-cpython-310/gemm_cutlass.o	3a5dd70ee5797a35
+2604	76260	1774028504310321338	/home/tnguyen10/Desktop/llm_int8_quant/llama/cudaLib/build/temp.linux-x86_64-cpython-310/gemm_cutlass.o	3a5dd70ee5797a35
+639	70499	1774028826920981091	/home/tnguyen10/Desktop/llm_int8_quant/llama/cudaLib/build/temp.linux-x86_64-cpython-310/gemm_cutlass.o	3a5dd70ee5797a35
+842	73146	1774028964075512971	/home/tnguyen10/Desktop/llm_int8_quant/llama/cudaLib/build/temp.linux-x86_64-cpython-310/gemm_cutlass.o	3a5dd70ee5797a35

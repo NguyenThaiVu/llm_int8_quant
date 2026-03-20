@@ -18,7 +18,6 @@ class Custom_Softmax(nn.Module):
         self.out_observer = MinMaxObserverPerLastDim(self.num_heads, self.max_seq_len)
         self.register_buffer('scale_out', torch.ones(self.num_heads, self.max_seq_len))
         
-        
         self.is_quantized = False
         
     def forward(self, x_q, scale_x):
@@ -27,17 +26,16 @@ class Custom_Softmax(nn.Module):
                     x_q.dtype == torch.bfloat16 or \
                     x_q.dtype == torch.float16,\
                     "Expected floating point input in calibration mode"
-            out = torch.softmax(x_q, dim=-1, dtype=torch.bfloat16)
-            print(f"Shape of softmax output: {out.shape}, dtype: {out.dtype}")
+            out = torch.softmax(x_q, dim=-1)
             self.out_observer(out)
             return out, 1.0
         else:   # Quantized mode            
             seq_len = x_q.shape[-1]
             mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.uint8, device=x_q.device))
             
-            scale_x_value = scale_x[:seq_len, :].to(torch.float32)
-            scale_out_value = self.scale_out[:seq_len * self.num_heads].to(torch.float32)
-            
+            scale_x_value = scale_x[:, :seq_len].to(torch.float32)
+            scale_out_value = self.scale_out[:, :seq_len].to(torch.float32)
+
             out_q = gemm_cutlass.func_softmax_lastdim_int8_masking(
                 x_q, scale_x_value.view(-1),
                 scale_out_value.view(-1), mask
@@ -51,7 +49,7 @@ class Custom_Softmax(nn.Module):
         
         
 if __name__ == "__main__":
-    seq_len = 1024
+    seq_len = 2048
     num_heads = 32
     
     device = 'cuda'
@@ -60,6 +58,8 @@ if __name__ == "__main__":
     X = torch.randn((num_heads, seq_len, seq_len), dtype=d_type, device=device)
     mask = torch.triu(torch.ones((seq_len, seq_len), dtype=torch.bool, device=device), diagonal=1)
     
+    # 1. ====================
+    # Measure correctness
     softmax_layer = Custom_Softmax(num_heads=num_heads, max_seq_len=seq_len, dim=-1).to(device)
     
     # Calibration mode
@@ -77,6 +77,25 @@ if __name__ == "__main__":
     mse = torch.mean((out_calib - out_q_dequant) ** 2).item()
     print(f"MSE: {mse}")
     
-    print(f"Sample output: {out_calib[:5, :5]}")
-    print(f"Sample dequantized: {out_q_dequant[:5, :5]}\n")
+    # print(f"Sample output: {out_calib[:5, :5]}")
+    # print(f"Sample dequantized: {out_q_dequant[:5, :5]}\n")
+    
+    # 2. ====================
+    # Measure latency
+    softmax_layer = Custom_Softmax(num_heads=num_heads, max_seq_len=seq_len, dim=-1).to(device)
+    
+    n_iter = 100
+    
+    bf16_softmax_time = measure_time(softmax_layer, X, 1.0, repeat=n_iter)
+    print(f"Latency of softmax (bf16): {bf16_softmax_time:.2f} ms")
+    
+    # Quantized mode
+    X_q, scale_x = quantize_row_int8_symmetric_nd(X)
+    softmax_layer.finish_calibration()  
+    quantized_softmax_time = measure_time(softmax_layer, X_q, scale_x, repeat=n_iter)
+    print(f"Latency of softmax (int8): {quantized_softmax_time:.2f} ms")
+    
+
+    
+    
     

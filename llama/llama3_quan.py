@@ -2,22 +2,20 @@ import os
 from pathlib import Path
 
 import torch
-from safetensors.torch import load_file
-
-from utils_evaluation import load_wikitext2_samples
 torch.manual_seed(123)
 import torch.nn as nn
+
+from safetensors.torch import load_file
 from huggingface_hub import hf_hub_download
 
-from model_utils import *
 from config import get_llama_config
 from tokenizer import Tokenizer
-from weight_utils import load_weights_into_llama    
-from generation_utils import *
+from utils_model import *
+from utils_weight import load_weights_into_llama    
+from utils_generation import *
 from utils_evaluation import *
-
-from quant_utils import quantize_row_int8_symmetric_nd, quantize_tensor
-from model_quan_utils import *
+from utils_quant import quantize_row_int8_symmetric_nd, quantize_tensor
+from utils_model_quan import *
 
 
 LLAMA_SIZE_STR = "3B" # "1B" or "3B"
@@ -327,10 +325,10 @@ del combined_weights  # free up memory
 # ===============================================
 # 4. Generate Text
 # ===============================================
-MAX_GENERATED_TOKENS = 2000
-PPL_CONTEXT_TOKENS = 2000
+MAX_GENERATED_TOKENS = 1000
+PPL_CONTEXT_TOKENS = 1000
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
+EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
 list_prompt = ["What is Vietnam?",\
                 "Who is Son Goku?",\
@@ -384,7 +382,7 @@ print(f"[INFO] Finished calibration.")
 # ========================================================================
 # Quantization mode
 print("\n===== Generated text after quantization: =====\n")
-list_prompt = ["What is the capital of VietNam?",\
+list_prompt = ["What is VietNam?",\
             "Who is Son Goku?"]
 
 for prompt in list_prompt:
