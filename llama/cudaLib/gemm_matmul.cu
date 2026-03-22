@@ -1100,6 +1100,7 @@ torch::Tensor int8_matmul_bias_epilogue_host(
 #include <cutlass/gemm/device/gemm_universal_adapter.h>
 
 
+template <typename TileShape, typename WarpShape, int kStages>
 torch::Tensor matmul_w8a8(
     const torch::Tensor &A,         // int8 [M, K]
     const torch::Tensor &B,         // int8 [N, K]
@@ -1146,17 +1147,13 @@ torch::Tensor matmul_w8a8(
     constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
     constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
 
-    using ThreadblockShape = cutlass::gemm::GemmShape<256, 128, 64>;
-    using WarpShape        = cutlass::gemm::GemmShape<64, 64, 64>;
-    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 32>;
-    constexpr int NumStages = 4;
     constexpr int EVTEpilogueStages = 1;
 
     using namespace cute;
 
     using OutputTileThreadMap =
         cutlass::epilogue::threadblock::OutputTileThreadLayout<
-            ThreadblockShape, WarpShape, ElementC, AlignmentC, EVTEpilogueStages>;
+            TileShape, WarpShape, ElementC, AlignmentC, EVTEpilogueStages>;
 
     using Accum = cutlass::epilogue::threadblock::VisitorAccFetch;
 
@@ -1206,12 +1203,12 @@ torch::Tensor matmul_w8a8(
             ElementCompute,
             cutlass::arch::OpClassTensorOp,
             cutlass::arch::Sm80,
-            ThreadblockShape,
+            TileShape,
             WarpShape,
-            InstructionShape,
+            cutlass::gemm::GemmShape<16, 8, 32>,
             EVTD,
-            cutlass::gemm::threadblock::ThreadblockSwizzleStreamK,
-            NumStages,
+            cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+            kStages,
             cutlass::arch::OpMultiplyAddSaturate,
             EVTEpilogueStages
         >::GemmKernel;
@@ -1250,8 +1247,7 @@ torch::Tensor matmul_w8a8(
         tensor_a.stride(0),
         tensor_b.stride(0),
         0,
-        0,
-        -1
+        0
     );
 
     DeviceGemm gemm_op;
@@ -1278,5 +1274,34 @@ torch::Tensor matmul_w8a8_host(
     const torch::Tensor &alphaCol,   // float [M, 1]
     const torch::Tensor &alphaRow    // float [1, N]
 ) {
-    return matmul_w8a8(A, B, alphaCol, alphaRow);
+    auto M = A.size(0);
+    auto K = A.size(1);
+    auto N = B.size(0);
+
+    if (M == 512 && N == 4096 && K == 4096) {
+    using TileShape = cutlass::gemm::GemmShape<128, 128, 128>;
+    using WarpShape = cutlass::gemm::GemmShape<64, 64, 128>;
+    constexpr int kStages = 3;
+    return matmul_w8a8<TileShape, WarpShape, kStages>(A, B, alphaCol, alphaRow);
+  } else if (M == 512 && N == 4096 && K == 14336) {
+    using TileShape = cutlass::gemm::GemmShape<128, 128, 64>;
+    using WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
+    constexpr int kStages = 4;
+    return matmul_w8a8<TileShape, WarpShape, kStages>(A, B, alphaCol, alphaRow);
+  } else if (K == 4096 && N == 4096) {
+    using TileShape = cutlass::gemm::GemmShape<256, 128, 64>;
+    using WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
+    constexpr int kStages = 3;
+    return matmul_w8a8<TileShape, WarpShape, kStages>(A, B, alphaCol, alphaRow);
+  } else if (M == 1024 && N == 14336 && K == 4096) {
+    using TileShape = cutlass::gemm::GemmShape<128, 128, 64>;
+    using WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
+    constexpr int kStages = 3;
+    return matmul_w8a8<TileShape, WarpShape, kStages>(A, B, alphaCol, alphaRow);
+  } else {
+    using TileShape = cutlass::gemm::GemmShape<256, 128, 64>;
+    using WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
+    constexpr int kStages = 3;
+    return matmul_w8a8<TileShape, WarpShape, kStages>(A, B, alphaCol, alphaRow);
+  }
 }
