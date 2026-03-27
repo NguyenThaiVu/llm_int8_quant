@@ -14,7 +14,7 @@ from utils_model import *
 from utils_weight import load_weights_into_llama    
 from utils_generation import *
 from utils_evaluation import *
-from utils_quant import quantize_row_int8_symmetric_nd, quantize_tensor
+from utils_quant import *
 from utils_model_quan import *
 
 
@@ -72,10 +72,9 @@ class Custom_GroupedQueryAttention(nn.Module):
     
         self.is_quantized = False
 
-    def forward(self, x, mask, cos, sin):
+    def forward(self, x, scale_x, mask, cos, sin):
         b, num_tokens, _ = x.shape
-
-        original_dtype = x.dtype
+        
         x = x.squeeze(0)  # Remove batch dimension for linear layers
 
         # Float computation (calibration)
@@ -111,10 +110,10 @@ class Custom_GroupedQueryAttention(nn.Module):
             # Compute output
             context = context.transpose(0, 1).reshape(num_tokens, self.d_out) 
             out, _ = self.out_proj(context, 1.0)
-            
         else: 
             # === Quantized computation ===
-            x_int8, x_scale = quantize_row_int8_symmetric_nd(x)
+            x_int8 = x
+            x_scale = scale_x
             
             queries_int8, queries_scale = self.W_query(x_int8, x_scale)
             keys_int8, keys_scale = self.W_key(x_int8, x_scale)
@@ -165,7 +164,7 @@ class Custom_GroupedQueryAttention(nn.Module):
             out, _ = self.out_proj(context, 1.0)  # Output projection in float for better accuracy
         
         out = out.unsqueeze(0) # Add batch dimension back
-        out = out.to(original_dtype)
+        out = out.to(torch.bfloat16)
         
         return out
     
@@ -181,6 +180,37 @@ class Custom_GroupedQueryAttention(nn.Module):
         # self.out_proj.finish_calibration()
         self.is_quantized = True
     
+class RMSNorm_Fuse_Quant(nn.Module):
+    """
+    This module fuse RMSNorm and quantization into a single kernel. 
+    - Input:
+        x: (seq_len, emb_dim) in bf16
+    - Output:
+        y: (seq_len, emb_dim) in bf16
+    OR 
+        Y_int8: (seq_len, emb_dim) in int8
+        scale_Y: (seq_len,) in float32
+    """
+    def __init__(self, emb_dim, eps=1e-6, dtype=torch.bfloat16):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(emb_dim, dtype=dtype))
+        self.norm_shape = (emb_dim,)
+        
+        self.is_quantized = False
+
+    def forward(self, x):
+        if self.is_quantized == False:
+            norm_x = F.rms_norm(x, normalized_shape=self.norm_shape, weight=self.weight, eps=self.eps)
+            return norm_x
+        else:
+            Y_int8, scale_Y = gemm_cutlass.func_rmsnorm_quant(x, 
+                                                            self.weight, self.eps)
+            return Y_int8, scale_Y
+    
+    def finish_calibration(self):
+        self.is_quantized = True
+    
 
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
@@ -192,25 +222,33 @@ class TransformerBlock(nn.Module):
             num_kv_groups=cfg["n_kv_groups"],
             dtype=cfg["dtype"]
         )
-                
-        # self.ff = FeedForward(cfg)
         self.ff = Custom_FeedForward(cfg).to(cfg["dtype"])
         
-        self.norm1 = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
+        self.norm1 = RMSNorm_Fuse_Quant(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
+        
+        # TODO: before we fuse RMSNorm with quantization, 
+        # we must handle outlier (smooth-quant) in FFN.
         self.norm2 = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
+        
+        self.is_quantized = False
 
     def forward(self, x, mask, cos, sin):
         # Shortcut connection for attention block
         shortcut = x
-        x = self.norm1(x)
-        x = self.att(x, mask, cos, sin)  
+        
+        if self.is_quantized == False:
+            x = self.norm1(x)
+            x = self.att(x, 1.0, mask, cos, sin)  
+        else:
+            x, scale_x = self.norm1(x)
+            x = self.att(x, scale_x, mask, cos, sin)  
+        
         x = x + shortcut 
 
         # Shortcut connection for feed-forward block
         shortcut = x
         x = self.norm2(x)
         
-        # x = self.ff(x)
         # # === Feed-forward with quantization support ===
         original_dtype = x.dtype
         x = x.squeeze(0)  # Remove batch dimension
@@ -225,8 +263,12 @@ class TransformerBlock(nn.Module):
     
     def finish_calibration(self):
         self.att.finish_calibration()
+        self.norm1.finish_calibration()
+        
         self.ff.finish_calibration()
-    
+        
+        self.is_quantized = True
+
 
 class Llama3Model(nn.Module):
     def __init__(self, cfg):
@@ -270,137 +312,137 @@ class Llama3Model(nn.Module):
         for block in self.trf_blocks:
             block.finish_calibration()
             
+            
+if __name__ == "__main__":
 
-model = Llama3Model(LLAMA32_CONFIG)
+    model = Llama3Model(LLAMA32_CONFIG)
 
-total_params = sum(p.numel() for p in model.parameters())
-print(f"Total number of parameters: {total_params:,}")
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total number of parameters: {total_params:,}")
 
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-else:
-    device = torch.device("cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
 
-model.to(device);
+    model.to(device);
 
-# ===============================================
-# 2. Load Tokenizer
-# ===============================================
-tokenizer_file_path = hf_hub_download(
-    repo_id=f"meta-llama/Llama-3.2-{LLAMA_SIZE_STR}-Instruct",
-    filename="original/tokenizer.model",
-    local_dir=LOCAL_DIR
-)
-
-tokenizer = Tokenizer(tokenizer_file_path)
-
-        
-# ===============================================
-# 3. Load Weights into Llama
-# ===============================================
-if LLAMA_SIZE_STR == "1B":
-    weights_file = hf_hub_download(
+    # ===============================================
+    # 2. Load Tokenizer
+    # ===============================================
+    tokenizer_file_path = hf_hub_download(
         repo_id=f"meta-llama/Llama-3.2-{LLAMA_SIZE_STR}-Instruct",
-        filename="model.safetensors",
+        filename="original/tokenizer.model",
         local_dir=LOCAL_DIR
     )
-    combined_weights = load_file(weights_file)
-else:
-    combined_weights = {}
-    for i in range(1, 3):
+
+    tokenizer = Tokenizer(tokenizer_file_path)
+
+            
+    # ===============================================
+    # 3. Load Weights into Llama
+    # ===============================================
+    if LLAMA_SIZE_STR == "1B":
         weights_file = hf_hub_download(
             repo_id=f"meta-llama/Llama-3.2-{LLAMA_SIZE_STR}-Instruct",
-            filename=f"model-0000{i}-of-00002.safetensors",
+            filename="model.safetensors",
             local_dir=LOCAL_DIR
         )
-        current_weights = load_file(weights_file)
-        combined_weights.update(current_weights)
+        combined_weights = load_file(weights_file)
+    else:
+        combined_weights = {}
+        for i in range(1, 3):
+            weights_file = hf_hub_download(
+                repo_id=f"meta-llama/Llama-3.2-{LLAMA_SIZE_STR}-Instruct",
+                filename=f"model-0000{i}-of-00002.safetensors",
+                local_dir=LOCAL_DIR
+            )
+            current_weights = load_file(weights_file)
+            combined_weights.update(current_weights)
 
 
-load_weights_into_llama(model, LLAMA32_CONFIG, combined_weights)
-model.to(device)
-del combined_weights  # free up memory
+    load_weights_into_llama(model, LLAMA32_CONFIG, combined_weights)
+    model.to(device)
+    del combined_weights  # free up memory
 
 
-# ===============================================
-# 4. Generate Text
-# ===============================================
-MAX_GENERATED_TOKENS = 1000
-PPL_CONTEXT_TOKENS = 1000
-PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
+    # ===============================================
+    # 4. Generate Text
+    # ===============================================
+    MAX_GENERATED_TOKENS = 512
+    PPL_CONTEXT_TOKENS = 512
+    PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
+    EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
-list_prompt = ["What is Vietnam?",\
-                "Who is Son Goku?",\
-                # "Describe the Chinese New Year festival.",\
-                "Which country has a capital city named Paris?"]
+    list_prompt = ["What is Vietnam?",\
+                    "Who is Son Goku?"]
 
-for prompt in list_prompt:
-    token_ids = generate(
-        model=model,
-        idx=text_to_token_ids(prompt, tokenizer).to(device),
-        max_new_tokens=MAX_GENERATED_TOKENS,
-        context_size=LLAMA32_CONFIG["context_length"],
-        top_k=1)
+    for prompt in list_prompt:
+        token_ids = generate(
+            model=model,
+            idx=text_to_token_ids(prompt, tokenizer).to(device),
+            max_new_tokens=MAX_GENERATED_TOKENS,
+            context_size=LLAMA32_CONFIG["context_length"],
+            top_k=1)
 
-    output_text = token_ids_to_text(token_ids, tokenizer)
-    print("\nResponse:\n", clean_text(output_text))
-    
-
-samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
-
-ppl = compute_ppl_single_text(model,
-                            tokenizer, 
-                            samples,
-                            context_size=PPL_CONTEXT_TOKENS,
-                            stride=PPL_STRIDE)
-print("PPL:", ppl)   
-    
-
-# ===============================================
-# 5. Quantization
-# ===============================================
-
-print("\nCollecting calibration data for quantization...")
-calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                split="train", n=10_000)
-calibrate_tokens = tokenizer.encode(calibrate_samples)
-print(f"[INFO] Load training calibration with {len(calibrate_tokens)} tokens.")
+        output_text = token_ids_to_text(token_ids, tokenizer)
+        print("\nResponse:\n", clean_text(output_text))
         
-for i in range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE):
-    chunk_tokens = calibrate_tokens[i:i + PPL_CONTEXT_TOKENS]
 
-    input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device).unsqueeze(0)
+    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
 
-    with torch.no_grad():
-        _ = model(input_ids)
+    ppl = compute_ppl_single_text(model,
+                                tokenizer, 
+                                samples,
+                                context_size=PPL_CONTEXT_TOKENS,
+                                stride=PPL_STRIDE)
+    print("PPL:", ppl)   
         
-model.finish_calibration()
-print(f"[INFO] Finished calibration.")
+
+    # ===============================================
+    # 5. Quantization
+    # ===============================================
+
+    print("\nCollecting calibration data for quantization...")
+    calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
+                                                    split="train", n=10_000)
+    calibrate_tokens = tokenizer.encode(calibrate_samples)
+    print(f"[INFO] Load training calibration with {len(calibrate_tokens)} tokens.")
+            
+    for i in range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE):
+        chunk_tokens = calibrate_tokens[i:i + PPL_CONTEXT_TOKENS]
+
+        input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device).unsqueeze(0)
+
+        with torch.no_grad():
+            _ = model(input_ids)
+            
+    model.finish_calibration()
+    print(f"[INFO] Finished calibration.")
 
 
-# ========================================================================
-# Quantization mode
-print("\n===== Generated text after quantization: =====\n")
-list_prompt = ["What is VietNam?",\
-            "Who is Son Goku?"]
+    # ========================================================================
+    # Quantization mode
+    print("\n===== Generated text after quantization: =====\n")
+    list_prompt = ["What is VietNam?",\
+                "Who is Son Goku?"]
 
-for prompt in list_prompt:
-    token_ids = generate(
-        model=model,
-        idx=text_to_token_ids(prompt, tokenizer).to(device),
-        max_new_tokens=MAX_GENERATED_TOKENS,
-        context_size=LLAMA32_CONFIG["context_length"],
-        top_k=1)
+    for prompt in list_prompt:
+        token_ids = generate(
+            model=model,
+            idx=text_to_token_ids(prompt, tokenizer).to(device),
+            max_new_tokens=MAX_GENERATED_TOKENS,
+            context_size=LLAMA32_CONFIG["context_length"],
+            top_k=1)
 
-    output_text = token_ids_to_text(token_ids, tokenizer)
-    print("\nResponse:\n", clean_text(output_text)) 
-    
+        output_text = token_ids_to_text(token_ids, tokenizer)
+        print("\nResponse:\n", clean_text(output_text)) 
+        
 
-ppl = compute_ppl_single_text(model,
-                            tokenizer, 
-                            samples,
-                            context_size=PPL_CONTEXT_TOKENS,
-                            stride=PPL_STRIDE)
-print("PPL:", ppl)   
-    
+    ppl = compute_ppl_single_text(model,
+                                tokenizer, 
+                                samples,
+                                context_size=PPL_CONTEXT_TOKENS,
+                                stride=PPL_STRIDE)
+    print("PPL:", ppl)   
+        

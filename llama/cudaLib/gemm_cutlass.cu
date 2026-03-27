@@ -91,6 +91,15 @@ torch::Tensor func_rmsnorm(
     return rmsnorm_cuda(x, gamma, eps);
 }
 
+std::tuple<torch::Tensor, torch::Tensor> func_rmsnorm_quant(
+    torch::Tensor x,      // FP32, shape (tokens, d_model)
+    torch::Tensor gamma,  // FP32, shape (d_model,)
+    float eps) 
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    return rmsnorm_quant_cuda(x, gamma, eps);
+}
+
 torch::Tensor func_rmsnorm_int8(
     torch::Tensor x,      // INT8, shape (tokens, d_model)
     torch::Tensor scale_x,
@@ -100,6 +109,17 @@ torch::Tensor func_rmsnorm_int8(
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     return rmsnorm_int8_cuda(x, scale_x, gamma, scale_y, eps);
+}
+
+torch::Tensor func_rmsnorm_optimized_int8(
+    torch::Tensor x,      // INT8, shape (tokens, d_model)
+    torch::Tensor scale_x,
+    torch::Tensor gamma,  // FP32, shape (d_model,)
+    torch::Tensor scale_y,
+    float eps) 
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    return rmsnorm_optimized_int8_cuda(x, scale_x, gamma, scale_y, eps);
 }
 
 torch::Tensor func_element_wise_mul_int8(
@@ -257,9 +277,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &func_rmsnorm,
         "RMSNorm for 2D float32 input with float32 gamma");
 
+    m.def("func_rmsnorm_quant",
+        &func_rmsnorm_quant,
+        "RMSNorm for 2D float32 input with float32 gamma, return quantized int8 output and per-row scale");
+
     m.def("func_rmsnorm_int8",
         &func_rmsnorm_int8,
         "RMSNorm for 2D int8 input with float32 gamma and input scale");
+
+    m.def("func_rmsnorm_optimized_int8",
+        &func_rmsnorm_optimized_int8,
+        "Optimized RMSNorm for 2D int8 input with float32 gamma and input scale");
         
     m.def("func_element_wise_mul_int8",
         &func_element_wise_mul_int8,

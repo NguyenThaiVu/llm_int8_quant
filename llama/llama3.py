@@ -95,15 +95,13 @@ del combined_weights  # free up memory
 # ===============================================
 # 4. Generate Text
 # ===============================================
-
-MAX_GENERATED_TOKENS = 1024
-PPL_CONTEXT_TOKENS = 1024
+MAX_GENERATED_TOKENS = 1000
+PPL_CONTEXT_TOKENS = 1000
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
 list_prompts = [
     "What is the capital of Vietnam?",\
-    "Describe the Chinese new year.",\
     "Who is Son Goku?"]
 
 for prompt in list_prompts:

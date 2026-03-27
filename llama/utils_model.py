@@ -6,6 +6,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import gemm_cutlass 
 
 class FeedForward(nn.Module):
     def __init__(self, cfg):
@@ -150,6 +151,19 @@ class GroupedQueryAttention(nn.Module):
 
         return context_vec
     
+
+class Custom_RMSNorm(nn.Module):
+    def __init__(self, emb_dim, eps=1e-6, dtype=torch.bfloat16):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(emb_dim, dtype=dtype))
+
+    def forward(self, x):
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        norm_x = x * torch.rsqrt(variance + self.eps)
+        norm_x = norm_x * self.weight
+        return norm_x
+    
     
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
@@ -162,21 +176,24 @@ class TransformerBlock(nn.Module):
             dtype=cfg["dtype"]
         )
         self.ff = FeedForward(cfg)
-        self.norm1 = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
-        self.norm2 = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
+        # self.norm1 = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
+        # self.norm2 = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
+        
+        self.norm1 = Custom_RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
+        self.norm2 = Custom_RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
 
     def forward(self, x, mask, cos, sin):
         # Shortcut connection for attention block
         shortcut = x
         x = self.norm1(x)
         x = self.att(x, mask, cos, sin)  # Shape [batch_size, num_tokens, emb_size]
-        x = x + shortcut  # Add the original input back
+        x = x + shortcut  
 
         # Shortcut connection for feed-forward block
         shortcut = x
         x = self.norm2(x)
         x = self.ff(x)
-        x = x + shortcut  # Add the original input back
+        x = x + shortcut  
 
         return x
     
@@ -187,14 +204,13 @@ class Llama3Model(nn.Module):
 
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
 
-        self.trf_blocks = nn.ModuleList(  # ModuleList since Sequential can only accept one input, and we need `x, mask, cos, sin`
+        self.trf_blocks = nn.ModuleList(  
             [TransformerBlock(cfg) for _ in range(cfg["n_layers"])]
         )
 
         self.final_norm = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
 
-        # Reusable utilities
         cos, sin = compute_rope_params(
             head_dim=cfg["emb_dim"] // cfg["n_heads"],
             theta_base=cfg["rope_base"],
