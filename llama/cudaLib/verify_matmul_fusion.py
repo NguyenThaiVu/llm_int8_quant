@@ -26,56 +26,51 @@ def bnb_int8_and_dequantize(x_q, w_q, x_scales, w_scales, output_dtype=torch.bfl
 
 if __name__ == "__main__":
     
-    # M = 2048
-    # K = 1024 * 8
-    # N = 1024 * 8
+    M = 2048
+    K = 4096
+    N = 8192
     
-    list_M = [1024, 2048, 4096, 8192, 10240]
-    list_K = [1024, 2048, 4096, 8192, 10240]
-    list_N = [1024, 2048, 4096, 8192, 10240]
+    dtype = torch.bfloat16
     
-    for M, K, N in zip(list_M, list_K, list_N):
-        print(f"\nTesting matmul shape ({M}, {K}, {N})")
+    X_bf = torch.randn((M, K), dtype=dtype, device='cuda')
+    W_bf = torch.randn((N, K), dtype=dtype, device='cuda')
     
-        dtype = torch.bfloat16
-        
-        X_bf = torch.randn((M, K), dtype=dtype, device='cuda')
-        W_bf = torch.randn((N, K), dtype=dtype, device='cuda')
-        
-        W_bf_T = W_bf.t().contiguous()
-        true_Y = torch.matmul(X_bf, W_bf_T)
-        
-        _, Y_scale = quantize_row_int8_symmetric_nd(true_Y) # assume quantize via calibration
-        
-        X_int8, X_scale = quantize_row_int8_symmetric_nd(X_bf)
-        W_int8, W_scale = quantize_row_int8_symmetric_nd(W_bf)
-        
-        # Verify correctness
-        # ==========================================================
-        Y_custom = gemm_cutlass.func_w8a8_matmul(X_int8, W_int8, X_scale, W_scale)    
-        max_diff = torch.max(torch.abs(Y_custom - true_Y))
-        print(f"Max diff: {max_diff:.4f}")
-        mse = torch.mean((Y_custom - true_Y) ** 2).item()
-        print(f"MSE: {mse:.4f}")
-        
-        # Measure time 
-        # ==========================================================
-        torch_time = measure_time(torch.matmul, X_bf, W_bf_T)
-        print(f"PyTorch fp16 matmul time: {torch_time:.2f} ms")
-        time.sleep(1) 
-        
-        custom_time = measure_time(gemm_cutlass.func_w8a8_matmul, 
-                                X_int8, W_int8, X_scale, W_scale)
-        print(f"Int8 matmul (fusion scale) time: {custom_time:.2f} ms")
-        time.sleep(1)
-        
-        int8_matmul_time = measure_time(gemm_cutlass.func_int8_matmul, 
-                                        X_int8, W_int8, 1.0)
-        print(f"Int8 matmul (without dequant) time: {int8_matmul_time:.2f} ms")
-        time.sleep(1)
-        
-        int8_three_scale_time = measure_time(gemm_cutlass.func_int8_matmul_out_int8_three_scale,
-                                            X_int8, W_int8, X_scale, W_scale, Y_scale)
-        print(f"Int8 matmul (and dequantize kernel) time: {int8_three_scale_time:.2f} ms")
-        
-        
+    W_bf_T = W_bf.t().contiguous()
+    true_Y = torch.matmul(X_bf, W_bf_T)
+    
+    _, Y_scale = quantize_row_int8_symmetric_nd(true_Y) # assume quantize via calibration
+    
+    X_int8, X_scale = quantize_row_int8_symmetric_nd(X_bf)
+    W_int8, W_scale = quantize_row_int8_symmetric_nd(W_bf)
+    
+    # Verify correctness
+    # ==========================================================
+    print(f"Shape of X_scale: {X_scale.shape}")
+    print(f"Shape of W_scale: {W_scale.shape}")
+    Y_custom = gemm_cutlass.func_w8a8_matmul(X_int8, W_int8, X_scale, W_scale)    
+    max_diff = torch.max(torch.abs(Y_custom - true_Y))
+    print(f"Max diff: {max_diff:.4f}")
+    mse = torch.mean((Y_custom - true_Y) ** 2).item()
+    print(f"MSE: {mse:.4f}")
+    
+    # Measure time 
+    # ==========================================================
+    torch_time = measure_time(torch.matmul, X_bf, W_bf_T)
+    print(f"PyTorch fp16 matmul time: {torch_time:.2f} ms")
+    time.sleep(1) 
+    
+    custom_time = measure_time(gemm_cutlass.func_w8a8_matmul, 
+                            X_int8, W_int8, X_scale, W_scale)
+    print(f"Int8 matmul (fusion scale) time: {custom_time:.2f} ms")
+    time.sleep(1)
+    
+    int8_matmul_time = measure_time(gemm_cutlass.func_int8_matmul, 
+                                    X_int8, W_int8, 1.0)
+    print(f"Int8 matmul (without dequant) time: {int8_matmul_time:.2f} ms")
+    time.sleep(1)
+    
+    int8_three_scale_time = measure_time(gemm_cutlass.func_int8_matmul_out_int8_three_scale,
+                                        X_int8, W_int8, X_scale, W_scale, Y_scale)
+    print(f"Int8 matmul (and dequantize kernel) time: {int8_three_scale_time:.2f} ms")
+    
+    

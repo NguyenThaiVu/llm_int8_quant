@@ -58,11 +58,11 @@ class Custom_GroupedQueryAttention(nn.Module):
         self.head_dim = head_dim
         self.d_out = num_heads * head_dim
 
-        self.W_query = Custom_Linear(d_in, self.d_out, max_seq_len=MAX_SEQ_LEN).to(dtype)
-        self.W_key = Custom_Linear(d_in, num_kv_groups * head_dim, max_seq_len=MAX_SEQ_LEN).to(dtype)
-        self.W_value = Custom_Linear(d_in, num_kv_groups * head_dim, max_seq_len=MAX_SEQ_LEN).to(dtype)
-        self.out_proj = Custom_Linear(self.d_out, d_in, max_seq_len=MAX_SEQ_LEN).to(dtype)
-            
+        self.W_query = Custom_Linear(d_in, self.d_out).to(dtype)
+        self.W_key = Custom_Linear(d_in, num_kv_groups * head_dim).to(dtype)
+        self.W_value = Custom_Linear(d_in, num_kv_groups * head_dim).to(dtype)
+        self.out_proj = Custom_Linear(self.d_out, d_in).to(dtype)
+
         self.query_rope = Custom_RoPE(num_heads, max_seq_len=MAX_SEQ_LEN, head_dim=head_dim).to(dtype)
         self.key_rope = Custom_RoPE(num_kv_groups, max_seq_len=MAX_SEQ_LEN, head_dim=head_dim).to(dtype)
         
@@ -113,7 +113,7 @@ class Custom_GroupedQueryAttention(nn.Module):
         else: 
             # === Quantized computation ===
             x_int8 = x
-            x_scale = scale_x
+            x_scale = scale_x.squeeze(0)
             
             queries_int8, queries_scale = self.W_query(x_int8, x_scale)
             keys_int8, keys_scale = self.W_key(x_int8, x_scale)
@@ -365,12 +365,11 @@ if __name__ == "__main__":
     model.to(device)
     del combined_weights  # free up memory
 
-
     # ===============================================
     # 4. Generate Text
     # ===============================================
-    MAX_GENERATED_TOKENS = 512
-    PPL_CONTEXT_TOKENS = 512
+    MAX_GENERATED_TOKENS = 1000
+    PPL_CONTEXT_TOKENS = 1000
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
     EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 

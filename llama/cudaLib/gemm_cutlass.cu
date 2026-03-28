@@ -26,7 +26,6 @@
 #include "gemm_matmul.cu"
 #include "gemm_rmsnorm.cu"
 #include "gemm_activation.cu"
-#include "gemm_element_wise.cu"
 
 using namespace torch::indexing;
 
@@ -42,24 +41,6 @@ torch::Tensor func_int8_matmul(
 ) {
   const at::cuda::OptionalCUDAGuard device_guard(input.device());
   return int8_matmul_host(input, weight, alpha);
-}
-
-torch::Tensor func_int8_matmul_output_int8(
-    torch::Tensor input,   // INT8 - shape (M, K)
-    torch::Tensor weight,  // INT8 - shape (N, K)
-    float scale            // BFloat16
-) {
-  const at::cuda::OptionalCUDAGuard device_guard(input.device());
-  return int8_matmul_output_int8_host(input, weight, scale);
-}
-
-torch::Tensor func_int8_matmul_output_int8_batched(
-    torch::Tensor input,   // INT8 - shape (B, M, K) or (M, K)
-    torch::Tensor weight,  // INT8 - shape (B, N, K) or (N, K)
-    torch::Tensor scales   // 1D float tensor, length = batch_size
-) {
-  const at::cuda::OptionalCUDAGuard device_guard(input.device());
-  return int8_matmul_output_int8_batched_host(input, weight, scales);
 }
 
 
@@ -122,17 +103,6 @@ torch::Tensor func_rmsnorm_optimized_int8(
     return rmsnorm_optimized_int8_cuda(x, scale_x, gamma, scale_y, eps);
 }
 
-torch::Tensor func_element_wise_mul_int8(
-    torch::Tensor a,
-    torch::Tensor scale_a,
-    torch::Tensor b,
-    torch::Tensor scale_b,
-    torch::Tensor scale_c) 
-{
-    const at::cuda::OptionalCUDAGuard device_guard(a.device());
-    return element_wise_mul_int8_rowwise_cuda(a, scale_a, b, scale_b, scale_c);
-}
-
 torch::Tensor func_apply_rope_int8(
     torch::Tensor x,          // int8, shape [batch_size, num_heads, seq_len, head_dim]
     torch::Tensor scale_x,
@@ -146,15 +116,6 @@ torch::Tensor func_apply_rope_int8(
     return apply_rope_int8_host(x, scale_x, cos, scale_cos, sin, scale_sin, scale_out);
 }
 
-torch::Tensor func_apply_sigmoid_int8(
-    torch::Tensor input,      // int8
-    torch::Tensor scale_in,   // float32 scalar
-    torch::Tensor scale_out   // float32 scalar
-) {
-    const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    return sigmoid_int8_cuda(input, scale_in, scale_out);
-}
-
 torch::Tensor func_apply_silu_int8(
     torch::Tensor input,      // int8
     torch::Tensor scale_in,   // float32 scalar
@@ -162,17 +123,6 @@ torch::Tensor func_apply_silu_int8(
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
     return silu_int8_cuda_rowwise(input, scale_in, scale_out);
-}
-
-torch::Tensor func_element_add_int8(
-    torch::Tensor a,          // int8
-    torch::Tensor scale_a,    // float32 scalar
-    torch::Tensor b,          // int8
-    torch::Tensor scale_b,    // float32 scalar
-    torch::Tensor scale_out   // float32 scalar
-) {
-    const at::cuda::OptionalCUDAGuard device_guard(a.device());
-    return element_add_int8_cuda(a, scale_a, b, scale_b, scale_out);
 }
 
 torch::Tensor func_silu_mul(
@@ -233,37 +183,37 @@ torch::Tensor func_int8_matmul_out_int8_three_scale_batched(
     return int8_matmul_out_int8_three_scale_batched_host(input, weight, row_scale, col_scale, out_scale);
 }
 
-torch::Tensor func_int8_matmul_bias(
-    torch::Tensor input,   // INT8 - shape (M, K)
-    torch::Tensor weight,  // INT8 - shape (N, K)
-    torch::Tensor bias     // FP32 - shape (N,)
-) {
-    const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    return int8_matmul_bias_epilogue_host(input, weight, bias, 1.0f);
-}
-
 torch::Tensor func_w8a8_matmul(
     torch::Tensor input,   // INT8 - shape (M, K)
     torch::Tensor weight,  // INT8 - shape (N, K)
-    torch::Tensor alphaCol, // FP32 - shape (M, 1)
-    torch::Tensor alphaRow  // FP32 - shape (1, N)
+    torch::Tensor alphaRow,  // FP32 - shape (M, 1)
+    torch::Tensor alphaCol // FP32 - shape (N, 1)
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    return matmul_w8a8_host(input, weight, alphaCol, alphaRow);
+    return matmul_w8a8_host(input, weight, alphaRow, alphaCol);
+}
+
+torch::Tensor func_w8a8o8_matmul(
+    torch::Tensor input,   // INT8 - shape (M, K)
+    torch::Tensor weight,  // INT8 - shape (N, K)
+    torch::Tensor alphaRow,  // FP32 - shape (M)
+    torch::Tensor alphaCol // FP32 - shape (N)
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(input.device());
+
+    if (input.dim() == 2) {
+        return matmul_w8a8o8_2D_host(input, weight, alphaRow, alphaCol);
+    } else if (input.dim() == 3) {
+        return matmul_w8a8o8_3D_host(input, weight, alphaRow, alphaCol);
+    } else {
+        throw std::invalid_argument("Input tensor must be 2D or 3D");
+    }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_int8_matmul",
         &func_int8_matmul,
         "Int8 MatMul using CUTLASS (INT8 input/weight, BFloat16 output)");
-
-    m.def("func_int8_matmul_output_int8",
-        &func_int8_matmul_output_int8,
-        "Int8 MatMul using CUTLASS (INT8 input/weight/output, BFloat16 scale)");
-    
-    m.def("func_int8_matmul_output_int8_batched",
-        &func_int8_matmul_output_int8_batched,
-        "Batched Int8 MatMul using CUTLASS (INT8 input/weight/output, BFloat16 scale)");
 
     m.def("func_softmax_lastdim_int8",
         &func_softmax_lastdim_int8,
@@ -288,26 +238,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_rmsnorm_optimized_int8",
         &func_rmsnorm_optimized_int8,
         "Optimized RMSNorm for 2D int8 input with float32 gamma and input scale");
-        
-    m.def("func_element_wise_mul_int8",
-        &func_element_wise_mul_int8,
-        "Element-wise multiply for int8 tensors with scales");
-    
+
     m.def("func_apply_rope_int8",
         &func_apply_rope_int8,
         "Apply RoPE to int8 tensor with given cos/sin tables and scales");
 
-    m.def("func_apply_sigmoid_int8",
-        &func_apply_sigmoid_int8,
-        "Apply Sigmoid activation function to int8 input tensor with given input/output scales");
-    
     m.def("func_apply_silu_int8",
         &func_apply_silu_int8,
         "Apply SiLU activation function to int8 input tensor with given input/output scales");
-
-    m.def("func_element_add_int8",
-        &func_element_add_int8,
-        "Element-wise add for int8 tensors with scales");
 
     m.def("func_silu_mul",
         &func_silu_mul,
@@ -333,11 +271,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &func_int8_matmul_out_int8_three_scale_batched,
         "Batched Int8 MatMul with three scales using CUTLASS (INT8 input/weight, BFloat16 per-element scale, INT8 output)");
 
-    m.def("func_int8_matmul_bias",
-        &func_int8_matmul_bias,
-        "Int8 MatMul with bias using CUTLASS (INT8 input/weight, FP32 bias, BFloat16 output)");
-    
     m.def("func_w8a8_matmul",
         &func_w8a8_matmul,
         "MatMul for INT8 input and INT8 weight with per-row and per-column scales using CUTLASS (INT8 input/weight, FP32 per-row and per-column scales, FP32 output)");
+
+    m.def("func_w8a8o8_matmul",
+        &func_w8a8o8_matmul,
+        "MatMul for INT8 input and INT8 weight with per-row and per-column scales using CUTLASS (INT8 input/weight, FP32 per-row and per-column scales, INT8 output)");
 }

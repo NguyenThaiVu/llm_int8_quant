@@ -5,13 +5,38 @@ import gemm_cutlass
 
 from utils_quant import quantize_row_int8_symmetric_nd, quantize_tensor
 
-MAX_SEQ_LEN = 640 # 640 or 1280 or 2112
+MAX_SEQ_LEN = 1280 # 640 or 1280 or 2112
 
 class Custom_Linear(nn.Module):
-    def __init__(self, in_features, out_features, max_seq_len=MAX_SEQ_LEN):
+    """
+    Linear layer with two execution modes:
+    1. Calibration mode
+        - Input: bf16
+        - Weight: bf16
+        - Output: bf16
+        - Behavior: computes `x @ weight.T` and updates output observer
+    
+    2. Quantization mode
+        - Input: int8
+        - Weight: int8
+        - Output: int8
+        - Behavior: computes quantized matmul with per-row scaling
+                    and returns quantized output and its scale
+    
+    This layer has: per-row scale for activation and 
+                    per-tensor scale for weight. 
+                    The output scale is per-row
+                    
+    Input shapes: (M, K) or (B, M, K)
+    Weight shapes: (N, K)
+    Output shapes: (M, N) or (B, M, N)
+    """
+    def __init__(self, in_features, out_features, 
+                 max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16):
         super(Custom_Linear, self).__init__()
         
-        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, 
+                                               dtype=dtype))
         nn.init.kaiming_normal_(self.weight, mode='fan_in', nonlinearity='relu')
         
         self.register_buffer(
@@ -32,32 +57,26 @@ class Custom_Linear(nn.Module):
             self.out_observer(out)
             return out, 1.0
         else:
-            assert x.dtype == torch.int8, "Expected int8 input in quantized mode"
+            assert x.dtype == torch.int8,\
+                "Expected int8 input in quantization"
             
             seq_len = x.shape[0]
+            out_dim = self.weight_q.shape[0]
             scale_y_value = self.scale_y[:seq_len]
-            requant_scale = scale_x * self.scale_w / scale_y_value
-            requant_scale = requant_scale.to(torch.float32)
             
-            if x.dim() == 3:
-                out_q = gemm_cutlass.func_int8_matmul_out_int8_per_row_scale_batched(
-                    x, self.weight_q, requant_scale
-                )
-            elif x.dim() == 2:
-                out_q = gemm_cutlass.func_int8_matmul_out_int8_per_row_scale(
-                    x, self.weight_q, requant_scale
-                )
-            else:
-                raise ValueError("Input must be 2D or 3D tensor")
+            row_scale = scale_x / scale_y_value  
+            col_scale = self.scale_w.expand(out_dim)
+            
+            out_q = gemm_cutlass.func_w8a8o8_matmul(x, self.weight_q,\
+                row_scale, col_scale)
+
             return out_q, scale_y_value
         
     def finish_calibration(self):
         self.weight_q, self.scale_w = quantize_tensor(self.weight)
-        
         self.scale_y = self.out_observer.get_scale().to(self.scale_w.device)
-        self.is_quantized = True  
         
-        # Release original weight to save memory
+        self.is_quantized = True  
         del self.weight
         torch.cuda.empty_cache()
         
@@ -249,8 +268,6 @@ class Custom_Matmul(nn.Module):
             if A.dim() == 2:
                 seq_len = A.shape[0]
                 
-                # scale_A = scale_A[:seq_len].to(torch.float32)
-                # scale_B = scale_B[:seq_len].to(torch.float32)
                 scale_out_value = self.scale_out[:seq_len].to(torch.float32)
                 
                 C_int8 = gemm_cutlass.func_int8_matmul_out_int8_three_scale(
@@ -260,8 +277,6 @@ class Custom_Matmul(nn.Module):
             elif A.dim() == 3:
                 batch_size, seq_len, _ = A.shape
                 
-                # scale_A = scale_A[:, :seq_len].to(torch.float32)
-                # scale_B = scale_B[:, :seq_len].to(torch.float32)
                 scale_out_value = self.scale_out[:, :seq_len].to(torch.float32)
 
                 C_int8 = gemm_cutlass.func_int8_matmul_out_int8_three_scale_batched(
