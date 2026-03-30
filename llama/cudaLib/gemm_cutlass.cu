@@ -143,24 +143,6 @@ std::tuple<torch::Tensor, torch::Tensor> func_silu_mul_int8(
     return silu_mul_int8_cuda(fc1, scale_fc1, fc2, scale_fc2);
 }
 
-torch::Tensor func_int8_matmul_out_int8_per_row_scale(
-    torch::Tensor input,   // INT8 - shape (M, K)
-    torch::Tensor weight,  // INT8 - shape (N, K)
-    torch::Tensor scale    // FP32 - shape (M, 1)
-) {
-    const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    return int8_matmul_out_int8_per_row_scale_host(input, weight, scale);
-}
-
-torch::Tensor func_int8_matmul_out_int8_per_row_scale_batched(
-    torch::Tensor input,   // INT8 - shape (B, M, K) 
-    torch::Tensor weight,  // INT8 - shape (B, N, K) or (N, K)
-    torch::Tensor scale    // FP32 - shape (B, M, 1) or (M, 1)
-) {
-    const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    return int8_matmul_out_int8_per_row_scale_batched_host(input, weight, scale);
-}
-
 torch::Tensor func_int8_matmul_out_int8_three_scale(
     torch::Tensor input,   // INT8 - shape (M, K)
     torch::Tensor weight,  // INT8 - shape (N, K)
@@ -254,14 +236,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_silu_mul_int8",
         &func_silu_mul_int8,
         "Apply SiLU to fc1 and multiply with fc2 (both int8) with proper scaling, return int8 output with scale");
-
-    m.def("func_int8_matmul_out_int8_per_row_scale",
-        &func_int8_matmul_out_int8_per_row_scale,
-        "Int8 MatMul with per-row output scale using CUTLASS (INT8 input/weight, FP32 per-row scale, INT8 output)");
-    
-    m.def("func_int8_matmul_out_int8_per_row_scale_batched",
-        &func_int8_matmul_out_int8_per_row_scale_batched,
-        "Batched Int8 MatMul with per-row output scale using CUTLASS (INT8 input/weight, FP32 per-row scale, INT8 output)");
 
     m.def("func_int8_matmul_out_int8_three_scale",
         &func_int8_matmul_out_int8_three_scale,

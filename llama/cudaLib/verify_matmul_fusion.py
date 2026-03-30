@@ -26,9 +26,9 @@ def bnb_int8_and_dequantize(x_q, w_q, x_scales, w_scales, output_dtype=torch.bfl
 
 if __name__ == "__main__":
     
-    M = 2048
+    M = 4096
     K = 4096
-    N = 8192
+    N = 4096
     
     dtype = torch.bfloat16
     

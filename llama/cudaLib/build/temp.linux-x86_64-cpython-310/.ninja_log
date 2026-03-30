@@ -1,2 +1,2 @@
 # ninja log v7
-0	78242	1774724923161495672	/home/tnguyen10/Desktop/llm_int8_quant/llama/cudaLib/build/temp.linux-x86_64-cpython-310/gemm_cutlass.o	3a5dd70ee5797a35
+2	83671	1774880258215099664	/home/tnguyen10/Desktop/llm_int8_quant/llama/cudaLib/build/temp.linux-x86_64-cpython-310/gemm_cutlass.o	3a5dd70ee5797a35

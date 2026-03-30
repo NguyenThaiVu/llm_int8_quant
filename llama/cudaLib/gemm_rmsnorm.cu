@@ -5,6 +5,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <vector>
+#include <tuple>
 
 #include <cstdio>
 #include <cfloat>
@@ -288,21 +290,15 @@ __global__ void rmsnorm_quant_int8_kernel(
     }
 }
 
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_bf16.h>
-#include <vector>
-#include <tuple>
-
-// Kernel declaration
-__global__ void rmsnorm_quant_int8_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const __nv_bfloat16* __restrict__ gamma,
-    int8_t* __restrict__ y_int8,
-    float* __restrict__ scale_y,
-    int d_model,
-    float eps
-);
+// // Kernel declaration
+// __global__ void rmsnorm_quant_int8_kernel(
+//     const __nv_bfloat16* __restrict__ x,
+//     const __nv_bfloat16* __restrict__ gamma,
+//     int8_t* __restrict__ y_int8,
+//     float* __restrict__ scale_y,
+//     int d_model,
+//     float eps
+// );
 
 std::tuple<torch::Tensor, torch::Tensor> rmsnorm_quant_cuda(
     torch::Tensor x,
@@ -347,8 +343,6 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_quant_cuda(
     );
 
     int threads = static_cast<int>(std::min<int64_t>(d_model, 512));
-
-    // round down to power of 2
     if (threads & (threads - 1)) {
         int p = 1;
         while ((p << 1) <= threads) {
@@ -377,52 +371,6 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_quant_cuda(
 
     return std::make_tuple(y, scale_y);
 }
-
-// std::tuple<torch::Tensor, torch::Tensor> rmsnorm_quant_cuda(torch::Tensor x, 
-//     torch::Tensor gamma, float eps
-// ) {
-//     TORCH_CHECK(x.is_cuda(), "x must be CUDA");
-//     TORCH_CHECK(gamma.is_cuda(), "gamma must be CUDA");
-//     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be BF16");
-//     TORCH_CHECK(gamma.scalar_type() == torch::kBFloat16, "gamma must be BF16");
-//     TORCH_CHECK(x.dim() == 2, "x must be 2D (tokens, d_model)");
-//     TORCH_CHECK(gamma.dim() == 1, "gamma must be 1D (d_model)");
-//     TORCH_CHECK(x.size(1) == gamma.size(0), "gamma size must match x's last dim");
-
-//     auto x_contig = x.contiguous();
-//     auto gamma_contig = gamma.contiguous();
-
-//     auto y = torch::empty_like(x_contig, x_contig.options().dtype(torch::kChar)); 
-//     auto scale_y = torch::empty({x_contig.size(0)}, x_contig.options().dtype(torch::kFloat32));
-
-//     int64_t num_tokens = x.size(0);
-//     int64_t d_model = x.size(1);
-
-//     int threads = (int)std::min<int64_t>(d_model, 512);
-//     if (threads & (threads - 1)) {
-//         int p = 1;
-//         while ((p << 1) <= threads) p <<= 1;
-//         threads = p;
-//     }
-//     threads = std::max(threads, 32);
-
-//     dim3 block(threads);
-//     dim3 grid((unsigned)num_tokens);
-
-//     auto stream = at::cuda::getCurrentCUDAStream();
-
-//     rmsnorm_quant_int8_kernel<<<grid, block, 0, stream>>>(
-//         reinterpret_cast<const __nv_bfloat16*>(x_contig.data_ptr()),
-//         reinterpret_cast<const __nv_bfloat16*>(gamma_contig.data_ptr()),
-//         y.data_ptr<int8_t>(),
-//         scale_y.data_ptr<float>(),
-//         (int)d_model,
-//         eps
-//     );
-
-//     C10_CUDA_KERNEL_LAUNCH_CHECK();
-//     return std::make_tuple(y, scale_y);
-// }
 
 
 
