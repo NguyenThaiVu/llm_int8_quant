@@ -235,6 +235,22 @@ This kernel compute
 
 */
 
+// ============================================================
+// This kernel computes SiLU(x1) * x2 
+// with per-row quantization for inputs and outputs.
+//
+// Input:
+//   x1_int8  : INT8, [num_tokens, d_model]
+//   scale_x1 : FP32, [num_tokens]   (per-row quant scale for x1)
+//   x2_int8  : INT8, [num_tokens, d_model]
+//   scale_x2 : FP32, [num_tokens]   (per-row quant scale for x2)
+//   smooth_scale: FP32, [num_tokens] (per-row smooth for quantization, optional)
+//
+// Output:
+//   y_int8   : INT8, [num_tokens, d_model]
+//   out_scales  : FP32, [num_tokens]   (per-row quant scale)
+// ============================================================
+
 __global__ void silu_mul_int8_kernel(
     const int8_t* __restrict__ x1_int8,   // [rows, cols]
     const int8_t* __restrict__ x2_int8,   // [rows, cols]
@@ -242,43 +258,47 @@ __global__ void silu_mul_int8_kernel(
     float* __restrict__ scale_x2,  // [rows]
     int8_t* __restrict__ out_int8,        // [rows, cols]
     float* __restrict__ out_scales,       // [rows]
+    const float* __restrict__ smooth_scale, // [rows] 
     int rows,
     int cols
 ) {
-    int row = blockIdx.x;  // one block per row
+    const int row = blockIdx.x;   // one block per row
     if (row >= rows) return;
 
-    int tid = threadIdx.x;
-    int row_offset = row * cols;
-    float s_x1 = scale_x1[row];
-    float s_x2 = scale_x2[row];
+    const int tid = threadIdx.x;
+    const int row_offset = row * cols;
 
-    extern __shared__ float sdata[];  // shared memory for reduction
+    const float s_x1 = scale_x1[row];
+    const float s_x2 = scale_x2[row];
 
-    // -------- Pass 1: compute max |y| in this row --------
+    extern __shared__ float sdata[];
+
+    // -------- Pass 1: compute max | y / s[j] | in this row --------
     float local_max = 0.0f;
 
     for (int col = tid; col < cols; col += blockDim.x) {
-        int idx = row_offset + col;
+        const int idx = row_offset + col;
 
-        // dequantize
-        float x1 = static_cast<float>(x1_int8[idx]) * s_x1;
-        float x2 = static_cast<float>(x2_int8[idx]) * s_x2;
+        // dequantize inputs
+        const float x1 = static_cast<float>(x1_int8[idx]) * s_x1;
+        const float x2 = static_cast<float>(x2_int8[idx]) * s_x2;
 
-        // SiLU(x1) = x1 / (1 + exp(-x1))
-        float silu = x1 / (1.0f + expf(-x1));
-        float y = silu * x2;
+        // exact float computation remains unchanged
+        const float silu = x1 / (1.0f + expf(-x1));
+        const float y = silu * x2;
 
-        float a = fabsf(y);
+        // apply SmoothQuant-style output smoothing only before quantization
+        const float s = smooth_scale[col];
+        const float y_smooth = y / s;
+
+        const float a = fabsf(y_smooth);
         if (a > local_max) local_max = a;
     }
 
-    // store local max into shared memory
     sdata[tid] = local_max;
     __syncthreads();
 
-    // block-wide reduction to get row_max in sdata[0]
-    // (simple binary tree reduction)
+    // block reduction for row max
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             if (sdata[tid + stride] > sdata[tid]) {
@@ -288,40 +308,36 @@ __global__ void silu_mul_int8_kernel(
         __syncthreads();
     }
 
-    float row_max = sdata[0];
+    const float row_max = sdata[0];
 
-    // Compute per-row output scale (symmetric, using 127)
-    float scale_out;
-    if (row_max > 0.0f) {
-        scale_out = row_max / 127.0f;
-    } else {
-        // avoid division by zero; arbitrary small scale
-        scale_out = 1.0f;
-    }
-
+    __shared__ float shared_scale_out;
     if (tid == 0) {
+        float scale_out = (row_max > 0.0f) ? (row_max / 127.0f) : 1.0f;
+        shared_scale_out = scale_out;
         out_scales[row] = scale_out;
     }
+    __syncthreads();
 
-    __syncthreads();  // ensure scale_out visible to all threads
+    const float scale_out = shared_scale_out;
+    const float inv_scale_out = 1.0f / scale_out;
 
-    // -------- Pass 2: recompute y and quantize --------
+    // -------- Pass 2: recompute y, smooth, quantize --------
     for (int col = tid; col < cols; col += blockDim.x) {
-        int idx = row_offset + col;
+        const int idx = row_offset + col;
 
-        float x1 = static_cast<float>(x1_int8[idx]) * s_x1;
-        float x2 = static_cast<float>(x2_int8[idx]) * s_x2;
+        const float x1 = static_cast<float>(x1_int8[idx]) * s_x1;
+        const float x2 = static_cast<float>(x2_int8[idx]) * s_x2;
 
-        float silu = x1 / (1.0f + expf(-x1));
-        float y = silu * x2;
+        const float silu = x1 / (1.0f + expf(-x1));
+        const float y = silu * x2;
 
-        float q = y / scale_out;
-        // round to nearest int
-        q = rintf(q);
+        const float s = smooth_scale[col];
+        const float y_smooth = y / s;
 
-        // clamp to int8 range
-        if (q > 127.0f) q = 127.0f;
-        if (q < -128.0f) q = -128.0f;
+        
+        int q = __float2int_rn(y_smooth * inv_scale_out);
+
+        q = max(-127, min(127, q));
 
         out_int8[idx] = static_cast<int8_t>(q);
     }
@@ -329,16 +345,38 @@ __global__ void silu_mul_int8_kernel(
 
 std::tuple<torch::Tensor, torch::Tensor> silu_mul_int8_cuda(
     torch::Tensor x1_int8, torch::Tensor scale_x1,
-    torch::Tensor x2_int8, torch::Tensor scale_x2
+    torch::Tensor x2_int8, torch::Tensor scale_x2,
+    torch::Tensor smooth_scale
 ) {
-    TORCH_CHECK(x1_int8.is_cuda() && x2_int8.is_cuda(), "Input int8 tensors must be CUDA");
-    TORCH_CHECK(scale_x1.is_cuda() && scale_x2.is_cuda(), "Scale tensors must be CUDA");
-    TORCH_CHECK(x1_int8.dtype() == torch::kChar && x2_int8.dtype() == torch::kChar, "Input tensors must be int8");
-    TORCH_CHECK(scale_x1.dtype() == torch::kFloat32 && scale_x2.dtype() == torch::kFloat32, "Scale tensors must be float32");
-    TORCH_CHECK(x1_int8.dim() == 2 && x2_int8.dim() == 2, "Input tensors must be 2D");
-    TORCH_CHECK(x1_int8.sizes() == x2_int8.sizes(), "Input tensor sizes must match");
-    TORCH_CHECK(scale_x1.dim() == 1 && scale_x2.dim() == 1, "Scale tensors must be 1D");
-    TORCH_CHECK(scale_x1.size(0) == x1_int8.size(0) && scale_x2.size(0) == x2_int8.size(0), "Scale tensor size must match input rows");
+    TORCH_CHECK(x1_int8.is_cuda() && x2_int8.is_cuda(), 
+                "Input int8 tensors must be CUDA");
+    TORCH_CHECK(scale_x1.is_cuda() && scale_x2.is_cuda(), 
+                "Scale tensors must be CUDA");
+    TORCH_CHECK(smooth_scale.is_cuda(), 
+                "Smooth scale tensor must be CUDA");
+    
+    TORCH_CHECK(x1_int8.dtype() == torch::kChar && 
+                x2_int8.dtype() == torch::kChar, 
+                "Input tensors must be int8");
+    TORCH_CHECK(scale_x1.dtype() == torch::kFloat32 && 
+                scale_x2.dtype() == torch::kFloat32, 
+                "Scale tensors must be float32");
+    TORCH_CHECK(smooth_scale.dtype() == torch::kFloat32, 
+                "Smooth scale tensor must be float32");
+
+    TORCH_CHECK(x1_int8.dim() == 2 && x2_int8.dim() == 2, 
+                "Input tensors must be 2D");
+    TORCH_CHECK(x1_int8.sizes() == x2_int8.sizes(), 
+                "Input tensor sizes must match");
+    TORCH_CHECK(scale_x1.dim() == 1 && scale_x2.dim() == 1, 
+                "Scale tensors must be 1D");
+    TORCH_CHECK(scale_x1.size(0) == x1_int8.size(0) && 
+                scale_x2.size(0) == x2_int8.size(0), 
+                "Scale tensor size must match input rows");
+    TORCH_CHECK(smooth_scale.dim() == 1, 
+                "Smooth scale must be 1D");
+    TORCH_CHECK(smooth_scale.size(0) == x1_int8.size(1), 
+                "Smooth scale size must match input columns");
 
     int rows = x1_int8.size(0);
     int cols = x1_int8.size(1);
@@ -358,6 +396,7 @@ std::tuple<torch::Tensor, torch::Tensor> silu_mul_int8_cuda(
         scale_x2.data_ptr<float>(),
         out_int8.data_ptr<int8_t>(),
         out_scales.data_ptr<float>(),
+        smooth_scale.data_ptr<float>(),
         rows,
         cols
     );

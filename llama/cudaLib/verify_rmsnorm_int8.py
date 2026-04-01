@@ -27,20 +27,33 @@ class RMSNorm_Fuse_Quant(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(emb_dim, dtype=dtype))
         self.norm_shape = (emb_dim,)
+        self.emb_dim = emb_dim
         
         self.is_quantized = False
+        self.is_smooth_scale = False
+        self.smooth_scale = nn.Parameter(torch.ones(emb_dim, dtype=torch.float32))
 
     def forward(self, x):
         if self.is_quantized == False:
             norm_x = F.rms_norm(x, normalized_shape=self.norm_shape, weight=self.weight, eps=self.eps)
             return norm_x
         else:
-            Y_int8, scale_Y = gemm_cutlass.func_rmsnorm_quant(x, 
-                                                            self.weight, self.eps)
+            if self.is_smooth_scale == False:
+                fake_smooth_scale = torch.ones(self.emb_dim,\
+                                    dtype=torch.float32, device=x.device)
+                Y_int8, scale_Y = gemm_cutlass.func_rmsnorm_quant(x, self.weight,\
+                                                        fake_smooth_scale, self.eps)
+            else:
+                Y_int8, scale_Y = gemm_cutlass.func_rmsnorm_quant(x, self.weight,\
+                                                        self.smooth_scale, self.eps)
             return Y_int8, scale_Y
     
     def finish_calibration(self):
         self.is_quantized = True
+        
+    def enable_smooth_scale(self, smooth_scale):
+        self.is_smooth_scale = True
+        self.smooth_scale.data.copy_(smooth_scale)
         
         
 if __name__ == "__main__":

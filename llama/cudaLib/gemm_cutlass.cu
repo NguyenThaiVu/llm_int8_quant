@@ -75,10 +75,11 @@ torch::Tensor func_rmsnorm(
 std::tuple<torch::Tensor, torch::Tensor> func_rmsnorm_quant(
     torch::Tensor x,      // FP32, shape (tokens, d_model)
     torch::Tensor gamma,  // FP32, shape (d_model,)
+    torch::Tensor smooth_scale, // FP32, shape (d_model,)
     float eps) 
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    return rmsnorm_quant_cuda(x, gamma, eps);
+    return rmsnorm_quant_cuda(x, gamma, smooth_scale, eps);
 }
 
 torch::Tensor func_rmsnorm_int8(
@@ -134,13 +135,14 @@ torch::Tensor func_silu_mul(
 }
 
 std::tuple<torch::Tensor, torch::Tensor> func_silu_mul_int8(
-    torch::Tensor fc1, 
-    torch::Tensor scale_fc1,
-    torch::Tensor fc2,
-    torch::Tensor scale_fc2
+    torch::Tensor fc1,  // int8 - shape (M, D)
+    torch::Tensor scale_fc1, // float32 - shape (M, 1)
+    torch::Tensor fc2,  // int8 - shape (M, D)
+    torch::Tensor scale_fc2,  // float32 - shape (M, 1)
+    torch::Tensor smooth_scale  // float32 - shape (M, 1)
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(fc1.device());
-    return silu_mul_int8_cuda(fc1, scale_fc1, fc2, scale_fc2);
+    return silu_mul_int8_cuda(fc1, scale_fc1, fc2, scale_fc2, smooth_scale);
 }
 
 torch::Tensor func_int8_matmul_out_int8_three_scale(

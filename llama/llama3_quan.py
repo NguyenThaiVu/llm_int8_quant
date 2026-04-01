@@ -180,6 +180,7 @@ class Custom_GroupedQueryAttention(nn.Module):
         # self.out_proj.finish_calibration()
         self.is_quantized = True
     
+
 class RMSNorm_Fuse_Quant(nn.Module):
     """
     This module fuse RMSNorm and quantization into a single kernel. 
@@ -196,20 +197,33 @@ class RMSNorm_Fuse_Quant(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(emb_dim, dtype=dtype))
         self.norm_shape = (emb_dim,)
+        self.emb_dim = emb_dim
         
         self.is_quantized = False
+        self.is_smooth_scale = False
+        self.smooth_scale = nn.Parameter(torch.ones(emb_dim, dtype=torch.float32))
 
     def forward(self, x):
         if self.is_quantized == False:
             norm_x = F.rms_norm(x, normalized_shape=self.norm_shape, weight=self.weight, eps=self.eps)
             return norm_x
         else:
-            Y_int8, scale_Y = gemm_cutlass.func_rmsnorm_quant(x, 
-                                                            self.weight, self.eps)
+            if self.is_smooth_scale == False:
+                fake_smooth_scale = torch.ones(self.emb_dim,\
+                                    dtype=torch.float32, device=x.device)
+                Y_int8, scale_Y = gemm_cutlass.func_rmsnorm_quant(x, self.weight,\
+                                                        fake_smooth_scale, self.eps)
+            else:
+                Y_int8, scale_Y = gemm_cutlass.func_rmsnorm_quant(x, self.weight,\
+                                                        self.smooth_scale, self.eps)
             return Y_int8, scale_Y
     
     def finish_calibration(self):
         self.is_quantized = True
+        
+    def enable_smooth_scale(self, smooth_scale):
+        self.is_smooth_scale = True
+        self.smooth_scale.data.copy_(smooth_scale)
     
 
 class TransformerBlock(nn.Module):
@@ -226,9 +240,7 @@ class TransformerBlock(nn.Module):
         
         self.norm1 = RMSNorm_Fuse_Quant(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
         
-        # TODO: before we fuse RMSNorm with quantization, 
-        # we must handle outlier (smooth-quant) in FFN.
-        self.norm2 = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
+        self.norm2 = RMSNorm_Fuse_Quant(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
         
         self.is_quantized = False
 
@@ -247,15 +259,28 @@ class TransformerBlock(nn.Module):
 
         # Shortcut connection for feed-forward block
         shortcut = x
-        x = self.norm2(x)
         
-        # # === Feed-forward with quantization support ===
-        original_dtype = x.dtype
-        x = x.squeeze(0)  # Remove batch dimension
-        x, _ = self.ff(x, 1.0)
-        x = x.unsqueeze(0) # Add batch dimension back
-        x = x.to(original_dtype)
-        # # ========================================        
+        if self.is_quantized == False:
+            original_dtype = x.dtype
+            x = x.squeeze(0)  # Remove batch dimension
+            
+            x = self.norm2(x)
+            
+            x, _ = self.ff(x, 1.0)
+            
+            x = x.unsqueeze(0) # Add batch dimension back
+            x = x.to(original_dtype)
+        
+        else:
+            original_dtype = x.dtype
+            x = x.squeeze(0)  # Remove batch dimension
+            
+            x, scale_x = self.norm2(x)
+            
+            x, _ = self.ff(x, scale_x)
+            
+            x = x.unsqueeze(0) # Add batch dimension back
+            x = x.to(original_dtype)    
         
         x = x + shortcut  
 
@@ -267,6 +292,10 @@ class TransformerBlock(nn.Module):
         
         self.ff.finish_calibration()
         
+        self.norm2.finish_calibration()
+        smooth_scale = self.ff.fc1.smooth_alpha
+        self.norm2.enable_smooth_scale(smooth_scale)
+        
         self.is_quantized = True
 
 
@@ -276,14 +305,13 @@ class Llama3Model(nn.Module):
 
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
 
-        self.trf_blocks = nn.ModuleList(  # ModuleList since Sequential can only accept one input, and we need `x, mask, cos, sin`
+        self.trf_blocks = nn.ModuleList(  
             [TransformerBlock(cfg) for _ in range(cfg["n_layers"])]
         )
 
         self.final_norm = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
 
-        # Reusable utilities
         cos, sin = compute_rope_params(
             head_dim=cfg["emb_dim"] // cfg["n_heads"],
             theta_base=cfg["rope_base"],
@@ -368,13 +396,12 @@ if __name__ == "__main__":
     # ===============================================
     # 4. Generate Text
     # ===============================================
-    MAX_GENERATED_TOKENS = 512
-    PPL_CONTEXT_TOKENS = 512
+    MAX_GENERATED_TOKENS = 2000
+    PPL_CONTEXT_TOKENS = 2000
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-    EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
+    EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
 
-    list_prompt = ["What is Vietnam?",\
-                    "Who is Son Goku?"]
+    list_prompt = ["What is Dragon Ball story?"]
 
     for prompt in list_prompt:
         token_ids = generate(
@@ -404,7 +431,7 @@ if __name__ == "__main__":
 
     print("\nCollecting calibration data for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=10_000)
+                                                    split="train", n=50_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load training calibration with {len(calibrate_tokens)} tokens.")
             
@@ -423,8 +450,7 @@ if __name__ == "__main__":
     # ========================================================================
     # Quantization mode
     print("\n===== Generated text after quantization: =====\n")
-    list_prompt = ["What is VietNam?",\
-                "Who is Son Goku?"]
+    list_prompt = ["What is Dragon Ball story?"]
 
     for prompt in list_prompt:
         token_ids = generate(

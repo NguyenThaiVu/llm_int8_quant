@@ -193,11 +193,13 @@ __device__ __forceinline__ float block_reduce_max(float val) {
 }
 
 // ============================================================
-// Fused RMSNorm + symmetric INT8 quantization
+// Fused RMSNorm + symmetric INT8 quantization (with smoothquant 
+// per column of input)
 //
 // Input:
 //   x        : BF16, [num_tokens, d_model]
 //   gamma    : BF16, [d_model]
+//   smooth_scale: FP32, [d_model]
 //
 // Output:
 //   y_int8   : INT8, [num_tokens, d_model]
@@ -214,6 +216,7 @@ __global__ void rmsnorm_quant_int8_kernel(
     int8_t* __restrict__ y_int8,
     float* __restrict__ scale_y,
     int d_model,
+    const float* __restrict__ smooth_scale,
     float eps
 ) {
     const int token_idx = blockIdx.x;
@@ -247,14 +250,16 @@ __global__ void rmsnorm_quant_int8_kernel(
 
     // --------------------------------------------------------
     // Step 2. Find row-wise max absolute value after RMSNorm
-    //         y_fp = x * rms_inv * gamma
+    //         y_fp = x * rms_inv * gamma * smooth_scale
     // --------------------------------------------------------
     float local_amax = 0.0f;
 
     for (int i = tid; i < d_model; i += blockDim.x) {
         float x_val = __bfloat162float(x_ptr[i]);
         float g_val = __bfloat162float(gamma[i]);
-        float y_val = x_val * rms_inv * g_val;
+        float s_val = smooth_scale[i];
+
+        float y_val = x_val * rms_inv * g_val / s_val;
         local_amax = fmaxf(local_amax, fabsf(y_val));
     }
 
@@ -263,7 +268,6 @@ __global__ void rmsnorm_quant_int8_kernel(
     __shared__ float shared_scale_y;
     if (tid == 0) {
         // Symmetric per-row scale.
-        // Guard against all-zero row to avoid divide-by-zero.
         float s = block_amax / 127.0f;
         if (s == 0.0f) {
             s = 1.0f;
@@ -282,7 +286,8 @@ __global__ void rmsnorm_quant_int8_kernel(
     for (int i = tid; i < d_model; i += blockDim.x) {
         float x_val = __bfloat162float(x_ptr[i]);
         float g_val = __bfloat162float(gamma[i]);
-        float y_val = x_val * rms_inv * g_val;
+        float s_val = smooth_scale[i];
+        float y_val = x_val * rms_inv * g_val / s_val;
 
         int q = __float2int_rn(y_val * inv_scale_y);
         q = max(-128, min(127, q));
@@ -290,36 +295,33 @@ __global__ void rmsnorm_quant_int8_kernel(
     }
 }
 
-// // Kernel declaration
-// __global__ void rmsnorm_quant_int8_kernel(
-//     const __nv_bfloat16* __restrict__ x,
-//     const __nv_bfloat16* __restrict__ gamma,
-//     int8_t* __restrict__ y_int8,
-//     float* __restrict__ scale_y,
-//     int d_model,
-//     float eps
-// );
-
 std::tuple<torch::Tensor, torch::Tensor> rmsnorm_quant_cuda(
     torch::Tensor x,
     torch::Tensor gamma,
+    torch::Tensor smooth_scale,
     float eps
 ) {
     TORCH_CHECK(x.is_cuda(), "x must be CUDA");
     TORCH_CHECK(gamma.is_cuda(), "gamma must be CUDA");
+    TORCH_CHECK(smooth_scale.is_cuda(), "smooth_scale must be CUDA");
 
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be BF16");
     TORCH_CHECK(gamma.scalar_type() == torch::kBFloat16, "gamma must be BF16");
+    TORCH_CHECK(smooth_scale.scalar_type() == torch::kFloat32,
+                    "smooth_scale must be FP32");
 
     TORCH_CHECK(x.dim() == 2 || x.dim() == 3,
                 "x must be 2D [tokens, d_model] or 3D [batch, tokens, d_model]");
     TORCH_CHECK(gamma.dim() == 1, "gamma must be 1D [d_model]");
     TORCH_CHECK(x.size(-1) == gamma.size(0),
                 "gamma size must match x's last dimension");
+    TORCH_CHECK(smooth_scale.dim() == 1, "smooth_scale must be 1D [d_model]");
+    TORCH_CHECK(smooth_scale.size(0) == gamma.size(0),
+                "smooth_scale size must match gamma size");
 
     auto x_contig = x.contiguous();
     auto gamma_contig = gamma.contiguous();
-
+    auto smooth_scale_contig = smooth_scale.contiguous();
     const int64_t d_model = x_contig.size(-1);
 
     // Flatten all leading dimensions into rows.
@@ -364,6 +366,7 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_quant_cuda(
         y.data_ptr<int8_t>(),
         scale_y.data_ptr<float>(),
         static_cast<int>(d_model),
+        smooth_scale_contig.data_ptr<float>(),
         eps
     );
 
