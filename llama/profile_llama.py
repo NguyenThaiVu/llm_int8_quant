@@ -103,7 +103,7 @@ EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
     
 # ================================================
-# Evaluation
+# Evaluation Latency
 # ===============================================
 
 samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
@@ -132,6 +132,5 @@ with torch.profiler.profile(
         out_ids = model(input_ids)
 
 print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
-
 
     

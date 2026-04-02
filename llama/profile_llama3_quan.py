@@ -178,7 +178,51 @@ class Custom_GroupedQueryAttention(nn.Module):
         self.context_layer.finish_calibration()
         # self.out_proj.finish_calibration()
         self.is_quantized = True
+    
 
+class RMSNorm_Fuse_Quant(nn.Module):
+    """
+    This module fuse RMSNorm and quantization into a single kernel. 
+    - Input:
+        x: (seq_len, emb_dim) in bf16
+    - Output:
+        y: (seq_len, emb_dim) in bf16
+    OR 
+        Y_int8: (seq_len, emb_dim) in int8
+        scale_Y: (seq_len,) in float32
+    """
+    def __init__(self, emb_dim, eps=1e-6, dtype=torch.bfloat16):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(emb_dim, dtype=dtype))
+        self.norm_shape = (emb_dim,)
+        self.emb_dim = emb_dim
+        
+        self.is_quantized = False
+        self.is_smooth_scale = False
+        self.smooth_scale = nn.Parameter(torch.ones(emb_dim, dtype=torch.float32))
+
+    def forward(self, x):
+        if self.is_quantized == False:
+            norm_x = F.rms_norm(x, normalized_shape=self.norm_shape, weight=self.weight, eps=self.eps)
+            return norm_x
+        else:
+            if self.is_smooth_scale == False:
+                fake_smooth_scale = torch.ones(self.emb_dim,\
+                                    dtype=torch.float32, device=x.device)
+                Y_int8, scale_Y = gemm_cutlass.func_rmsnorm_quant(x, self.weight,\
+                                                        fake_smooth_scale, self.eps)
+            else:
+                Y_int8, scale_Y = gemm_cutlass.func_rmsnorm_quant(x, self.weight,\
+                                                        self.smooth_scale, self.eps)
+            return Y_int8, scale_Y
+    
+    def finish_calibration(self):
+        self.is_quantized = True
+        
+    def enable_smooth_scale(self, smooth_scale):
+        self.is_smooth_scale = True
+        self.smooth_scale.data.copy_(smooth_scale)
     
 
 class TransformerBlock(nn.Module):
@@ -351,78 +395,68 @@ if __name__ == "__main__":
     # ===============================================
     # 4. Generate Text
     # ===============================================
-    MAX_GENERATED_TOKENS = 1024
-    PPL_CONTEXT_TOKENS = 1024
+    MAX_GENERATED_TOKENS = 2000
+    PPL_CONTEXT_TOKENS = 2000
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
     EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
-    list_prompts = ["What is Dragon Ball story?"]
 
-    for prompt in list_prompts:
-        token_ids = generate(
-            model=model,
-            idx=text_to_token_ids(prompt, tokenizer).to(device),
-            max_new_tokens=MAX_GENERATED_TOKENS,
-            context_size=LLAMA32_CONFIG["context_length"],
-            top_k=1)
-
-        output_text = token_ids_to_text(token_ids, tokenizer)
-        print("\nResponse:\n", clean_text(output_text))
-        
-
-    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
-
-    ppl = compute_ppl_single_text(model,
-                                tokenizer, 
-                                samples,
-                                context_size=PPL_CONTEXT_TOKENS,
-                                stride=PPL_STRIDE)
-    print("PPL:", ppl)   
-        
-
+    # ================================================
+    # Evaluation Latency
     # ===============================================
-    # 5. Quantization
-    # ===============================================
+    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,\
+                                        split='train')
+    samples = tokenizer.encode(samples)
 
-    print("\nCollecting calibration data for quantization...")
-    calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=10_000)
-    calibrate_tokens = tokenizer.encode(calibrate_samples)
-    print(f"[INFO] Load training calibration with {len(calibrate_tokens)} tokens.")
-            
-    for i in range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE):
-        chunk_tokens = calibrate_tokens[i:i + PPL_CONTEXT_TOKENS]
+    chunk_tokens = samples[0: PPL_CONTEXT_TOKENS]
 
-        input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device).unsqueeze(0)
+    input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device).unsqueeze(0)
+    print(f"[INFO] Input tokens: {input_ids.shape}")
 
+    with torch.no_grad():
+        out_ids = model(input_ids)
+    print(f"[INFO] Output tokens: {out_ids.shape}")
+    
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
         with torch.no_grad():
-            _ = model(input_ids)
+            out_ids = model(input_ids)
+
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
+    print()
+    
+    
+        
+
+    # ===============================================
+    # 5. Quantization latency
+    # ===============================================
             
     model.finish_calibration()
-    print(f"[INFO] Finished calibration.")
+    print(f"\n[INFO] Finished calibration.\n")
 
-
-    # ========================================================================
-    # Quantization mode
-    print("\n===== Generated text after quantization: =====\n")
-    list_prompts = ["What is Dragon Ball story?"]
-
-    for prompt in list_prompts:
-        token_ids = generate(
-            model=model,
-            idx=text_to_token_ids(prompt, tokenizer).to(device),
-            max_new_tokens=MAX_GENERATED_TOKENS,
-            context_size=LLAMA32_CONFIG["context_length"],
-            top_k=1)
-
-        output_text = token_ids_to_text(token_ids, tokenizer)
-        print("\nResponse:\n", clean_text(output_text)) 
-        
-
-    ppl = compute_ppl_single_text(model,
-                                tokenizer, 
-                                samples,
-                                context_size=PPL_CONTEXT_TOKENS,
-                                stride=PPL_STRIDE)
-    print("PPL:", ppl)   
+    with torch.no_grad():
+        out_ids = model(input_ids)
+    print(f"[INFO] Output quantization tokens: {out_ids.shape}")
+    
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+        with torch.no_grad():
+            out_ids = model(input_ids)
+            
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
         

@@ -1,11 +1,12 @@
 import os 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import gemm_cutlass
 
 from utils_quant import quantize_row_int8_symmetric_nd, quantize_tensor
 
-MAX_SEQ_LEN = 2112 # 576 or 1040 or 2112
+MAX_SEQ_LEN = 1040 # 576 or 1040 or 2112
 
 class Custom_Linear(nn.Module):
     """
@@ -173,6 +174,52 @@ class Custom_RMSNorm(nn.Module):
         self.is_quantized = True
         
         
+class RMSNorm_Fuse_Quant(nn.Module):
+    """
+    This module fuse RMSNorm and quantization into a single kernel. 
+    - Input:
+        x: (seq_len, emb_dim) in bf16
+    - Output:
+        y: (seq_len, emb_dim) in bf16
+    OR 
+        Y_int8: (seq_len, emb_dim) in int8
+        scale_Y: (seq_len,) in float32
+    """
+    def __init__(self, emb_dim, eps=1e-6, dtype=torch.bfloat16):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(emb_dim, dtype=dtype))
+        self.norm_shape = (emb_dim,)
+        self.emb_dim = emb_dim
+        
+        self.is_quantized = False
+        self.is_smooth_scale = False
+        self.smooth_scale = nn.Parameter(torch.ones(emb_dim, dtype=torch.float32))
+
+    def forward(self, x):
+        if self.is_quantized == False:
+            norm_x = F.rms_norm(x, normalized_shape=self.norm_shape,\
+                                weight=self.weight, eps=self.eps)
+            return norm_x
+        else:
+            if self.is_smooth_scale == False:
+                fake_smooth_scale = torch.ones(self.emb_dim,\
+                                    dtype=torch.float32, device=x.device)
+                Y_int8, scale_Y = gemm_cutlass.func_rmsnorm_quant(x, self.weight,\
+                                        fake_smooth_scale, self.eps)
+            else:
+                Y_int8, scale_Y = gemm_cutlass.func_rmsnorm_quant(x, self.weight,\
+                                        self.smooth_scale, self.eps)
+            return Y_int8, scale_Y
+    
+    def finish_calibration(self):
+        self.is_quantized = True
+        
+    def enable_smooth_scale(self, smooth_scale):
+        self.is_smooth_scale = True
+        self.smooth_scale.data.copy_(smooth_scale)
+        
+        
 class Custom_RoPE(nn.Module):
     def __init__(self, num_heads, max_seq_len=MAX_SEQ_LEN, head_dim=None):
         super(Custom_RoPE, self).__init__()
@@ -180,7 +227,8 @@ class Custom_RoPE(nn.Module):
         self.max_seq_len = max_seq_len
         self.head_dim = head_dim
         
-        self.out_observer = MinMaxObserverPerLastDim(self.num_heads, self.max_seq_len)
+        self.out_observer = MinMaxObserverPerLastDim(self.num_heads,\
+                                    self.max_seq_len)
         self.register_buffer('scale_out',\
                     torch.ones(self.num_heads, self.max_seq_len)) 
         self.is_quantized = False
@@ -292,7 +340,7 @@ class Custom_Matmul(nn.Module):
         
 
 class MinMaxObserverPerLastDim(nn.Module): 
-    def __init__(self, max_batch=1, max_seq_len=1024): 
+    def __init__(self, max_batch=1, max_seq_len=MAX_SEQ_LEN): 
         super().__init__() 
         self.max_batch = max_batch 
         self.max_seq_len = max_seq_len 
@@ -378,7 +426,7 @@ def compute_smooth_alpha(input_observer, weight, lambd=0.5):
     """
 
     # Activation stats
-    max_a = input_observer.get_amax().to(torch.float32)  # <-- important
+    max_a = input_observer.get_amax().to(torch.float32)  
     max_a = torch.clamp(max_a, min=1e-6)
 
     # Weight stats
@@ -388,7 +436,9 @@ def compute_smooth_alpha(input_observer, weight, lambd=0.5):
     # Compute alpha
     alpha = torch.pow(max_a, lambd) / torch.pow(max_w, (1.0 - lambd))
     alpha = torch.clamp(alpha, min=0.01, max=100.0)
-    return alpha  
+    
+    return alpha
+
 
 class Custom_Linear_PerRow(nn.Module):
     def __init__(self, in_features, out_features, max_seq_len=MAX_SEQ_LEN):
@@ -396,16 +446,19 @@ class Custom_Linear_PerRow(nn.Module):
         
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         nn.init.kaiming_normal_(self.weight, mode='fan_in', nonlinearity='relu')
+        self.in_features = in_features
+        self.out_features = out_features
         
         # Weight quantization
         self.register_buffer(
             "weight_q",
             torch.empty(out_features, in_features, dtype=torch.int8)
         )
-        self.register_buffer('scale_w', torch.ones(out_features))
+        self.register_buffer('scale_w', torch.ones(out_features,\
+                            dtype=torch.float32))
         
-        # Smooth quantization
-        self.register_buffer('smooth_alpha', torch.ones(in_features)) 
+        self.smooth_alpha = torch.ones(in_features, dtype=torch.float32)
+        
         self.in_observer = PerChannelAbsMaxObserver(in_features)
         
         self.out_observer = MinMaxObserverPerLastDim(max_seq_len=max_seq_len)
@@ -425,14 +478,8 @@ class Custom_Linear_PerRow(nn.Module):
             seq_len = x.shape[0]
             scale_y_value = self.scale_y[:seq_len].to(torch.float32)
             
-            out_dim = self.weight_q.shape[0]
-            
             row_scale = scale_x / scale_y_value  
-            col_scale = self.scale_w.expand(out_dim)
-            
-            # out_q = gemm_cutlass.func_int8_matmul_out_int8_three_scale(
-            #         x, self.weight_q, 
-            #         scale_x, self.scale_w, scale_y_value)
+            col_scale = self.scale_w.expand(self.out_features)
             
             out_q = gemm_cutlass.func_w8a8o8_matmul(x, self.weight_q,\
                 row_scale, col_scale)
@@ -443,7 +490,7 @@ class Custom_Linear_PerRow(nn.Module):
         if alpha is None:
             alpha = compute_smooth_alpha(self.in_observer, self.weight)
 
-        self.smooth_alpha.copy_(alpha)  
+        self.smooth_alpha = alpha
         w_smooth = self.weight * alpha.unsqueeze(0) 
             
         # Quantize the smoothed weight
@@ -461,8 +508,8 @@ class Custom_Silu(nn.Module):
 
         self.is_quantized = False
         self.is_smooth_scale = False
-        self.register_buffer("smooth_scale", 
-                             torch.ones(emb_dim, dtype=torch.float32))
+        
+        self.smooth_alpha = torch.ones(emb_dim, dtype=torch.float32)
 
     def forward(self, x1, scale_x1, x2, scale_x2):
         if not self.is_quantized:
@@ -473,23 +520,22 @@ class Custom_Silu(nn.Module):
             assert x1.dtype == torch.int8 and x2.dtype == torch.int8,\
                 "Expected int8 inputs in quantized mode"
 
-            # smooth_scale = self.smooth_scale.to(torch.float32)
-            smooth_scale = self.smooth_scale
+            # smooth_alpha_value = self.smooth_alpha.to(torch.float32)
             x_int8, x_scale = gemm_cutlass.func_silu_mul_int8(\
                 x1, scale_x1,\
-                x2, scale_x2, smooth_scale)
+                x2, scale_x2, self.smooth_alpha)
             
             return x_int8, x_scale
 
     def finish_calibration(self):
         self.is_quantized = True
 
-    def enable_smooth_scale(self, smooth_scale):
-        assert smooth_scale.shape == (self.emb_dim,)
+    def enable_smooth_scale(self, smooth_alpha_value):
+        assert smooth_alpha_value.shape == (self.emb_dim,)
         self.is_smooth_scale = True
-        with torch.no_grad():
-            smooth_value = smooth_scale.to(torch.float32)
-            self.smooth_scale.copy_(smooth_value)
+        
+        smooth_alpha_value = smooth_alpha_value.to(torch.float32)
+        self.smooth_alpha = smooth_alpha_value
         
         
 class Custom_FeedForward(nn.Module):

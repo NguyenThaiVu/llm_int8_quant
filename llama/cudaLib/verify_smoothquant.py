@@ -72,7 +72,7 @@ class Custom_Linear_PerRow(nn.Module):
 
 if __name__ == "__main__":
     
-    seq_len = 1024
+    seq_len = 2048
     emb_dim = 4096
     dtype = torch.bfloat16
     
@@ -83,9 +83,15 @@ if __name__ == "__main__":
     Y, _ = linear_layer(X, 1.0)
     print(f"Output before quantization: {Y.shape}")
     
+    torch_time = measure_time(linear_layer, X, 1.0)
+    print(f"Pytorch BF16 time: {torch_time:.2f} ms")
+    
     linear_layer.finish_calibration()
     X_int8, scale_x = quantize_row_int8_symmetric_nd(X)
     Y_q, scale_y = linear_layer(X_int8, scale_x)
+    
+    int8_smooth_time = measure_time(linear_layer, X_int8, scale_x)
+    print(f"Int8 SmoothQuant time: {int8_smooth_time:.2f} ms")
     
     print(f"Output after quantization: {Y_q.shape}, dtype: {Y_q.dtype}")
     Y_deq = Y_q.float() * scale_y.unsqueeze(1)
@@ -95,5 +101,7 @@ if __name__ == "__main__":
     print(f"Max absolute difference: {max_diff.item()}")
     mse = ((Y - Y_deq) ** 2).mean()
     print(f"Mean Squared Error: {mse.item()}")
+    
+    
     
     
