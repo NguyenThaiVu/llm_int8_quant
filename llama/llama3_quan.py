@@ -32,7 +32,6 @@ elif os.path.exists(MODEL_HUD_FOLDER_2):
     MODEL_HUB = MODEL_HUD_FOLDER_2
 else:
     raise ValueError("Model hub folder not found. Please check the paths.")
-
 LOCAL_DIR = os.path.join(MODEL_HUB, MODEL_FOLDER)
 
 
@@ -73,9 +72,9 @@ class Custom_GroupedQueryAttention(nn.Module):
         self.is_quantized = False
 
     def forward(self, x, scale_x, mask, cos, sin):
-        b, num_tokens, _ = x.shape
+        num_tokens, _ = x.shape
         
-        x = x.squeeze(0)  # Remove batch dimension for linear layers
+        # x = x.squeeze(0)  # Remove batch dimension for linear layers
 
         if self.is_quantized == False:  
             queries, _ = self.W_query(x, 1.0)
@@ -112,7 +111,8 @@ class Custom_GroupedQueryAttention(nn.Module):
         else: 
             # === Quantized computation ===
             x_int8 = x
-            x_scale = scale_x.squeeze(0)
+            # x_scale = scale_x.squeeze(0)
+            x_scale = scale_x
             
             queries_int8, queries_scale = self.W_query(x_int8, x_scale)
             keys_int8, keys_scale = self.W_key(x_int8, x_scale)
@@ -162,7 +162,7 @@ class Custom_GroupedQueryAttention(nn.Module):
             
             out, _ = self.out_proj(context, 1.0)  # Output projection in float for better accuracy
         
-        out = out.unsqueeze(0) # Add batch dimension back
+        # out = out.unsqueeze(0) # Add batch dimension back
         out = out.to(torch.bfloat16)
         
         return out
@@ -217,24 +217,24 @@ class TransformerBlock(nn.Module):
         
         if self.is_quantized == False:
             original_dtype = x.dtype
-            x = x.squeeze(0)  # Remove batch dimension
+            # x = x.squeeze(0)  # Remove batch dimension
             
             x = self.norm2(x)
             
             x, _ = self.ff(x, 1.0)
             
-            x = x.unsqueeze(0) # Add batch dimension back
+            # x = x.unsqueeze(0) # Add batch dimension back
             x = x.to(original_dtype)
         
         else:
             original_dtype = x.dtype
-            x = x.squeeze(0)  # Remove batch dimension
+            # x = x.squeeze(0)  # Remove batch dimension
             
             x, scale_x = self.norm2(x)
             
             x, _ = self.ff(x, scale_x)
             
-            x = x.unsqueeze(0) # Add batch dimension back
+            # x = x.unsqueeze(0) # Add batch dimension back
             x = x.to(original_dtype)    
         
         x = x + shortcut  
@@ -282,8 +282,9 @@ class Llama3Model(nn.Module):
         tok_embeds = self.tok_emb(in_idx)
         x = tok_embeds
 
-        num_tokens = x.shape[1]
-        mask = torch.triu(torch.ones(num_tokens, num_tokens, device=x.device, dtype=torch.bool), diagonal=1)
+        num_tokens = x.shape[0]
+        mask = torch.triu(torch.ones(num_tokens, num_tokens,\
+                        device=x.device, dtype=torch.bool), diagonal=1)
         
         for block in self.trf_blocks:
             x = block(x, mask, self.cos, self.sin)
@@ -351,8 +352,8 @@ if __name__ == "__main__":
     # ===============================================
     # 4. Generate Text
     # ===============================================
-    MAX_GENERATED_TOKENS = 1024
-    PPL_CONTEXT_TOKENS = 1024
+    MAX_GENERATED_TOKENS = 512
+    PPL_CONTEXT_TOKENS = 512
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
     EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
@@ -384,16 +385,16 @@ if __name__ == "__main__":
     # 5. Quantization
     # ===============================================
 
-    print("\nCollecting calibration data for quantization...")
+    print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=10_000)
+                                                    split="train", n=1_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
-    print(f"[INFO] Load training calibration with {len(calibrate_tokens)} tokens.")
+    print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             
     for i in range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE):
         chunk_tokens = calibrate_tokens[i:i + PPL_CONTEXT_TOKENS]
 
-        input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device).unsqueeze(0)
+        input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
 
         with torch.no_grad():
             _ = model(input_ids)

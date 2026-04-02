@@ -54,9 +54,9 @@ torch::Tensor func_softmax_lastdim_int8(
 }
 
 torch::Tensor func_softmax_lastdim_int8_masking(
-    torch::Tensor x_q,          // int8
-    torch::Tensor scale_x,      // float32, length dim0*dim1
-    torch::Tensor scale_y,      // float32, length dim0*dim1
+    torch::Tensor x_q,          // int8, shape (dim0, dim1, dim2)
+    torch::Tensor scale_x,      // float32, shape (dim0, dim1) 
+    torch::Tensor scale_y,      // float32, shape (dim0, dim1)
     torch::Tensor mask      // bool, shape (dim0, dim1, dim2)   
 ) {
   const at::cuda::OptionalCUDAGuard device_guard(x_q.device());

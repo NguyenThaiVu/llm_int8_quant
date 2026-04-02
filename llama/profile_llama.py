@@ -96,8 +96,8 @@ del combined_weights  # free up memory
 # 4. Generate Text
 # ===============================================
 
-MAX_GENERATED_TOKENS = 2048
-PPL_CONTEXT_TOKENS = 2048
+MAX_GENERATED_TOKENS = 1000
+PPL_CONTEXT_TOKENS = 1000
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
@@ -111,14 +111,13 @@ samples = tokenizer.encode(samples)
 
 chunk_tokens = samples[0: PPL_CONTEXT_TOKENS]
 
-input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device).unsqueeze(0)
+input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
 print(f"[INFO] Input tokens: {input_ids.shape}")
 
 with torch.no_grad():
     out_ids = model(input_ids)
 print(f"[INFO] Output tokens: {out_ids.shape}")
     
-# Profile the model computation using torch.profiler
 with torch.profiler.profile(
     activities=[
         torch.profiler.ProfilerActivity.CPU,

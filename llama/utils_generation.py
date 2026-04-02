@@ -3,14 +3,21 @@ import re
 import torch
 
 
-def text_to_token_ids(text, tokenizer):
+def text_to_token_ids(text, tokenizer, batch_dim=False):
     encoded = tokenizer.encode(text)
-    encoded_tensor = torch.tensor(encoded).unsqueeze(0)  # add batch dimension
+    if batch_dim:
+        # add batch dimension
+        encoded_tensor = torch.tensor(encoded).unsqueeze(0)  
+    else:
+        encoded_tensor = torch.tensor(encoded)
     return encoded_tensor
 
 
-def token_ids_to_text(token_ids, tokenizer):
-    flat = token_ids.squeeze(0)  # remove batch dimension
+def token_ids_to_text(token_ids, tokenizer, batch_dim=False):
+    if batch_dim:
+        flat = token_ids.squeeze(0)  # remove batch dimension
+    else:
+        flat = token_ids
     return tokenizer.decode(flat.tolist())
 
 
@@ -18,18 +25,17 @@ def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=No
 
     # For-loop is the same as before: Get logits, and only focus on last time step
     for _ in range(max_new_tokens):
-        idx_cond = idx[:, -context_size:]
+        idx_cond = idx[-context_size:]
         with torch.no_grad():
             logits = model(idx_cond)
-        logits = logits[:, -1, :]
+        logits = logits[-1, :]
 
-        idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch_size, 1)
+        idx_next = torch.argmax(logits, dim=-1, keepdim=True)  
 
         if idx_next == eos_id:  # Stop generating early if end-of-sequence token is encountered and eos_id is specified
             break
 
-        # Same as before: append sampled index to the running sequence
-        idx = torch.cat((idx, idx_next), dim=1)  # (batch_size, num_tokens+1)
+        idx = torch.cat((idx, idx_next), dim=0)  # (num_tokens+1)
 
     return idx
 

@@ -67,8 +67,8 @@ def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, freq_c
 
 
 def apply_rope(x, cos, sin):
-    # x: (batch_size, num_heads, seq_len, head_dim)
-    batch_size, num_heads, seq_len, head_dim = x.shape
+    # x: (num_heads, seq_len, head_dim)
+    num_heads, seq_len, head_dim = x.shape
     assert head_dim % 2 == 0, "Head dimension must be even"
 
     # Split x into first half and second half
@@ -76,10 +76,10 @@ def apply_rope(x, cos, sin):
     x2 = x[..., head_dim // 2 :]  # Second half
 
     # Adjust sin and cos shapes
-    cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, seq_len, head_dim)
-    sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(0)
+    cos = cos[:seq_len, :].unsqueeze(0)  # Shape: (1, seq_len, head_dim)
+    sin = sin[:seq_len, :].unsqueeze(0)
 
-    # Apply the rotary transformation
+    # Apply the rotary transformation    
     rotated = torch.cat((-x2, x1), dim=-1)
     x_rotated = (x * cos) + (rotated * sin)
 
@@ -110,59 +110,47 @@ class GroupedQueryAttention(nn.Module):
         self.out_proj = nn.Linear(d_out, d_out, bias=False, dtype=dtype)
 
     def forward(self, x, mask, cos, sin):
-        b, num_tokens, d_in = x.shape
+        # b, num_tokens, d_in = x.shape
+        num_tokens, d_in = x.shape
 
-        queries = self.W_query(x)  # Shape: (b, num_tokens, d_out)
-        keys = self.W_key(x)  # Shape: (b, num_tokens, num_kv_groups * head_dim)
-        values = self.W_value(x)  # Shape: (b, num_tokens, num_kv_groups * head_dim)
+        queries = self.W_query(x)  
+        keys = self.W_key(x)  
+        values = self.W_value(x) 
 
         # Reshape queries, keys, and values
-        queries = queries.view(b, num_tokens, self.num_heads, self.head_dim)
-        keys = keys.view(b, num_tokens, self.num_kv_groups, self.head_dim)
-        values = values.view(b, num_tokens, self.num_kv_groups, self.head_dim)
+        queries = queries.view(num_tokens, self.num_heads, self.head_dim)
+        keys = keys.view(num_tokens, self.num_kv_groups, self.head_dim)
+        values = values.view(num_tokens, self.num_kv_groups, self.head_dim)
 
         # Transpose keys, values, and queries
-        keys = keys.transpose(1, 2)  # Shape: (b, num_kv_groups, num_tokens, head_dim)
-        values = values.transpose(1, 2)  # Shape: (b, num_kv_groups, num_tokens, head_dim)
-        queries = queries.transpose(1, 2)  # Shape: (b, num_heads, num_tokens, head_dim)
+        keys = keys.transpose(0, 1)  # Shape: (num_kv_groups, num_tokens, head_dim)
+        values = values.transpose(0, 1)  # Shape: (num_kv_groups, num_tokens, head_dim)
+        queries = queries.transpose(0, 1)  # Shape: (num_heads, num_tokens, head_dim)
 
         # Apply RoPE
         keys = apply_rope(keys, cos, sin)
         queries = apply_rope(queries, cos, sin)
 
         # Expand keys and values to match the number of heads
-        # Shape: (b, num_heads, num_tokens, head_dim)
-        keys = keys.repeat_interleave(self.group_size, dim=1)  # Shape: (b, num_heads, num_tokens, head_dim)
-        values = values.repeat_interleave(self.group_size, dim=1)  # Shape: (b, num_heads, num_tokens, head_dim)
+        # Shape: (num_heads, num_tokens, head_dim)
+        keys = keys.repeat_interleave(self.group_size, dim=0)  
+        values = values.repeat_interleave(self.group_size, dim=0)
 
         # Compute attention scores
-        attn_scores = queries @ keys.transpose(2, 3)  # Dot product for each head
+        attn_scores = queries @ keys.transpose(1, 2)
         attn_scores = attn_scores.masked_fill(mask, -torch.inf)
 
         attn_weights = torch.softmax(attn_scores / keys.shape[-1]**0.5, dim=-1)
         assert keys.shape[-1] == self.head_dim
 
-        # Shape: (b, num_tokens, num_heads, head_dim)
-        context_vec = (attn_weights @ values).transpose(1, 2)
+        # Shape: (num_tokens, num_heads, head_dim)
+        context_vec = (attn_weights @ values).transpose(0, 1).contiguous()
 
         # Combine heads, where self.d_out = self.num_heads * self.head_dim
-        context_vec = context_vec.reshape(b, num_tokens, self.d_out)
+        context_vec = context_vec.reshape(num_tokens, self.d_out)
         context_vec = self.out_proj(context_vec)  # optional projection
 
         return context_vec
-    
-
-class Custom_RMSNorm(nn.Module):
-    def __init__(self, emb_dim, eps=1e-6, dtype=torch.bfloat16):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(emb_dim, dtype=dtype))
-
-    def forward(self, x):
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        norm_x = x * torch.rsqrt(variance + self.eps)
-        norm_x = norm_x * self.weight
-        return norm_x
     
     
 class TransformerBlock(nn.Module):
@@ -176,11 +164,8 @@ class TransformerBlock(nn.Module):
             dtype=cfg["dtype"]
         )
         self.ff = FeedForward(cfg)
-        # self.norm1 = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
-        # self.norm2 = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
-        
-        self.norm1 = Custom_RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
-        self.norm2 = Custom_RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
+        self.norm1 = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
+        self.norm2 = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
 
     def forward(self, x, mask, cos, sin):
         # Shortcut connection for attention block
@@ -226,7 +211,7 @@ class Llama3Model(nn.Module):
         tok_embeds = self.tok_emb(in_idx)
         x = tok_embeds
 
-        num_tokens = x.shape[1]
+        num_tokens = x.shape[0]
         mask = torch.triu(torch.ones(num_tokens, num_tokens, device=x.device, dtype=torch.bool), diagonal=1)
         
         for block in self.trf_blocks:

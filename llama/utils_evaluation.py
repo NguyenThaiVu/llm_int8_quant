@@ -21,9 +21,9 @@ def compute_ppl(model, tokenizer, texts, context_size, device="cuda"):
 
         for t in range(1, L):            
             start = max(0, t - context_size)
-            inp = ids_t[start:t].unsqueeze(0)   # [1, w]
-            logits = model(inp)                 # [1, w, V]
-            last_logits = logits[:, -1, :]    # [1, V]
+            inp = ids_t[start:t]
+            logits = model(inp)            
+            last_logits = logits[-1, :]    
             target = ids_t[t].view(1)
 
             loss = F.cross_entropy(last_logits, target, reduction="sum")
@@ -96,13 +96,13 @@ def compute_ppl_single_text(model, tokenizer, text, context_size, device="cuda",
         target_end = min(end_idx + stride, seq_len)
 
         input_start = max(0, target_end - context_size - 1)
-        input_ids = ids[input_start:target_end - 1].unsqueeze(0)   # [1, T]
-        target_ids = ids[input_start + 1:target_end].unsqueeze(0)  # [1, T]
+        input_ids = ids[input_start:target_end - 1]
+        target_ids = ids[input_start + 1:target_end]
 
         # Only score the last `trg_len` positions in this window
         trg_len = target_end - end_idx
         mask = torch.full_like(target_ids, -100)
-        mask[:, -trg_len:] = target_ids[:, -trg_len:]
+        mask[-trg_len:] = target_ids[-trg_len:]
 
         outputs = model(input_ids)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs

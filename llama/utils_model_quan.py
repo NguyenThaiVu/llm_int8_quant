@@ -6,7 +6,7 @@ import gemm_cutlass
 
 from utils_quant import quantize_row_int8_symmetric_nd, quantize_tensor
 
-MAX_SEQ_LEN = 1040 # 576 or 1040 or 2112
+MAX_SEQ_LEN = 576 # 576 or 1040 or 2112
 
 class Custom_Linear(nn.Module):
     """
@@ -36,6 +36,8 @@ class Custom_Linear(nn.Module):
                  max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16):
         super(Custom_Linear, self).__init__()
         
+        self.in_features = in_features
+        self.out_features = out_features
         self.weight = nn.Parameter(torch.empty(out_features, in_features, 
                                                dtype=dtype))
         nn.init.kaiming_normal_(self.weight, mode='fan_in', nonlinearity='relu')
@@ -46,14 +48,14 @@ class Custom_Linear(nn.Module):
             persistent=False,
         )
         
-        self.register_buffer('scale_w', torch.tensor(1.0))
-        self.register_buffer('scale_y', torch.ones(out_features))
+        self.scale_w = torch.ones((1), dtype=torch.float32)
+        self.scale_y = torch.ones((out_features), dtype=torch.float32)  
 
         self.out_observer = MinMaxObserverPerLastDim(max_seq_len=max_seq_len)
         self.is_quantized = False
         
     def forward(self, x, scale_x):
-        if not self.is_quantized:  # Calibration mode 
+        if not self.is_quantized:  
             out = torch.matmul(x, self.weight.t())  
             self.out_observer(out)
             return out, 1.0
@@ -62,11 +64,10 @@ class Custom_Linear(nn.Module):
                 "Expected int8 input in quantization"
             
             seq_len = x.shape[0]
-            out_dim = self.weight_q.shape[0]
             scale_y_value = self.scale_y[:seq_len]
             
             row_scale = scale_x / scale_y_value  
-            col_scale = self.scale_w.expand(out_dim)
+            col_scale = self.scale_w.expand(self.out_features)
             
             out_q = gemm_cutlass.func_w8a8o8_matmul(x, self.weight_q,\
                 row_scale, col_scale)
@@ -74,7 +75,10 @@ class Custom_Linear(nn.Module):
             return out_q, scale_y_value
         
     def finish_calibration(self):
-        self.weight_q, self.scale_w = quantize_tensor(self.weight)
+        weight_q, scale_w = quantize_tensor(self.weight)
+        self.weight_q = weight_q
+        self.scale_w = scale_w
+        
         self.scale_y = self.out_observer.get_scale().to(self.scale_w.device)
         
         self.is_quantized = True  
@@ -88,7 +92,8 @@ class Custom_Softmax(nn.Module):
         self.num_heads = num_heads
         self.max_seq_len = max_seq_len
         self.out_observer = MinMaxObserverPerLastDim(self.num_heads, self.max_seq_len)
-        self.register_buffer('scale_out', torch.ones(self.num_heads, self.max_seq_len))
+        self.scale_out = torch.ones((self.num_heads, self.max_seq_len),\
+                                dtype=torch.float32, device='cuda')
         
         self.is_quantized = False
         
@@ -103,14 +108,23 @@ class Custom_Softmax(nn.Module):
             return out, 1.0
         else:          
             seq_len = x_q.shape[-1]
-            mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.uint8, device=x_q.device))
+            mask = torch.tril(torch.ones((seq_len, seq_len),\
+                            dtype=torch.uint8, device=x_q.device))
             
-            scale_x_value = scale_x[:, :seq_len].to(torch.float32)
-            scale_out_value = self.scale_out[:, :seq_len].to(torch.float32)
+            scale_x_value = scale_x[:, :seq_len]
+            # scale_x_value = scale_x[:, :seq_len].to(torch.float32)
+            
+            scale_out_value = self.scale_out[:, :seq_len]
+            # scale_out_value = self.scale_out[:, :seq_len].to(torch.float32)
 
+            # out_q = gemm_cutlass.func_softmax_lastdim_int8_masking(
+            #     x_q, scale_x_value.view(-1),
+            #     scale_out_value.view(-1), mask
+            # )
+            
             out_q = gemm_cutlass.func_softmax_lastdim_int8_masking(
-                x_q, scale_x_value.view(-1),
-                scale_out_value.view(-1), mask
+                x_q, scale_x_value,
+                scale_out_value, mask
             )
             
             return out_q, scale_out_value
@@ -123,7 +137,7 @@ class Custom_Softmax(nn.Module):
 class Custom_RMSNorm(nn.Module):
     def __init__(self, num_heads=1, max_seq_len=MAX_SEQ_LEN, dim=None, eps=1e-6):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim)) # learnable weight of RMSNorm
+        self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
         self.dim = dim
         self.num_heads = num_heads
@@ -131,10 +145,14 @@ class Custom_RMSNorm(nn.Module):
         
         if self.num_heads == 1 or self.num_heads == None:
             self.out_observer = MinMaxObserverPerLastDim(max_seq_len=max_seq_len)
-            self.register_buffer('scale_out', torch.ones(max_seq_len))
+            # self.register_buffer('scale_out', torch.ones(max_seq_len))
+            self.scale_out = torch.ones((max_seq_len),\
+                            dtype=torch.float32, device='cuda')
         elif self.num_heads > 1:
             self.out_observer = MinMaxObserverPerLastDim(self.num_heads, max_seq_len=self.max_seq_len)
-            self.register_buffer('scale_out', torch.ones(self.num_heads, self.max_seq_len))
+            # self.register_buffer('scale_out', torch.ones(self.num_heads, self.max_seq_len))
+            self.scale_out = torch.ones((self.num_heads, self.max_seq_len),\
+                            dtype=torch.float32, device='cuda')
         else:
             raise ValueError("num_heads must be >= 1")
         
@@ -148,8 +166,8 @@ class Custom_RMSNorm(nn.Module):
                     "Expected floating point input in calibration mode"
                     
             mean_square = x.pow(2).mean(-1, keepdim=True)  
-            inv_rms = torch.rsqrt(mean_square + self.eps)   # [seq_len, 1]
-            out = x * inv_rms * self.weight  # [seq_len, head_dim]
+            inv_rms = torch.rsqrt(mean_square + self.eps)
+            out = x * inv_rms * self.weight  
             self.out_observer(out)
             return out, 1.0
         else:
@@ -157,12 +175,20 @@ class Custom_RMSNorm(nn.Module):
             
             if x.dim() == 2:
                 seq_len = x.shape[0]
-                scale_x_value = scale_x[:seq_len].to(torch.float32)
-                scale_out_value = self.scale_out[:seq_len].to(torch.float32)
+                scale_x_value = scale_x[:seq_len]
+                # scale_x_value = scale_x[:seq_len].to(torch.float32)
+                
+                scale_out_value = self.scale_out[:seq_len]
+                # scale_out_value = self.scale_out[:seq_len].to(torch.float32)
+            
             elif x.dim() == 3:
                 seq_len = x.shape[1]
-                scale_x_value = scale_x[:, :seq_len].to(torch.float32)
-                scale_out_value = self.scale_out[:, :seq_len].to(torch.float32)
+            
+                scale_x_value = scale_x[:, :seq_len]
+                # scale_x_value = scale_x[:, :seq_len].to(torch.float32)
+            
+                scale_out_value = self.scale_out[:, :seq_len]
+                # scale_out_value = self.scale_out[:, :seq_len].to(torch.float32)
         
             y_q = gemm_cutlass.func_rmsnorm_int8(
                 x, scale_x_value, self.weight, scale_out_value, self.eps
@@ -229,8 +255,10 @@ class Custom_RoPE(nn.Module):
         
         self.out_observer = MinMaxObserverPerLastDim(self.num_heads,\
                                     self.max_seq_len)
-        self.register_buffer('scale_out',\
-                    torch.ones(self.num_heads, self.max_seq_len)) 
+        # self.register_buffer('scale_out',\
+        #             torch.ones(self.num_heads, self.max_seq_len)) 
+        self.scale_out = torch.ones((self.num_heads, self.max_seq_len),\
+                            dtype=torch.float32, device='cuda')
         self.is_quantized = False
         
     def forward(self, x, scale_x, 
@@ -263,8 +291,12 @@ class Custom_RoPE(nn.Module):
         else:
             assert x.dtype == torch.int8, "Expected int8 input in quantized mode"
             seq_len = x.shape[1]
-            scale_x_value = scale_x[:, :seq_len].to(torch.float32)
-            scale_out_value = self.scale_out[:, :seq_len].to(torch.float32)
+            
+            scale_x_value = scale_x[:, :seq_len]
+            # scale_x_value = scale_x[:, :seq_len].to(torch.float32)
+            
+            scale_out_value = self.scale_out[:, :seq_len]
+            # scale_out_value = self.scale_out[:, :seq_len].to(torch.float32)
             
             cos = cos[:seq_len, :]
             sin = sin[:seq_len, :]
@@ -378,23 +410,32 @@ class MinMaxObserverPerLastDim(nn.Module):
     
     def get_scale(self, B=None, T=None): 
         qmax = 127.0
-        if T == None: 
+
+        if T is None: 
             T = self.max_seq_len 
-        
+
         # if input 2D, return (T,) scale; 
-        if self.max_batch == None or self.max_batch == 1: 
-            max_abs = torch.maximum(\
-                self.max_val[0, :T].abs(),\
-                self.min_val[0, :T].abs()\
-            ) 
-            return (max_abs / qmax).clamp(min=1e-8) # (T,) 
-        
-        # if input 3D, return (B,T) scale; 
-        max_abs = torch.maximum(\
-                self.max_val[:B, :T].abs(),\
-                self.min_val[:B, :T].abs()\
-        ) 
-        return (max_abs / qmax).clamp(min=1e-8) # (B, T)
+        if self.max_batch is None or self.max_batch == 1: 
+            max_val = self.max_val[0, :T].to(torch.float32)
+            min_val = self.min_val[0, :T].to(torch.float32)
+            max_abs = torch.maximum(
+                max_val.abs(),
+                min_val.abs()
+            )
+
+            scale = (max_abs / qmax).clamp(min=1e-8)
+            return scale
+
+        # if input 3D, return (B, T) scale; 
+        max_val = self.max_val[:B, :T].to(torch.float32)
+        min_val = self.min_val[:B, :T].to(torch.float32)
+        max_abs = torch.maximum(
+            max_val.abs(),
+            min_val.abs()
+        )
+
+        scale = (max_abs / qmax).clamp(min=1e-8)
+        return scale
     
 
 class PerChannelAbsMaxObserver(nn.Module):
@@ -520,7 +561,6 @@ class Custom_Silu(nn.Module):
             assert x1.dtype == torch.int8 and x2.dtype == torch.int8,\
                 "Expected int8 inputs in quantized mode"
 
-            # smooth_alpha_value = self.smooth_alpha.to(torch.float32)
             x_int8, x_scale = gemm_cutlass.func_silu_mul_int8(\
                 x1, scale_x1,\
                 x2, scale_x2, self.smooth_alpha)

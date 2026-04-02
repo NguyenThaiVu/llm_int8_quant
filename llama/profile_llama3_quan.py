@@ -40,6 +40,10 @@ LOCAL_DIR = os.path.join(MODEL_HUB, MODEL_FOLDER)
 # 1. Define Model Architecture
 # ===============================================
 
+# ===============================================
+# 1. Define Model Architecture
+# ===============================================
+
 class Custom_GroupedQueryAttention(nn.Module):
     def __init__(
         self, d_in, num_heads, num_kv_groups, head_dim=None, dtype=None
@@ -73,9 +77,9 @@ class Custom_GroupedQueryAttention(nn.Module):
         self.is_quantized = False
 
     def forward(self, x, scale_x, mask, cos, sin):
-        b, num_tokens, _ = x.shape
+        num_tokens, _ = x.shape
         
-        x = x.squeeze(0)  # Remove batch dimension for linear layers
+        # x = x.squeeze(0)  # Remove batch dimension for linear layers
 
         if self.is_quantized == False:  
             queries, _ = self.W_query(x, 1.0)
@@ -112,7 +116,8 @@ class Custom_GroupedQueryAttention(nn.Module):
         else: 
             # === Quantized computation ===
             x_int8 = x
-            x_scale = scale_x.squeeze(0)
+            # x_scale = scale_x.squeeze(0)
+            x_scale = scale_x
             
             queries_int8, queries_scale = self.W_query(x_int8, x_scale)
             keys_int8, keys_scale = self.W_key(x_int8, x_scale)
@@ -162,7 +167,7 @@ class Custom_GroupedQueryAttention(nn.Module):
             
             out, _ = self.out_proj(context, 1.0)  # Output projection in float for better accuracy
         
-        out = out.unsqueeze(0) # Add batch dimension back
+        # out = out.unsqueeze(0) # Add batch dimension back
         out = out.to(torch.bfloat16)
         
         return out
@@ -178,51 +183,7 @@ class Custom_GroupedQueryAttention(nn.Module):
         self.context_layer.finish_calibration()
         # self.out_proj.finish_calibration()
         self.is_quantized = True
-    
 
-class RMSNorm_Fuse_Quant(nn.Module):
-    """
-    This module fuse RMSNorm and quantization into a single kernel. 
-    - Input:
-        x: (seq_len, emb_dim) in bf16
-    - Output:
-        y: (seq_len, emb_dim) in bf16
-    OR 
-        Y_int8: (seq_len, emb_dim) in int8
-        scale_Y: (seq_len,) in float32
-    """
-    def __init__(self, emb_dim, eps=1e-6, dtype=torch.bfloat16):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(emb_dim, dtype=dtype))
-        self.norm_shape = (emb_dim,)
-        self.emb_dim = emb_dim
-        
-        self.is_quantized = False
-        self.is_smooth_scale = False
-        self.smooth_scale = nn.Parameter(torch.ones(emb_dim, dtype=torch.float32))
-
-    def forward(self, x):
-        if self.is_quantized == False:
-            norm_x = F.rms_norm(x, normalized_shape=self.norm_shape, weight=self.weight, eps=self.eps)
-            return norm_x
-        else:
-            if self.is_smooth_scale == False:
-                fake_smooth_scale = torch.ones(self.emb_dim,\
-                                    dtype=torch.float32, device=x.device)
-                Y_int8, scale_Y = gemm_cutlass.func_rmsnorm_quant(x, self.weight,\
-                                                        fake_smooth_scale, self.eps)
-            else:
-                Y_int8, scale_Y = gemm_cutlass.func_rmsnorm_quant(x, self.weight,\
-                                                        self.smooth_scale, self.eps)
-            return Y_int8, scale_Y
-    
-    def finish_calibration(self):
-        self.is_quantized = True
-        
-    def enable_smooth_scale(self, smooth_scale):
-        self.is_smooth_scale = True
-        self.smooth_scale.data.copy_(smooth_scale)
     
 
 class TransformerBlock(nn.Module):
@@ -261,24 +222,24 @@ class TransformerBlock(nn.Module):
         
         if self.is_quantized == False:
             original_dtype = x.dtype
-            x = x.squeeze(0)  # Remove batch dimension
+            # x = x.squeeze(0)  # Remove batch dimension
             
             x = self.norm2(x)
             
             x, _ = self.ff(x, 1.0)
             
-            x = x.unsqueeze(0) # Add batch dimension back
+            # x = x.unsqueeze(0) # Add batch dimension back
             x = x.to(original_dtype)
         
         else:
             original_dtype = x.dtype
-            x = x.squeeze(0)  # Remove batch dimension
+            # x = x.squeeze(0)  # Remove batch dimension
             
             x, scale_x = self.norm2(x)
             
             x, _ = self.ff(x, scale_x)
             
-            x = x.unsqueeze(0) # Add batch dimension back
+            # x = x.unsqueeze(0) # Add batch dimension back
             x = x.to(original_dtype)    
         
         x = x + shortcut  
@@ -326,7 +287,7 @@ class Llama3Model(nn.Module):
         tok_embeds = self.tok_emb(in_idx)
         x = tok_embeds
 
-        num_tokens = x.shape[1]
+        num_tokens = x.shape[0]
         mask = torch.triu(torch.ones(num_tokens, num_tokens, device=x.device, dtype=torch.bool), diagonal=1)
         
         for block in self.trf_blocks:
@@ -338,7 +299,6 @@ class Llama3Model(nn.Module):
     def finish_calibration(self):
         for block in self.trf_blocks:
             block.finish_calibration()
-            
             
 if __name__ == "__main__":
 
@@ -405,16 +365,17 @@ if __name__ == "__main__":
     # Evaluation Latency
     # ===============================================
     samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,\
-                                        split='train')
+                                        split='train') 
     samples = tokenizer.encode(samples)
 
     chunk_tokens = samples[0: PPL_CONTEXT_TOKENS]
 
-    input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device).unsqueeze(0)
+    input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
     print(f"[INFO] Input tokens: {input_ids.shape}")
 
-    with torch.no_grad():
-        out_ids = model(input_ids)
+    for _ in range(3):  # Warm-up runs
+        with torch.no_grad():
+            out_ids = model(input_ids)
     print(f"[INFO] Output tokens: {out_ids.shape}")
     
     with torch.profiler.profile(
@@ -426,15 +387,13 @@ if __name__ == "__main__":
         profile_memory=True,
         with_stack=True
     ) as prof:
-        with torch.no_grad():
-            out_ids = model(input_ids)
+        for _ in range(10):  # Profile multiple runs for better statistics
+            with torch.no_grad():
+                out_ids = model(input_ids)
 
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
     print()
     
-    
-        
-
     # ===============================================
     # 5. Quantization latency
     # ===============================================
@@ -442,8 +401,9 @@ if __name__ == "__main__":
     model.finish_calibration()
     print(f"\n[INFO] Finished calibration.\n")
 
-    with torch.no_grad():
-        out_ids = model(input_ids)
+    for _ in range(3):  # Warm-up runs
+        with torch.no_grad():
+            out_ids = model(input_ids)
     print(f"[INFO] Output quantization tokens: {out_ids.shape}")
     
     with torch.profiler.profile(
@@ -455,8 +415,9 @@ if __name__ == "__main__":
         profile_memory=True,
         with_stack=True
     ) as prof:
-        with torch.no_grad():
-            out_ids = model(input_ids)
-            
+        for _ in range(10):  # Profile multiple runs for better statistics
+            with torch.no_grad():
+                out_ids = model(input_ids)
+
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
         
