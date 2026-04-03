@@ -352,8 +352,8 @@ if __name__ == "__main__":
     # ===============================================
     # 4. Generate Text
     # ===============================================
-    MAX_GENERATED_TOKENS = 512
-    PPL_CONTEXT_TOKENS = 512
+    MAX_GENERATED_TOKENS = 2000
+    PPL_CONTEXT_TOKENS = 2000
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
     EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
@@ -380,7 +380,6 @@ if __name__ == "__main__":
                                 stride=PPL_STRIDE)
     print("PPL:", ppl)   
         
-
     # ===============================================
     # 5. Quantization
     # ===============================================
