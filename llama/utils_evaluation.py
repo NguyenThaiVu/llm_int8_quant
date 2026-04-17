@@ -51,9 +51,10 @@ def load_wikitext_single_text(dataset_name="wikitext-2", split="validation", n=N
 
     config = f"{dataset_name}-raw-v1"
     dataset = load_dataset("wikitext", config, split=split)
-
+    
     if n is not None:
-        dataset = dataset.select(range(n))
+        if n < len(dataset):
+            dataset = dataset.select(range(n))
 
     text = "\n".join(x["text"] for x in dataset if x["text"].strip() != "")
     return text

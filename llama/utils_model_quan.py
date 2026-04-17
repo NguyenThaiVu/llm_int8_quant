@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import gemm_cutlass
-
 from utils_quant import quantize_row_int8_symmetric_nd, quantize_tensor
 
 MAX_SEQ_LEN = 2112 # 576 or 1040 or 2112
@@ -24,7 +23,7 @@ class Custom_Linear(nn.Module):
         - Behavior: computes quantized matmul with per-row scaling
                     and returns quantized output and its scale
     
-    This layer has: per-row scale for activation and 
+    This layer has: per-row scale for activation
                     per-tensor scale for weight. 
                     The output scale is per-row
                     
@@ -87,112 +86,49 @@ class Custom_Softmax(nn.Module):
         super(Custom_Softmax, self).__init__()
         self.num_heads = num_heads
         self.max_seq_len = max_seq_len
-        self.out_observer = MinMaxObserverPerLastDim(self.num_heads, self.max_seq_len)
-        self.scale_out = torch.ones((self.num_heads, self.max_seq_len),\
-                                dtype=torch.float32, device='cuda')
         
         self.is_quantized = False
         
-    def forward(self, x_q, scale_x):
+    def forward(self, x, scale_x, mask):
         if self.is_quantized == False: 
-            assert x_q.dtype == torch.float32 or \
-                    x_q.dtype == torch.bfloat16 or \
-                    x_q.dtype == torch.float16,\
-                    "Expected floating point input in calibration mode"
-            out = torch.softmax(x_q, dim=-1)
-            self.out_observer(out)
-            return out, 1.0
-        else:          
-            seq_len = x_q.shape[-1]
-            mask = torch.tril(torch.ones((seq_len, seq_len),\
-                            dtype=torch.uint8, device=x_q.device))
-            
-            scale_x_value = scale_x[:, :seq_len]
-            
-            scale_out_value = self.scale_out[:, :seq_len]
-            
-            out_q = gemm_cutlass.func_softmax_lastdim_int8_masking(
-                x_q, scale_x_value,
-                scale_out_value, mask
-            )
-            
-            return out_q, scale_out_value
-    
-    def finish_calibration(self):
-        self.scale_out = self.out_observer.get_scale().to(self.scale_out.device)
-        self.is_quantized = True  
-        
-        
-class Custom_RMSNorm(nn.Module):
-    def __init__(self, num_heads=1, max_seq_len=MAX_SEQ_LEN, dim=None, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-        self.dim = dim
-        self.num_heads = num_heads
-        self.max_seq_len = max_seq_len 
-        
-        if self.num_heads == 1 or self.num_heads == None:
-            self.out_observer = MinMaxObserverPerLastDim(max_seq_len=max_seq_len)
-            self.scale_out = torch.ones((max_seq_len),\
-                            dtype=torch.float32, device='cuda')
-        elif self.num_heads > 1:
-            self.out_observer = MinMaxObserverPerLastDim(self.num_heads, max_seq_len=self.max_seq_len)
-            self.scale_out = torch.ones((self.num_heads, self.max_seq_len),\
-                            dtype=torch.float32, device='cuda')
-        else:
-            raise ValueError("num_heads must be >= 1")
-        
-        self.is_quantized = False
-
-    def forward(self, x, scale_x):
-        if not self.is_quantized:  
             assert x.dtype == torch.float32 or \
                     x.dtype == torch.bfloat16 or \
                     x.dtype == torch.float16,\
                     "Expected floating point input in calibration mode"
-                    
-            mean_square = x.pow(2).mean(-1, keepdim=True)  
-            inv_rms = torch.rsqrt(mean_square + self.eps)
-            out = x * inv_rms * self.weight  
-            self.out_observer(out)
+            out = torch.softmax(x, dim=-1)
             return out, 1.0
-        else:
-            assert x.dtype == torch.int8, "Expect int8 in quantized mode"
+        else:          
+            x_int8 = x
             
-            if x.dim() == 2:
-                seq_len = x.shape[0]
-                scale_x_value = scale_x[:seq_len]
-                
-                scale_out_value = self.scale_out[:seq_len]
-            
-            elif x.dim() == 3:
-                seq_len = x.shape[1]
-            
-                scale_x_value = scale_x[:, :seq_len]
-            
-                scale_out_value = self.scale_out[:, :seq_len]
-        
-            y_q = gemm_cutlass.func_rmsnorm_int8(
-                x, scale_x_value, self.weight, scale_out_value, self.eps
+            out_q, scale_out = gemm_cutlass.func_softmax_lastdim_int8_masking(
+                x_int8, scale_x, mask
             )
-            return y_q, scale_out_value
+            
+            return out_q, scale_out
     
     def finish_calibration(self):
-        self.scale_out = self.out_observer.get_scale().to(self.scale_out.device)
-        self.is_quantized = True
+        self.is_quantized = True  
         
         
 class RMSNorm_Fuse_Quant(nn.Module):
     """
-    This module fuse RMSNorm and quantization into a single kernel. 
+    This module fuse (1) RMSNorm and (2) quantization into single kernel
+    This module has two execution modes:
+    1. Calibration mode:
     - Input:
         x: (seq_len, emb_dim) in bf16
     - Output:
         y: (seq_len, emb_dim) in bf16
-    OR 
-        Y_int8: (seq_len, emb_dim) in int8
-        scale_Y: (seq_len,) in float32
+    
+    2. Quantization mode:
+    - Input: 
+        x: (seq_len, emb_dim) in int8
+    - Output:
+        y: (seq_len, emb_dim) in int8
+        scale_y: (seq_len,) in float32
+        
+    In the quantization mode, we fuse the RMSNorm and quantization into a single int8 kernel, 
+    The quantization account for the outlier by using smooth_scale.
     """
     def __init__(self, emb_dim, eps=1e-6, dtype=torch.bfloat16):
         super().__init__()
@@ -225,6 +161,12 @@ class RMSNorm_Fuse_Quant(nn.Module):
         self.is_quantized = True
         
     def enable_smooth_scale(self, smooth_scale):
+        """
+        This function apply smooth scaling to quantization (for input activations) 
+        Note:
+        - Normal quantization: Y_int8 = Y / scale_Y
+        - Smooth quantization: Y_int8 = (Y / smooth_scale) / scale_Y
+        """
         self.is_smooth_scale = True
         self.smooth_scale.data.copy_(smooth_scale)
         
@@ -236,10 +178,6 @@ class Custom_RoPE(nn.Module):
         self.max_seq_len = max_seq_len
         self.head_dim = head_dim
         
-        self.out_observer = MinMaxObserverPerLastDim(self.num_heads,\
-                                    self.max_seq_len)
-        self.scale_out = torch.ones((self.num_heads, self.max_seq_len),\
-                            dtype=torch.float32, device='cuda')
         self.is_quantized = False
         
     def forward(self, x, scale_x, 
@@ -257,7 +195,7 @@ class Custom_RoPE(nn.Module):
             x2 = x[..., head_dim // 2 :]  # Second half
 
             # 2. Adjust sin and cos shapes
-            cos = cos[:seq_len, :].unsqueeze(0)  # Shape:  1, seq_len, head_dim)
+            cos = cos[:seq_len, :].unsqueeze(0)  # Shape: (1, seq_len, head_dim)
             sin = sin[:seq_len, :].unsqueeze(0)
 
             # 3. Apply the rotary transformation
@@ -267,31 +205,44 @@ class Custom_RoPE(nn.Module):
             # 4. Reshape back to original shape and dtype
             out = x_rotated.to(dtype=origin_dtype)
             out = out.view(origin_shape)  
-            self.out_observer(out)
             return out, 1.0
         else:
             assert x.dtype == torch.int8, "Expected int8 input in quantized mode"
             seq_len = x.shape[1]
             
-            scale_x_value = scale_x[:, :seq_len]
-            
-            scale_out_value = self.scale_out[:, :seq_len]
-            
             cos = cos[:seq_len, :]
             sin = sin[:seq_len, :]
-
-            Y_int8 = gemm_cutlass.func_apply_rope_int8(x, scale_x_value, \
+            
+            Y_int8, scale_out = gemm_cutlass.func_apply_rope_int8(x, scale_x, \
                             cos, scale_cos,
-                            sin, scale_sin,
-                            scale_out_value)
-            return Y_int8, scale_out_value
+                            sin, scale_sin)
+            return Y_int8, scale_out
     
     def finish_calibration(self):
-        self.scale_out = self.out_observer.get_scale().to('cuda')
         self.is_quantized = True
         
 
 class Custom_Matmul(nn.Module):
+    """
+    C = A @ B^T
+    This module perform matmul with two execution modes:
+    1. Calibration mode:
+    - Input:
+        A: (M, K) - bf16
+        B: (N, K) - bf16
+    - Output:
+        C: (M, N) - bf16
+    
+    2. Quantization mode:
+    - Input:
+        A: (M, K)  - int8
+        B: (N, K) - int8
+        scale_A: (M,) - float32
+        scale_B: (N,) - float32
+    - Output:
+        C: (M, N) - int8
+        scale_C: (M,) - float32
+    """
     def __init__(self, num_heads=1, max_seq_len=MAX_SEQ_LEN):
         super().__init__()
         self.num_heads = num_heads
@@ -311,12 +262,6 @@ class Custom_Matmul(nn.Module):
         self.is_quantized = False
         
     def forward(self, A, scale_A, B, scale_B):
-        """
-        A: (M, K)
-        B: (N, K)
-        C = A @ B^T -> (M, N)
-        """
-        
         if self.is_quantized == False:
             if A.dim() == 2:
                 C = torch.matmul(A, B.T)
@@ -442,7 +387,6 @@ class PerChannelAbsMaxObserver(nn.Module):
 def compute_smooth_alpha(input_observer, weight, lambd=0.5):
     """
     Compute SmoothQuant alpha in full FP32 precision.
-
     Output:
         alpha: torch.float32 tensor of shape (in_features,)
     """
@@ -505,11 +449,10 @@ class Custom_Linear_PerRow(nn.Module):
     def finish_calibration(self, alpha=None):
         if alpha is None:
             alpha = compute_smooth_alpha(self.in_observer, self.weight)
-
         self.smooth_alpha = alpha
-        w_smooth = self.weight * alpha.unsqueeze(0) 
-            
+        
         # Quantize the smoothed weight
+        w_smooth = self.weight * alpha.unsqueeze(0) 
         self.weight_q, self.scale_w = quantize_row_int8_symmetric_nd(w_smooth)
 
         self.scale_y = self.out_observer.get_scale().to(self.scale_w.device)
@@ -546,6 +489,12 @@ class Custom_Silu(nn.Module):
         self.is_quantized = True
 
     def enable_smooth_scale(self, smooth_alpha_value):
+        """
+        This function apply smooth scaling to quantization (for input activations) 
+        Note:
+        - Normal quantization: Y_int8 = Y / scale_Y
+        - Smooth quantization: Y_int8 = (Y / smooth_scale) / scale_Y
+        """
         assert smooth_alpha_value.shape == (self.emb_dim,)
         self.is_smooth_scale = True
         
@@ -558,8 +507,8 @@ class Custom_FeedForward(nn.Module):
     In the FNN, we use SmoothQuant for all fc1, fc2, and fc3 layers to 
     minimize the quantization error due to activation outlier.
     
-    To speed up computation, we use the same smooth_alpha for 
-    both fc1 and fc2, since they have the same input activation X.
+    We use the same smooth_alpha for both fc1 and fc2, 
+    since they have the same input activation X.
     """
     def __init__(self, cfg):
         super().__init__()
@@ -602,10 +551,10 @@ class Custom_FeedForward(nn.Module):
         fc1_smooth_alpha = self.fc1.smooth_alpha
 
         # fc2 uses the same smooth_alpha as fc1 
-        # since they have the same input
         self.fc2.finish_calibration(alpha=fc1_smooth_alpha) 
         
         self.fc3.finish_calibration()
+        
         # Assign fc3's smooth_alpha to silu_layer's 
         fc3_smooth_alpha = self.fc3.smooth_alpha
         self.silu_layer.enable_smooth_scale(fc3_smooth_alpha)

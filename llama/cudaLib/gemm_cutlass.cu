@@ -26,6 +26,7 @@
 #include "gemm_matmul.cu"
 #include "gemm_rmsnorm.cu"
 #include "gemm_activation.cu"
+#include "gemm_matrix_utils.cu"
 
 using namespace torch::indexing;
 
@@ -53,14 +54,13 @@ torch::Tensor func_softmax_lastdim_int8(
   return softmax_lastdim_int8_cuda(x_q, scale_x, scale_y);
 }
 
-torch::Tensor func_softmax_lastdim_int8_masking(
+std::tuple<torch::Tensor, torch::Tensor> func_softmax_lastdim_int8_masking(
     torch::Tensor x_q,          // int8, shape (dim0, dim1, dim2)
     torch::Tensor scale_x,      // float32, shape (dim0, dim1) 
-    torch::Tensor scale_y,      // float32, shape (dim0, dim1)
     torch::Tensor mask      // bool, shape (dim0, dim1, dim2)   
 ) {
   const at::cuda::OptionalCUDAGuard device_guard(x_q.device());
-  return softmax_lastdim_int8_masking_cuda(x_q, scale_x, scale_y, mask);
+  return softmax_lastdim_int8_masking_cuda(x_q, scale_x, mask);
 }
 
 torch::Tensor func_rmsnorm(
@@ -93,28 +93,16 @@ torch::Tensor func_rmsnorm_int8(
     return rmsnorm_int8_cuda(x, scale_x, gamma, scale_y, eps);
 }
 
-torch::Tensor func_rmsnorm_optimized_int8(
-    torch::Tensor x,      // INT8, shape (tokens, d_model)
-    torch::Tensor scale_x,
-    torch::Tensor gamma,  // FP32, shape (d_model,)
-    torch::Tensor scale_y,
-    float eps) 
-{
-    const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    return rmsnorm_optimized_int8_cuda(x, scale_x, gamma, scale_y, eps);
-}
-
-torch::Tensor func_apply_rope_int8(
+std::tuple<torch::Tensor, torch::Tensor> func_apply_rope_int8(
     torch::Tensor x,          // int8, shape [batch_size, num_heads, seq_len, head_dim]
     torch::Tensor scale_x,
     torch::Tensor cos,       // int8, shape [seq_len, head_dim]
     float scale_cos,
     torch::Tensor sin,       // int8, shape [seq_len, head_dim]
-    float scale_sin,
-    torch::Tensor scale_out) 
+    float scale_sin) 
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    return apply_rope_int8_host(x, scale_x, cos, scale_cos, sin, scale_sin, scale_out);
+    return rope_int8_host(x, scale_x, cos, scale_cos, sin, scale_sin);
 }
 
 torch::Tensor func_apply_silu_int8(
@@ -178,10 +166,10 @@ torch::Tensor func_w8a8_matmul(
 }
 
 torch::Tensor func_w8a8o8_matmul(
-    torch::Tensor input,   // INT8 - shape (M, K)
-    torch::Tensor weight,  // INT8 - shape (N, K)
-    torch::Tensor alphaRow,  // FP32 - shape (M)
-    torch::Tensor alphaCol // FP32 - shape (N)
+    torch::Tensor input,   // INT8 - shape (M, K) or (B, M, K)
+    torch::Tensor weight,  // INT8 - shape (N, K) or (B, N, K)
+    torch::Tensor alphaRow,  // FP32 - shape (M) or (B, M)
+    torch::Tensor alphaCol // FP32 - shape (N) or (B, N)
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
 
@@ -192,6 +180,14 @@ torch::Tensor func_w8a8o8_matmul(
     } else {
         throw std::invalid_argument("Input tensor must be 2D or 3D");
     }
+}
+
+std::vector<torch::Tensor> func_dequant_transpose_requant(
+    torch::Tensor values_int8,   // int8, [H, L, D]
+    torch::Tensor values_scale   // float, [H, L]
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(values_int8.device());
+    return dequant_transpose_requant_host(values_int8, values_scale);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -218,10 +214,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_rmsnorm_int8",
         &func_rmsnorm_int8,
         "RMSNorm for 2D int8 input with float32 gamma and input scale");
-
-    m.def("func_rmsnorm_optimized_int8",
-        &func_rmsnorm_optimized_int8,
-        "Optimized RMSNorm for 2D int8 input with float32 gamma and input scale");
 
     m.def("func_apply_rope_int8",
         &func_apply_rope_int8,
@@ -254,4 +246,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_w8a8o8_matmul",
         &func_w8a8o8_matmul,
         "MatMul for INT8 input and INT8 weight with per-row and per-column scales using CUTLASS (INT8 input/weight, FP32 per-row and per-column scales, INT8 output)");
+
+    m.def("func_dequant_transpose_requant",
+        &func_dequant_transpose_requant,
+        "Dequantize, transpose, and requantize an int8 matrix.");
 }

@@ -39,6 +39,10 @@ LOCAL_DIR = os.path.join(MODEL_HUB, MODEL_FOLDER)
 # 1. Define Model Architecture
 # ===============================================
 
+# ===============================================
+# 1. Define Model Architecture
+# ===============================================
+
 class Custom_GroupedQueryAttention(nn.Module):
     def __init__(
         self, d_in, num_heads, num_kv_groups, head_dim=None, dtype=None
@@ -71,10 +75,8 @@ class Custom_GroupedQueryAttention(nn.Module):
     
         self.is_quantized = False
 
-    def forward(self, x, scale_x, mask, cos, sin):
+    def forward(self, x, scale_x, mask, cos, scale_cos, sin, scale_sin):
         num_tokens, _ = x.shape
-        
-        # x = x.squeeze(0)  # Remove batch dimension for linear layers
 
         if self.is_quantized == False:  
             queries, _ = self.W_query(x, 1.0)
@@ -99,7 +101,7 @@ class Custom_GroupedQueryAttention(nn.Module):
             # Softmax the attention scores
             attn_scores = attn_scores.masked_fill(mask, -torch.inf)
             attn_scores = attn_scores / (self.head_dim ** 0.5)
-            attn_weights, _ = self.softmax_layer(attn_scores, 1.0)         
+            attn_weights, _ = self.softmax_layer(attn_scores, 1.0, 1.0)         
             
             # Compute context
             values = values.transpose(1, 2)  # Shape: (num_heads, head_dim, num_tokens)
@@ -111,28 +113,27 @@ class Custom_GroupedQueryAttention(nn.Module):
         else: 
             # === Quantized computation ===
             x_int8 = x
-            # x_scale = scale_x.squeeze(0)
             x_scale = scale_x
             
             queries_int8, queries_scale = self.W_query(x_int8, x_scale)
             keys_int8, keys_scale = self.W_key(x_int8, x_scale)
             values_int8, values_scale = self.W_value(x_int8, x_scale)
             
-            # Reshape for multi-head attention
+            # Reshape for multi-head 
             queries_int8 = queries_int8.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
-            keys_int8 = keys_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
-            values_int8 = values_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
-
             queries_scale = queries_scale.unsqueeze(0).expand(self.num_heads, -1)
+            
+            keys_int8 = keys_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
             keys_scale = keys_scale.unsqueeze(0).expand(self.num_kv_groups, -1)
+            
+            values_int8 = values_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
             values_scale = values_scale.unsqueeze(0).expand(self.num_kv_groups, -1)
             
             # Apply RoPE to quantized Q and K
-            cos_int8, cos_scale = quantize_tensor(cos)
-            sin_int8, sin_scale = quantize_tensor(sin)
-            
-            queries_int8, queries_scale = self.query_rope(queries_int8, queries_scale, cos_int8, cos_scale, sin_int8, sin_scale)
-            keys_int8, keys_scale = self.key_rope(keys_int8, keys_scale, cos_int8, cos_scale, sin_int8, sin_scale)
+            queries_int8, queries_scale = self.query_rope(queries_int8, queries_scale,\
+                                        cos, scale_cos, sin, scale_sin)
+            keys_int8, keys_scale = self.key_rope(keys_int8, keys_scale,\
+                                        cos, scale_cos, sin, scale_sin)
             
             # Repeat K and V for grouped attention
             keys_int8 = keys_int8.repeat_interleave(self.group_size, dim=0)
@@ -141,31 +142,33 @@ class Custom_GroupedQueryAttention(nn.Module):
             values_scale = values_scale.repeat_interleave(self.group_size, dim=0)
             
             # Attention score with quantization    
-            attn_scores_int8, attn_scores_scale = self.qk_score_layer(queries_int8, queries_scale, keys_int8, keys_scale)
+            attn_scores_int8, attn_scores_scale = self.qk_score_layer(queries_int8,\
+                                                        queries_scale,\
+                                                        keys_int8,\
+                                                        keys_scale)
             
             # Softmax the attention scores with quantization 
-            attn_scores_scale = attn_scores_scale.to(torch.float32) / (self.head_dim ** 0.5)  # Adjust scale for softmax
-            attn_weights_int8, attn_weights_scale = self.softmax_layer(attn_scores_int8, attn_scores_scale)
+            attn_scores_scale = attn_scores_scale / (self.head_dim ** 0.5)  # Adjust scale for softmax
+            attn_weights_int8, attn_weights_scale = self.softmax_layer(attn_scores_int8,\
+                                                    attn_scores_scale, mask)
             
             # Compute context with quantization
-            values = values_int8.to(torch.float32) * values_scale.unsqueeze(-1)
-            values = values.transpose(1, 2)  # Shape: (num_heads, head_dim, num_tokens)
-            values_int8, values_scale = quantize_row_int8_symmetric_nd(values)
+            values_int8, values_scale = gemm_cutlass.func_dequant_transpose_requant(values_int8,\
+                                                        values_scale)
             
-            context_int8, context_scale = self.context_layer(attn_weights_int8, attn_weights_scale,
-                                                             values_int8, values_scale)
-            
+            context_int8, context_scale = self.context_layer(attn_weights_int8,\
+                                                            attn_weights_scale,\
+                                                            values_int8,\
+                                                            values_scale)
+
             # Compute output with quantization
             context = context_int8.to(torch.float32) * context_scale.unsqueeze(-1)
             context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
-            context = context.to(self.out_proj.weight.dtype)  
+            context = context.to(self.out_proj.weight.dtype)  # shape: (num_tokens, d_out)
             
-            out, _ = self.out_proj(context, 1.0)  # Output projection in float for better accuracy
+            out, _ = self.out_proj(context, 1.0)  # Output float for better accuracy
         
-        # out = out.unsqueeze(0) # Add batch dimension back
-        out = out.to(torch.bfloat16)
-        
-        return out
+        return out.to(torch.bfloat16)
     
     def finish_calibration(self):
         self.W_query.finish_calibration()
@@ -197,18 +200,40 @@ class TransformerBlock(nn.Module):
         
         self.norm2 = RMSNorm_Fuse_Quant(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
         
+        cos, sin = compute_rope_params(
+            head_dim=cfg["emb_dim"] // cfg["n_heads"],
+            theta_base=cfg["rope_base"],
+            context_length=cfg["context_length"],
+            freq_config=cfg["rope_freq"]
+        )
+        self.register_buffer("cos", cos.to(cfg["dtype"]))
+        self.register_buffer("sin", sin.to(cfg["dtype"]))
+        
+        cos_int8, cos_scale = quantize_tensor(cos)
+        sin_int8, sin_scale = quantize_tensor(sin)
+        self.register_buffer("cos_int8", cos_int8)
+        self.register_buffer("cos_scale", cos_scale)
+        self.register_buffer("sin_int8", sin_int8)
+        self.register_buffer("sin_scale", sin_scale)
+
         self.is_quantized = False
 
-    def forward(self, x, mask, cos, sin):
+    def forward(self, x):
         # Shortcut connection for attention block
         shortcut = x
         
         if self.is_quantized == False:
             x = self.norm1(x)
-            x = self.att(x, 1.0, mask, cos, sin)  
+            mask = torch.triu(torch.ones(x.shape[0], x.shape[0],\
+                                device=x.device, dtype=torch.bool), diagonal=1)
+            x = self.att(x, 1.0, mask, self.cos, 1.0, self.sin, 1.0)  
         else:
             x, scale_x = self.norm1(x)
-            x = self.att(x, scale_x, mask, cos, sin)  
+            mask = torch.tril(torch.ones((x.shape[0], x.shape[0]),\
+                            dtype=torch.uint8, device=x.device))
+            x = self.att(x, scale_x, mask,\
+                        self.cos_int8, self.cos_scale,\
+                        self.sin_int8, self.sin_scale)  
         
         x = x + shortcut 
 
@@ -217,24 +242,20 @@ class TransformerBlock(nn.Module):
         
         if self.is_quantized == False:
             original_dtype = x.dtype
-            # x = x.squeeze(0)  # Remove batch dimension
             
             x = self.norm2(x)
             
             x, _ = self.ff(x, 1.0)
-            
-            # x = x.unsqueeze(0) # Add batch dimension back
+        
             x = x.to(original_dtype)
         
         else:
             original_dtype = x.dtype
-            # x = x.squeeze(0)  # Remove batch dimension
             
             x, scale_x = self.norm2(x)
             
             x, _ = self.ff(x, scale_x)
             
-            # x = x.unsqueeze(0) # Add batch dimension back
             x = x.to(original_dtype)    
         
         x = x + shortcut  
@@ -266,28 +287,17 @@ class Llama3Model(nn.Module):
 
         self.final_norm = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
-
-        cos, sin = compute_rope_params(
-            head_dim=cfg["emb_dim"] // cfg["n_heads"],
-            theta_base=cfg["rope_base"],
-            context_length=cfg["context_length"],
-            freq_config=cfg["rope_freq"]
-        )
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+        
         self.cfg = cfg
 
 
     def forward(self, in_idx):
         tok_embeds = self.tok_emb(in_idx)
         x = tok_embeds
-
-        num_tokens = x.shape[0]
-        mask = torch.triu(torch.ones(num_tokens, num_tokens,\
-                        device=x.device, dtype=torch.bool), diagonal=1)
         
         for block in self.trf_blocks:
-            x = block(x, mask, self.cos, self.sin)
+            x = block(x)
+        
         x = self.final_norm(x)
         logits = self.out_head(x.to(self.cfg["dtype"]))
         return logits
@@ -355,7 +365,7 @@ if __name__ == "__main__":
     MAX_GENERATED_TOKENS = 2000
     PPL_CONTEXT_TOKENS = 2000
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-    EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
+    EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
 
     list_prompts = ["What is Dragon Ball story?"]
 
@@ -386,7 +396,7 @@ if __name__ == "__main__":
 
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=1_000)
+                                                    split="train", n=50_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             

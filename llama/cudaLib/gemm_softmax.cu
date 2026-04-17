@@ -187,12 +187,11 @@ bool check_broadcastable(const at::Tensor& x, const at::Tensor& mask) {
     return false;
 }
 
-template <typename scalar_t>
 __global__ void softmax_lastdim_int8_masking_kernel(
     const int8_t* __restrict__ x_q,
     int8_t* __restrict__ y_q,
-    const scalar_t* __restrict__ scale_x,  // [num_vecs]
-    const scalar_t* __restrict__ scale_y,  // [num_vecs]
+    const float* __restrict__ scale_x,  // [num_vecs]
+    float* __restrict__ scale_y,  // [num_vecs]
     const uint8_t* __restrict__ mask,      // [num_vecs * dim2]
     int64_t num_vecs,
     int64_t dim2,
@@ -201,33 +200,30 @@ __global__ void softmax_lastdim_int8_masking_kernel(
     int64_t vec = (int64_t)blockIdx.x;
     if (vec >= num_vecs) return;
 
-    float sx       = (float)scale_x[vec];
-    float scaleOut = (float)scale_y[vec];
+    float sx = (float)scale_x[vec];
 
-    int tid    = threadIdx.x;
+    int tid = threadIdx.x;
     int stride = blockDim.x;
 
     extern __shared__ int8_t xq_s[];
     const int8_t* xq = x_q + vec * dim2;
-    int8_t* yq       = y_q + vec * dim2;
+    int8_t* yq = y_q + vec * dim2;
 
     const uint8_t* mask_vec;
     if (broadcast_first_dim) {
-        // x_q is (B, T, T), mask is (T, T)
-        // num_vecs = B * T, dim2 = T
-        int64_t row = vec % dim2;          // t_q
-        mask_vec = mask + row * dim2;      // mask[row, :]
+        int64_t row = vec % dim2;
+        mask_vec = mask + row * dim2;
     } else {
-        // mask has same flattened layout as x_q
         mask_vec = mask + vec * dim2;
     }
 
     __shared__ float warp_buf[32];
-    int lane      = tid & 31;
-    int warp      = tid >> 5;
+    __shared__ float row_scale_out;
+
+    int lane = tid & 31;
+    int warp = tid >> 5;
     int num_warps = (stride + 31) >> 5;
 
-    // load
     for (int64_t j = tid; j < dim2; j += stride) {
         xq_s[j] = xq[j];
     }
@@ -240,6 +236,7 @@ __global__ void softmax_lastdim_int8_masking_kernel(
         float v = sx * (float)xq_s[j];
         local_max = fmaxf(local_max, v);
     }
+
     float warp_m = warp_max(local_max);
     if (lane == 0) warp_buf[warp] = warp_m;
     __syncthreads();
@@ -259,6 +256,7 @@ __global__ void softmax_lastdim_int8_masking_kernel(
         float v = sx * (float)xq_s[j];
         local_sum += __expf(v - max_val);
     }
+
     float warp_s = warp_sum(local_sum);
     if (lane == 0) warp_buf[warp] = warp_s;
     __syncthreads();
@@ -269,30 +267,60 @@ __global__ void softmax_lastdim_int8_masking_kernel(
         if (lane == 0) warp_buf[0] = v;
     }
     __syncthreads();
-    float sum_val = warp_buf[0];
 
-    sum_val = fmaxf(sum_val, 1e-20f);
+    float sum_val = fmaxf(warp_buf[0], 1e-20f);
     float inv_sum = 1.0f / sum_val;
 
-    // 3) write
+    // 3) compute max-abs of output values p
+    float local_absmax = 0.0f;
+    for (int64_t j = tid; j < dim2; j += stride) {
+        if (!mask_vec[j]) continue;
+        float v = sx * (float)xq_s[j];
+        float p = __expf(v - max_val) * inv_sum;
+        local_absmax = fmaxf(local_absmax, fabsf(p));
+    }
+
+    float warp_absmax = warp_max(local_absmax);
+    if (lane == 0) warp_buf[warp] = warp_absmax;
+    __syncthreads();
+
+    if (warp == 0) {
+        float v = (lane < num_warps) ? warp_buf[lane] : 0.0f;
+        v = warp_max(v);
+        if (lane == 0) warp_buf[0] = v;
+    }
+    __syncthreads();
+
+    float absmax_val = warp_buf[0];
+
+    if (tid == 0) {
+        float s = (absmax_val > 0.0f) ? (absmax_val / 127.0f) : 1.0f;
+        row_scale_out = s;
+        scale_y[vec] = s;
+    }
+    __syncthreads();
+
+    float inv_scale_out = 1.0f / row_scale_out;
+
+    // 4) quantize and write
     for (int64_t j = tid; j < dim2; j += stride) {
         if (!mask_vec[j]) {
             yq[j] = (int8_t)0;
             continue;
         }
+
         float v = sx * (float)xq_s[j];
         float p = __expf(v - max_val) * inv_sum;
 
-        int q = __float2int_rn(p / scaleOut);
+        int q = __float2int_rn(p * inv_scale_out);
         q = max(0, min(127, q));
         yq[j] = (int8_t)q;
     }
 }
 
-torch::Tensor softmax_lastdim_int8_masking_cuda(
+std::tuple<torch::Tensor, torch::Tensor> softmax_lastdim_int8_masking_cuda(
     torch::Tensor x_q,          // int8, shape [..., C]
     torch::Tensor scale_x,      // float shape [...]
-    torch::Tensor scale_y,      // float shape [...]
     torch::Tensor mask          // uint8, shape [..., C] or [C, C] (broadcast)
 ) {
     TORCH_CHECK(x_q.is_cuda(), "x_q must be CUDA");
@@ -300,7 +328,7 @@ torch::Tensor softmax_lastdim_int8_masking_cuda(
     TORCH_CHECK(x_q.dim() >= 1, "x_q must be at least 1D");
 
     TORCH_CHECK(scale_x.is_cuda(), "scale_x must be CUDA");
-    TORCH_CHECK(scale_y.is_cuda(), "scale_y must be CUDA");
+    TORCH_CHECK(scale_x.scalar_type() == at::kFloat, "scale_x must be float32");
 
     TORCH_CHECK(mask.is_cuda(), "mask must be CUDA");
     TORCH_CHECK(mask.scalar_type() == at::kByte, "mask must be uint8");
@@ -323,19 +351,11 @@ torch::Tensor softmax_lastdim_int8_masking_cuda(
         scale_x.dim() == xq.dim() - 1,
         "scale_x must have shape equal to x_q.shape[:-1]"
     );
-    TORCH_CHECK(
-        scale_y.dim() == xq.dim() - 1,
-        "scale_y must have shape equal to x_q.shape[:-1]"
-    );
 
     for (int i = 0; i < xq.dim() - 1; ++i) {
         TORCH_CHECK(
             scale_x.size(i) == xq.size(i),
             "scale_x shape must equal x_q.shape[:-1]"
-        );
-        TORCH_CHECK(
-            scale_y.size(i) == xq.size(i),
-            "scale_y shape must equal x_q.shape[:-1]"
         );
     }
 
@@ -343,13 +363,8 @@ torch::Tensor softmax_lastdim_int8_masking_cuda(
         scale_x.numel() == num_vecs,
         "scale_x numel must equal product of leading dims of x_q"
     );
-    TORCH_CHECK(
-        scale_y.numel() == num_vecs,
-        "scale_y numel must equal product of leading dims of x_q"
-    );
 
     auto sx = scale_x.contiguous().view({num_vecs});
-    auto sy = scale_y.contiguous().view({num_vecs});
 
     bool broadcast_first_dim = false;
     torch::Tensor masking;
@@ -364,6 +379,7 @@ torch::Tensor softmax_lastdim_int8_masking_cuda(
     }
 
     auto y_q = torch::empty_like(xq);
+    auto sy = torch::empty({num_vecs}, sx.options().dtype(torch::kFloat));
 
     int threads = (int)std::min<int64_t>(dim2, 512);
     threads = std::max(threads, 32);
@@ -374,23 +390,17 @@ torch::Tensor softmax_lastdim_int8_masking_cuda(
     size_t shared_mem_size = (size_t)dim2 * sizeof(int8_t);
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kHalf, at::kBFloat16,
-        sx.scalar_type(),
-        "softmax_lastdim_int8_masking_cuda",
-        [&] {
-            softmax_lastdim_int8_masking_kernel<scalar_t>
-                <<<grid, block, shared_mem_size, stream>>>(
-                    xq.data_ptr<int8_t>(),
-                    y_q.data_ptr<int8_t>(),
-                    sx.data_ptr<scalar_t>(),
-                    sy.data_ptr<scalar_t>(),
-                    masking.data_ptr<uint8_t>(),
-                    num_vecs,
-                    dim2,
-                    broadcast_first_dim);
-        });
+    softmax_lastdim_int8_masking_kernel<<<grid, block, shared_mem_size, stream>>>(
+            xq.data_ptr<int8_t>(),
+            y_q.data_ptr<int8_t>(),
+            sx.data_ptr<float>(),
+            sy.data_ptr<float>(),
+            masking.data_ptr<uint8_t>(),
+            num_vecs,
+            dim2,
+            broadcast_first_dim
+    );
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return y_q;
+    return std::make_tuple(y_q, sy.view(expected_scale_shape));
 }

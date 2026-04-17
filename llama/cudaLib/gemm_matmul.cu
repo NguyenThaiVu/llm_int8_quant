@@ -911,7 +911,7 @@ torch::Tensor matmul_w8a8o8_3D_host(
         TORCH_CHECK(alphaCol.size(0) == B.size(0), "alphaCol must have N elements");
     } else if (alphaCol.dim() == 2) {
         TORCH_CHECK(alphaCol.dim() == 2 && alphaCol.size(0) == A.size(0) &&
-                    alphaCol.size(1) == B.size(0),
+                    alphaCol.size(1) == B.size(1),
                     "alphaCol must have shape (batch_size, N)");
     } else {
         TORCH_CHECK(false, "alphaCol must be 1D or 2D tensor");

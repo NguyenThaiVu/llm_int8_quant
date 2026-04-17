@@ -1,4 +1,6 @@
 import os 
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 from pathlib import Path
 from safetensors.torch import load_file
 
@@ -69,6 +71,7 @@ tokenizer = Tokenizer(tokenizer_file_path)
 # ===============================================
 # 3. Load Weights into Llama
 # ===============================================
+print(f"\n[INFO] Loading weights to model...")
 if LLAMA_SIZE_STR == "1B":
     weights_file = hf_hub_download(
         repo_id=HF_REPO_ID,
@@ -90,6 +93,7 @@ else:
 load_weights_into_llama(model, LLAMA32_CONFIG, combined_weights)
 model.to(device)
 del combined_weights  # free up memory
+print(f"[INFO] Weights loaded successfully.\n")
 
 
 # ===============================================
