@@ -109,6 +109,27 @@ class Custom_Softmax(nn.Module):
     def finish_calibration(self):
         self.is_quantized = True  
         
+
+class Custom_RMSNorm(torch.nn.Module):
+    def __init__(self, d_model, eps=1e-6):
+        super().__init__()
+        self.d_model = d_model
+        self.norm_shape = (d_model,)
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.ones(d_model))
+        self.is_quantized = False
+    
+    def forward(self, x, scale_x):
+        if self.is_quantized == False:
+            y = F.rms_norm(x, self.norm_shape, self.weight, eps=self.eps)
+            return y
+        else:
+            x_int8, scale_x = gemm_cutlass.func_rmsnorm_int8(x, scale_x, self.weight, self.eps)
+            return x_int8, scale_x
+    
+    def finish_calibration(self):
+        self.is_quantized = True
+        
         
 class RMSNorm_Fuse_Quant(nn.Module):
     """

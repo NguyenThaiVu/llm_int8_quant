@@ -329,106 +329,132 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_quant_cuda(
 
 // ================================================================
 /*
-Custom RMSNorm kernel for INT8 input and INT8 output
+RMSNorm kernel for INT8 input and INT8 output
 - Input: x -  INT8, shape (..., d_model) 
     scale_x - FLOAT32, shape (...) - per-row scale for x
     gamma: FLOAT32 or BF16 - (d_model)
-    scale_y - FLOAT32, shape (...) - per-row scale for y
 - Output: 
     y - INT8, shape (..., d_model)
+    scale_y - FLOAT32, shape (...) - per-row scale for y
 */
 template <typename T>
 __global__ void rmsnorm_int8_kernel(
-    const int8_t* __restrict__ x,         // quantized input: [num_rows, d_model]
-    const float* __restrict__ scale_x,    // input dequant scale per row: [num_rows]
-    const T* __restrict__ gamma,          // RMSNorm weight: [d_model]
-    int8_t* __restrict__ y,               // quantized output: [num_rows, d_model]
-    const float* __restrict__ scale_y,    // output quant scale per row: [num_rows]
+    const int8_t* __restrict__ x,         // shape [num_rows, d_model]
+    const float* __restrict__ scale_x,    // shape [num_rows]
+    const T* __restrict__ gamma,          // RMSNorm weight: shape [d_model]
+    int8_t* __restrict__ y,               // Shape [num_rows, d_model]
+    float* __restrict__ scale_y,          // shape [num_rows]
     int d_model,
     float eps
 ) {
-    // One CUDA block handles one row
     const int row = blockIdx.x;
-    const int thread_id = threadIdx.x;
+    const int tid = threadIdx.x;
 
-    // Start of this row in the flattened input/output tensors.
     const int8_t* row_x = x + row * d_model;
     int8_t* row_y = y + row * d_model;
 
-    // Per-row quantization scales.
     const float x_scale = scale_x[row];
-    const float y_scale = scale_y[row];
+
+    // Shared memory layout:
+    // [0 .. blockDim.x-1]           : partial sums
+    // [blockDim.x .. 2*blockDim.x-1]: partial max abs
+    extern __shared__ float shared[];
+    float* sh_sum = shared;
+    float* sh_max = shared + blockDim.x;
 
     // ------------------------------------------------------------
-    // Part 1. Compute sum of squares of the dequantized row.
-    // Real value:  x_real[i] = x_scale * row_x[i]
-    // We need:  sum_sq = sum_i (x_real[i]^2)
+    // Pass 1a: Compute sum of squares in real domain
+    // x_real = x_q * x_scale
     // ------------------------------------------------------------
     float local_sum_sq = 0.0f;
-
-    for (int col = thread_id; col < d_model; col += blockDim.x) {
+    for (int col = tid; col < d_model; col += blockDim.x) {
         float x_real = x_scale * static_cast<float>(row_x[col]);
         local_sum_sq += x_real * x_real;
     }
 
-    // ------------------------------------------------------------
-    // Part 2. Reduce all thread-local sums into one block-wide sum.
-    // shared[tid] will temporarily store each thread's partial sum.
-    // ------------------------------------------------------------
-    extern __shared__ float shared[];
-    shared[thread_id] = local_sum_sq;
+    sh_sum[tid] = local_sum_sq;
     __syncthreads();
 
+    // Block reduction for sum
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (thread_id < stride) {
-            shared[thread_id] += shared[thread_id + stride];
+        if (tid < stride) {
+            sh_sum[tid] += sh_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float mean_sq = sh_sum[0] / static_cast<float>(d_model);
+        sh_sum[0] = rsqrtf(mean_sq + eps);   // store rms_inv
+    }
+    __syncthreads();
+
+    const float rms_inv = sh_sum[0];
+
+    // ------------------------------------------------------------
+    // Pass 1b: Compute max absolute floating-point output
+    //
+    // y_fp = (x_q * x_scale) * rms_inv * gamma[col]
+    // ------------------------------------------------------------
+    float local_max_abs = 0.0f;
+    const float norm_scale = x_scale * rms_inv;
+
+    for (int col = tid; col < d_model; col += blockDim.x) {
+        float gamma_val = static_cast<float>(gamma[col]);
+        float y_fp = static_cast<float>(row_x[col]) * norm_scale * gamma_val;
+        float a = fabsf(y_fp);
+        local_max_abs = fmaxf(local_max_abs, a);
+    }
+
+    sh_max[tid] = local_max_abs;
+    __syncthreads();
+
+    // Block reduction for max
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sh_max[tid] = fmaxf(sh_max[tid], sh_max[tid + stride]);
         }
         __syncthreads();
     }
 
     // ------------------------------------------------------------
-    // Part 3. Compute inverse RMS for this row.
-    // mean_sq = sum_sq / d_model
-    // rms_inv = 1 / sqrt(mean_sq + eps)
-    //
-    // Store it in shared[0] so all threads can read it.
+    // Compute per-row output scale for quantization
     // ------------------------------------------------------------
-    if (thread_id == 0) {
-        float sum_sq = shared[0];
-        float mean_sq = sum_sq / static_cast<float>(d_model);
-        float rms_inv = rsqrtf(mean_sq + eps);
-        shared[0] = rms_inv;
+    if (tid == 0) {
+        float max_abs = sh_max[0];
+
+        // Avoid divide-by-zero for all-zero rows
+        float row_scale_y = max_abs / 127.0f;
+        if (row_scale_y == 0.0f) {
+            row_scale_y = 1.0f;
+        }
+
+        scale_y[row] = row_scale_y;
+        sh_sum[0] = row_scale_y;  // reuse shared storage
     }
     __syncthreads();
 
-    const float rms_inv = shared[0];
+    const float row_scale_y = sh_sum[0];
+    const float inv_scale_y = 1.0f / row_scale_y;
 
     // ------------------------------------------------------------
-    // Part 4. Combine scales for the final quantized output.
-    const float input_to_output_scale = (x_scale * rms_inv) / y_scale;
-
+    // Pass 2: Quantize output
     // ------------------------------------------------------------
-    // Part 5. Apply RMSNorm, then quantize to int8.
-    // ------------------------------------------------------------
-    for (int col = thread_id; col < d_model; col += blockDim.x) {
-        float gamma_value = static_cast<float>(gamma[col]);
+    for (int col = tid; col < d_model; col += blockDim.x) {
+        float gamma_val = static_cast<float>(gamma[col]);
+        float y_fp = static_cast<float>(row_x[col]) * norm_scale * gamma_val;
 
-        float y_fp =
-            static_cast<float>(row_x[col]) *
-            input_to_output_scale *
-            gamma_value;
+        int q = __float2int_rn(y_fp * inv_scale_y);
+        q = max(-127, min(127, q));
 
-        int y_int = __float2int_rn(y_fp);
-        y_int = max(-128, min(127, y_int));
-        row_y[col] = static_cast<int8_t>(y_int);
+        row_y[col] = static_cast<int8_t>(q);
     }
 }
 
-torch::Tensor rmsnorm_int8_cuda(
+std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_cuda(
     torch::Tensor x,      // INT8 - (..., d_model)
     torch::Tensor scale_x,  // Float32 scalar scale for INT8 input
     torch::Tensor gamma,  // (d_model)
-    torch::Tensor scale_y,  // Float32 scalar scale for INT8 output
     float eps
 ) {
     TORCH_CHECK(x.scalar_type() == torch::kChar, "x must be int8");
@@ -442,6 +468,7 @@ torch::Tensor rmsnorm_int8_cuda(
     TORCH_CHECK(x.size(-1) == gamma.size(0), "gamma size must match x.size(-1)");
 
     auto x_contig = x.contiguous();
+    auto scale_x_contig = scale_x.contiguous();
     auto gamma_contig = gamma.contiguous();
 
     const int64_t d_model = x_contig.size(-1);
@@ -451,15 +478,13 @@ torch::Tensor rmsnorm_int8_cuda(
 
     TORCH_CHECK(scale_x.is_cuda() && scale_x.scalar_type() == torch::kFloat32,
             "scale_x must be CUDA float32");
-    TORCH_CHECK(scale_y.is_cuda() && scale_y.scalar_type() == torch::kFloat32,
-            "scale_y must be CUDA float32");
     TORCH_CHECK(scale_x.numel() == n_rows, "scale_x must have n_rows elements");
-    TORCH_CHECK(scale_y.numel() == n_rows, "scale_y must have n_rows elements");
 
     // output same shape as input
     auto y = torch::empty_like(x_contig, x_contig.options().dtype(torch::kChar));
+    auto scale_y = torch::empty({n_rows}, x_contig.options().dtype(torch::kFloat32));
 
-    int threads = (int)std::min<int64_t>(d_model, 512);
+    int threads = (int)std::min<int64_t>(d_model, 256);
     if (threads & (threads - 1)) {
         int p = 1;
         while ((p << 1) <= threads) p <<= 1;
@@ -469,7 +494,7 @@ torch::Tensor rmsnorm_int8_cuda(
 
     dim3 block(threads);
     dim3 grid((unsigned)n_rows);
-    size_t shmem_bytes = threads * sizeof(float);
+    size_t shmem_bytes = 2 * threads * sizeof(float);
     auto stream = at::cuda::getCurrentCUDAStream();
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -479,7 +504,7 @@ torch::Tensor rmsnorm_int8_cuda(
         ([&] {
             rmsnorm_int8_kernel<scalar_t><<<grid, block, shmem_bytes, stream>>>(
                 x_contig.data_ptr<int8_t>(),
-                scale_x.data_ptr<float>(),
+                scale_x_contig.data_ptr<float>(),
                 gamma_contig.data_ptr<scalar_t>(),
                 y.data_ptr<int8_t>(),
                 scale_y.data_ptr<float>(),
@@ -489,7 +514,7 @@ torch::Tensor rmsnorm_int8_cuda(
         })
     );
 
-    return y.view(x.sizes());  
+    return std::make_tuple(y.view(x.sizes()), scale_y.view(scale_x.sizes()));  
 }
 
 

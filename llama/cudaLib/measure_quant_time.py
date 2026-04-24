@@ -11,17 +11,20 @@ import gemm_cutlass
 def quantization_func(X_int8, scale_X, dtype_out=torch.bfloat16):
     X_dequant = X_int8.to(torch.float32) * scale_X.unsqueeze(-1)
     X_dequant = X_dequant.to(dtype_out)
+    X_dequant = X_dequant.transpose(0, 1).reshape(seq_len, emb_dim) 
     return X_dequant
 
 if __name__ == "__main__":
        
     seq_len = 2000
     emb_dim = 4096
+    num_heads = 32
+    head_dim = emb_dim // num_heads
     dtype = torch.bfloat16
     
     NUM_HAPPENINGS = 112
     
-    X = torch.randn(seq_len, emb_dim, dtype=dtype).cuda()
+    X = torch.randn(num_heads, seq_len, head_dim, dtype=dtype).cuda()
     
     X_int8, scale_X = quantize_row_int8_symmetric_nd(X)
     

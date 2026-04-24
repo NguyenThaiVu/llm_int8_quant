@@ -96,8 +96,8 @@ del combined_weights  # free up memory
 # 4. Generate Text
 # ===============================================
 
-MAX_GENERATED_TOKENS = 1000
-PPL_CONTEXT_TOKENS = 1000
+MAX_GENERATED_TOKENS = 2000
+PPL_CONTEXT_TOKENS = 2000
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
@@ -133,3 +133,26 @@ with torch.profiler.profile(
 print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
 
     
+# ================================================
+# Evaluation Latency with Torch.compile
+# ================================================
+model_compiled = torch.compile(model)
+
+print(f"\n[INFO] Running with torch.compile...")
+with torch.no_grad():
+    out_ids = model_compiled(input_ids)
+print(f"[INFO] Output tokens: {out_ids.shape}")
+
+with torch.profiler.profile(
+    activities=[
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ],
+    record_shapes=True,
+    profile_memory=True,
+    with_stack=True
+) as prof:
+    with torch.no_grad():
+        out_ids = model_compiled(input_ids) 
+        
+print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))

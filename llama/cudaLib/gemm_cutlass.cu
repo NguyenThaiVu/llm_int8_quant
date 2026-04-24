@@ -82,15 +82,14 @@ std::tuple<torch::Tensor, torch::Tensor> func_rmsnorm_quant(
     return rmsnorm_quant_cuda(x, gamma, smooth_scale, eps);
 }
 
-torch::Tensor func_rmsnorm_int8(
+std::tuple<torch::Tensor, torch::Tensor> func_rmsnorm_int8(
     torch::Tensor x,      // INT8, shape (tokens, d_model)
     torch::Tensor scale_x,
     torch::Tensor gamma,  // FP32, shape (d_model,)
-    torch::Tensor scale_y,
     float eps) 
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    return rmsnorm_int8_cuda(x, scale_x, gamma, scale_y, eps);
+    return rmsnorm_int8_cuda(x, scale_x, gamma, eps);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> func_apply_rope_int8(
@@ -133,26 +132,24 @@ std::tuple<torch::Tensor, torch::Tensor> func_silu_mul_int8(
     return silu_mul_int8_cuda(fc1, scale_fc1, fc2, scale_fc2, smooth_scale);
 }
 
-torch::Tensor func_int8_matmul_out_int8_three_scale(
+std::tuple<torch::Tensor, torch::Tensor> func_int8_matmul_out_int8_three_scale(
     torch::Tensor input,   // INT8 - shape (M, K)
     torch::Tensor weight,  // INT8 - shape (N, K)
     torch::Tensor row_scale, // FP32 - shape (M, 1)
-    torch::Tensor col_scale,  // FP32 - shape (N, 1)
-    torch::Tensor out_scale // FP32 - shape (M, 1)
+    torch::Tensor col_scale  // FP32 - shape (N, 1)
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    return int8_matmul_out_int8_three_scale_host(input, weight, row_scale, col_scale, out_scale);
+    return int8_matmul_out_int8_three_scale_host(input, weight, row_scale, col_scale);
 }
 
-torch::Tensor func_int8_matmul_out_int8_three_scale_batched(
+std::tuple<torch::Tensor, torch::Tensor> func_int8_matmul_out_int8_three_scale_batched(
     torch::Tensor input,   // INT8 - shape (B, M, K) 
     torch::Tensor weight,  // INT8 - shape (B, N, K) or (N, K)
     torch::Tensor row_scale, // FP32 - shape (B, M, 1) or (M, 1)
-    torch::Tensor col_scale, // FP32 - shape (B, N, 1) or (N, 1)
-    torch::Tensor out_scale  // FP32 - shape (B, M, 1) or (M, 1)
+    torch::Tensor col_scale // FP32 - shape (B, N, 1) or (N, 1)
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    return int8_matmul_out_int8_three_scale_batched_host(input, weight, row_scale, col_scale, out_scale);
+    return int8_matmul_out_int8_three_scale_batched_host(input, weight, row_scale, col_scale);
 }
 
 torch::Tensor func_w8a8_matmul(
@@ -162,7 +159,13 @@ torch::Tensor func_w8a8_matmul(
     torch::Tensor alphaCol // FP32 - shape (N, 1)
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    return matmul_w8a8_host(input, weight, alphaRow, alphaCol);
+    if (input.dim() == 2) {
+        return matmul_w8a8_2D_host(input, weight, alphaRow, alphaCol);
+    } else if (input.dim() == 3) {
+        return matmul_w8a8_3D_host(input, weight, alphaRow, alphaCol);
+    } else {
+        throw std::invalid_argument("Input tensor must be 2D or 3D");
+    }
 }
 
 torch::Tensor func_w8a8o8_matmul(

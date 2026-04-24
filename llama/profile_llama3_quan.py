@@ -32,12 +32,7 @@ elif os.path.exists(MODEL_HUD_FOLDER_2):
     MODEL_HUB = MODEL_HUD_FOLDER_2
 else:
     raise ValueError("Model hub folder not found. Please check the paths.")
-
 LOCAL_DIR = os.path.join(MODEL_HUB, MODEL_FOLDER)
-
-# Make global count for debugging quantization calls
-# Make sure it is global so that it can be accessed and modified inside the attention module
-global_count = 0
 
 # ===============================================
 # 1. Define Model Architecture
@@ -71,7 +66,8 @@ class Custom_GroupedQueryAttention(nn.Module):
         
         self.softmax_layer = Custom_Softmax(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)    
         self.qk_score_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)
-        self.context_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)
+        self.context_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN,\
+                                            is_return_float=True).to(dtype)
     
         self.is_quantized = False
 
@@ -121,10 +117,8 @@ class Custom_GroupedQueryAttention(nn.Module):
             
             # Reshape for multi-head 
             queries_int8 = queries_int8.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
-            queries_scale = queries_scale.unsqueeze(0).expand(self.num_heads, -1)
             
             keys_int8 = keys_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
-            keys_scale = keys_scale.unsqueeze(0).expand(self.num_kv_groups, -1)
             
             values_int8 = values_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
             values_scale = values_scale.unsqueeze(0).expand(self.num_kv_groups, -1)
@@ -148,7 +142,7 @@ class Custom_GroupedQueryAttention(nn.Module):
                                                         keys_scale)
             
             # Softmax the attention scores with quantization 
-            attn_scores_scale = attn_scores_scale / (self.head_dim ** 0.5)  # Scale for softmax
+            attn_scores_scale = attn_scores_scale / (self.head_dim ** 0.5)
             attn_weights_int8, attn_weights_scale = self.softmax_layer(attn_scores_int8,\
                                                     attn_scores_scale, mask)
             
@@ -156,16 +150,12 @@ class Custom_GroupedQueryAttention(nn.Module):
             values_int8, values_scale = gemm_cutlass.func_dequant_transpose_requant(values_int8,\
                                                         values_scale)
             
-            context_int8, context_scale = self.context_layer(attn_weights_int8,\
-                                                            attn_weights_scale,\
-                                                            values_int8,\
-                                                            values_scale)
+            context, _ = self.context_layer(attn_weights_int8,\
+                                            attn_weights_scale,\
+                                            values_int8,\
+                                            values_scale)
 
-            # Compute output with quantization
-            context = context_int8.to(torch.float32) * context_scale.unsqueeze(-1)
-            context = context.to(self.out_proj.weight.dtype)  
             context = context.transpose(0, 1).reshape(num_tokens, self.d_out) 
-            
             out, _ = self.out_proj(context, 1.0)  # Output float for better accuracy
         
         return out
@@ -376,9 +366,9 @@ if __name__ == "__main__":
     input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
     print(f"[INFO] Input tokens: {input_ids.shape}")
 
-    for _ in range(3):  # Warm-up runs
-        with torch.no_grad():
-            out_ids = model(input_ids)
+    # Warm-up runs
+    with torch.no_grad():
+        out_ids = model(input_ids)
     print(f"[INFO] Output tokens: {out_ids.shape}")
     
     with torch.profiler.profile(
@@ -403,9 +393,9 @@ if __name__ == "__main__":
     model.finish_calibration()
     print(f"\n[INFO] Finished calibration.\n")
 
-    for _ in range(3):  # Warm-up runs
-        with torch.no_grad():
-            out_ids = model(input_ids)
+    # Warm-up runs
+    with torch.no_grad():
+        out_ids = model(input_ids)
     print(f"[INFO] Output quantization tokens: {out_ids.shape}")
     
     with torch.profiler.profile(
@@ -422,5 +412,3 @@ if __name__ == "__main__":
 
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=50))
     
-
-        

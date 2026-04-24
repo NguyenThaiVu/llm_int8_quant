@@ -26,7 +26,7 @@ This function. take input tensor in int8, apply RoPE, and output int8 tensor.
 
 * Inputs:
 - x: int8 [num_heads, seq_len, head_dim]
-- scale_x: float32 [num_heads, seq_len]
+- scale_x: float32 [num_heads, seq_len] or [seq_len] (if shared across heads)
 - cos: int8 [seq_len, head_dim]
 - sin: int8 [seq_len, head_dim]
 - scale_cos: float32 scalar
@@ -47,7 +47,8 @@ __global__ void rope_int8_kernel(
     int head_dim,
     int seq_len,
     int8_t* __restrict__ out,
-    float* __restrict__ scale_out
+    float* __restrict__ scale_out, 
+    int scale_mode // 0 = per-token per-head, 1 = per-token shared across heads
 ) {
     int head = (int)blockIdx.z;
     int pos  = (int)blockIdx.y;
@@ -58,7 +59,12 @@ __global__ void rope_int8_kernel(
     int row_idx  = head * seq_len + pos;
     int row_base = row_idx * head_dim;
 
-    float sx = (float)scale_x[row_idx];
+    float sx;
+    if (scale_mode == 0) {
+        sx = (float)scale_x[row_idx];
+    } else {
+        sx = (float)scale_x[pos];
+    }
 
     float local_max = 0.0f;
 
@@ -111,7 +117,7 @@ __global__ void rope_int8_kernel(
 
 std::tuple<torch::Tensor, torch::Tensor> rope_int8_host(
     torch::Tensor x,          // int8 [num_heads, seq_len, head_dim]
-    torch::Tensor scale_x,    // float32 [num_heads, seq_len]
+    torch::Tensor scale_x,    // float32 [num_heads, seq_len] or [seq_len] (if shared across heads)
     torch::Tensor cos,        // int8 [seq_len, head_dim]
     float scale_cos,  
     torch::Tensor sin,        // int8 [seq_len, head_dim]
@@ -128,7 +134,6 @@ std::tuple<torch::Tensor, torch::Tensor> rope_int8_host(
     TORCH_CHECK(scale_x.dtype() == torch::kFloat, "scale_x must be float32");
 
     TORCH_CHECK(x.dim() == 3, "x must be 3D tensor [num_heads, seq_len, head_dim]");
-    TORCH_CHECK(scale_x.dim() == 2, "scale_x must be 2D [num_heads, seq_len]");
     TORCH_CHECK(cos.dim() == 2, "cos must be 2D [seq_len, head_dim]");
     TORCH_CHECK(sin.dim() == 2, "sin must be 2D [seq_len, head_dim]");
 
@@ -137,8 +142,6 @@ std::tuple<torch::Tensor, torch::Tensor> rope_int8_host(
     int head_dim  = x.size(2);
 
     TORCH_CHECK((head_dim % 2) == 0, "head_dim must be even");
-    TORCH_CHECK(scale_x.size(0) == num_heads && scale_x.size(1) == seq_len,
-                "scale_x shape must be [num_heads, seq_len]");
     TORCH_CHECK(cos.size(0) == seq_len && cos.size(1) == head_dim,
                 "cos shape must be [seq_len, head_dim]");
     TORCH_CHECK(sin.size(0) == seq_len && sin.size(1) == head_dim,
@@ -152,6 +155,21 @@ std::tuple<torch::Tensor, torch::Tensor> rope_int8_host(
     auto out = torch::empty_like(xq);
     auto scale_out = torch::empty({num_heads, seq_len},
         x.options().dtype(torch::kFloat));
+
+    int scale_mode;
+    if (scale_x.dim() == 2) {
+        if (scale_x.size(0) != num_heads || scale_x.size(1) != seq_len) {
+            TORCH_CHECK(false, "If scale_x is 2D, it must have shape [num_heads, seq_len]");
+        }
+        scale_mode = 0; // per-token per-head
+    } else if (scale_x.dim() == 1) {
+        if (scale_x.size(0) != seq_len) {
+            TORCH_CHECK(false, "If scale_x is 1D, it must have shape [seq_len]");
+        }
+        scale_mode = 1; // per-token shared across heads
+    } else {
+        TORCH_CHECK(false, "Invalid shape for scale_x");
+    }
 
     dim3 block(256);
     dim3 grid(1, (unsigned)seq_len, (unsigned)num_heads);
@@ -168,7 +186,8 @@ std::tuple<torch::Tensor, torch::Tensor> rope_int8_host(
         head_dim,
         seq_len,
         out.data_ptr<int8_t>(),
-        scale_out.data_ptr<float>());
+        scale_out.data_ptr<float>(),
+        scale_mode);
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 

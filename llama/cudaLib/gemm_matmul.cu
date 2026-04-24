@@ -19,6 +19,8 @@
 #include "cutlass/util/host_tensor.h"
 #include "cutlass/gemm/device/gemm.h"
 
+#include "gemm_utils.cu"
+
 
 using namespace torch::indexing;
 
@@ -236,81 +238,101 @@ torch::Tensor int8_matmul_host(
 // ================================================================
 
 template<int Vec>
-__global__ void three_scale_quantize_kernel(
+__global__ void dynamic_three_scale_quantize_kernel(
     const cutlass::bfloat16_t* __restrict__ input,   // (M, N)
-    const float* __restrict__ row_factor,            // (M,) = row_scale / out_scale
+    const float* __restrict__ row_scale,             // (M,)
     const float* __restrict__ col_scale,             // (N,)
     int8_t* __restrict__ output,                     // (M, N)
+    float* __restrict__ out_scale,                   // (M,)
     int M,
     int N)
 {
-    int row  = blockIdx.y * blockDim.y + threadIdx.y;
-    int col0 = (blockIdx.x * blockDim.x + threadIdx.x) * Vec;
-
+    // One block handles one row (blockIdx.x = row index)
+    int row = blockIdx.x; 
     if (row >= M) return;
 
-    float rf = row_factor[row];
-    int base = row * N + col0;
+    float row_s = row_scale[row];
+    float max_val = 0.0f;
 
-    #pragma unroll
-    for (int i = 0; i < Vec; ++i) {
-        int col = col0 + i;
-        if (col < N) {
-            float x = static_cast<float>(input[base + i]);
-            float scaled = x * rf * col_scale[col];
+    // --- Pass 1: Find Row Max ---
+    // Each thread iterates through the row to find its local maximum
+    for (int col = threadIdx.x * Vec; col < N; col += blockDim.x * Vec) {
+        #pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            if (col + i < N) {
+                float val = static_cast<float>(input[row * N + col + i]);
+                float scaled_val = fabsf(val * row_s * col_scale[col + i]);
+                max_val = fmaxf(max_val, scaled_val);
+            }
+        }
+    }
 
-            int q = __float2int_rn(scaled);
-            q = q < -128 ? -128 : (q > 127 ? 127 : q);
+    // Use your helper to get the absolute max for the entire row
+    float row_max = block_reduce_max(max_val);
+    
+    // Calculate out_scale for this row
+    float s_out = row_max / 127.0f;
+    if (threadIdx.x == 0) {
+        out_scale[row] = s_out;
+    }
+    __syncthreads(); // Ensure s_out is ready for all threads
 
-            output[base + i] = static_cast<int8_t>(q);
+    // Avoid division by zero
+    float inv_s_out = (s_out > 1e-9f) ? (1.0f / s_out) : 0.0f;
+
+    // --- Pass 2: Quantize and Write ---
+    for (int col = threadIdx.x * Vec; col < N; col += blockDim.x * Vec) {
+        #pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+            if (col + i < N) {
+                float val = static_cast<float>(input[row * N + col + i]);
+                float scaled = val * row_s * col_scale[col + i] * inv_s_out;
+
+                int q = __float2int_rn(scaled);
+                // Clamp to INT8 range
+                q = (q < -128) ? -128 : (q > 127 ? 127 : q);
+                output[row * N + col + i] = static_cast<int8_t>(q);
+            }
         }
     }
 }
 
 
-torch::Tensor int8_matmul_out_int8_three_scale_host(
-    torch::Tensor input,
-    torch::Tensor weight,
+std::tuple<torch::Tensor, torch::Tensor> int8_matmul_out_int8_three_scale_host(
+    torch::Tensor input,    // (M, N) INT8
+    torch::Tensor weight,   // (N, K) INT8
     torch::Tensor row_scale,
-    torch::Tensor col_scale,
-    torch::Tensor out_scale)
+    torch::Tensor col_scale)
 {
     auto bf16_out = int8_matmul_host(input, weight, 1.0f);
 
-    int M_out = bf16_out.size(0);
-    int N_out = bf16_out.size(1);
+    const int M = bf16_out.size(0);
+    const int N = bf16_out.size(1);
 
-    auto output_int8 = torch::empty(
-        {M_out, N_out},
-        torch::dtype(torch::kChar).device(input.device()));
-
-    // Precompute row_factor = row_scale / out_scale
-    auto row_factor = row_scale / out_scale;
+    auto output_int8 = torch::empty({M, N}, torch::dtype(torch::kChar).device(input.device()));
+    auto out_scale = torch::empty({M}, torch::dtype(torch::kFloat32).device(input.device()));
 
     constexpr int Vec = 4;
-    dim3 threads(128, 2);
-    dim3 blocks((N_out + threads.x * Vec - 1) / (threads.x * Vec),
-                (M_out + threads.y - 1) / threads.y);
+    int threads = 256;
+    int blocks = M; 
 
-    three_scale_quantize_kernel<Vec><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+    dynamic_three_scale_quantize_kernel<Vec><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<cutlass::bfloat16_t*>(bf16_out.data_ptr<torch::BFloat16>()),
-        row_factor.data_ptr<float>(),
+        row_scale.data_ptr<float>(),
         col_scale.data_ptr<float>(),
         output_int8.data_ptr<int8_t>(),
-        M_out, N_out
+        out_scale.data_ptr<float>(),
+        M, N
     );
 
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    return output_int8;
+    return {output_int8, out_scale};
 }
 
-torch::Tensor int8_matmul_out_int8_three_scale_batched_host(
+std::tuple<torch::Tensor, torch::Tensor> int8_matmul_out_int8_three_scale_batched_host(
     torch::Tensor A,  // (batch_size, M, K)
     torch::Tensor B,  // (batch_size, N, K) 
     torch::Tensor row_scales,  // (batch_size, M)
-    torch::Tensor col_scales,  // (batch_size, N)
-    torch::Tensor out_scales   // (batch_size, M)
+    torch::Tensor col_scales  // (batch_size, N)
 ) {
     TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
     TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
@@ -344,15 +366,8 @@ torch::Tensor int8_matmul_out_int8_three_scale_batched_host(
     TORCH_CHECK(col_scales.dtype() == torch::kFloat32,
                 "col_scales must be float32");
 
-    // out_scales: [batch_size, M] float32
-    TORCH_CHECK(out_scales.dim() == 2, "out_scales must be 2D tensor");
-    TORCH_CHECK(out_scales.size(0) == batch_size &&
-                out_scales.size(1) == M,
-                "out_scales shape must match batch size and M of A");
-    TORCH_CHECK(out_scales.dtype() == torch::kFloat32,
-                "out_scales must be float32");
-
     auto out = torch::empty({batch_size, M, N}, A.options().dtype(torch::kChar));
+    auto out_scales = torch::empty({batch_size, M}, torch::dtype(torch::kFloat32).device(A.device()));
 
     for (int64_t b = 0; b < batch_size; ++b) {
         auto A_b = A.select(0, b).contiguous();  // (M, K)
@@ -364,14 +379,16 @@ torch::Tensor int8_matmul_out_int8_three_scale_batched_host(
         }
         auto row_scales_b = row_scales.select(0, b).contiguous();  // (M,)
         auto col_scales_b = col_scales.select(0, b).contiguous();  // (N,)
-        auto out_scales_b = out_scales.select(0, b).contiguous();  // (M,)
+        // auto out_scales_b = out_scales.select(0, b).contiguous();  // (M,)
 
-        auto out_b_result = int8_matmul_out_int8_three_scale_host(
-            A_b, B_b, row_scales_b, col_scales_b, out_scales_b);
+        auto [out_b_result, out_scales_b_result] = int8_matmul_out_int8_three_scale_host(
+            A_b, B_b, row_scales_b, col_scales_b
+        );
 
         out.select(0, b).copy_(out_b_result);
+        out_scales.select(0, b).copy_(out_scales_b_result);
     }
-    return out;
+    return {out, out_scales};
 }
 
 
@@ -412,35 +429,28 @@ template <typename TileShape, typename WarpShape, int kStages>
 torch::Tensor matmul_w8a8(
     const torch::Tensor &A,         // int8 [M, K]
     const torch::Tensor &B,         // int8 [N, K]
-    const torch::Tensor &alphaRow,  // float [M, 1]
-    const torch::Tensor &alphaCol   // float [1, N]
+    const torch::Tensor &alphaRow,  // float [M] or [M, 1]
+    const torch::Tensor &alphaCol   // float [N] or [1, N]
 ) {
-    TORCH_CHECK(A.is_cuda() && B.is_cuda() 
-                && alphaRow.is_cuda() && alphaCol.is_cuda());
+    TORCH_CHECK(A.is_cuda() && B.is_cuda() &&
+                alphaRow.is_cuda() && alphaCol.is_cuda(),
+                "All tensors must be CUDA tensors");
+
     TORCH_CHECK(A.scalar_type() == torch::kInt8, "A must be int8");
     TORCH_CHECK(B.scalar_type() == torch::kInt8, "B must be int8");
-    TORCH_CHECK(alphaCol.scalar_type() == torch::kFloat32, 
-                "alphaCol must be float32");
-    TORCH_CHECK(alphaRow.scalar_type() == torch::kFloat32, 
-                "alphaRow must be float32");
+    TORCH_CHECK(alphaRow.scalar_type() == torch::kFloat32, "alphaRow must be float32");
+    TORCH_CHECK(alphaCol.scalar_type() == torch::kFloat32, "alphaCol must be float32");
+
     TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "A and B must be 2D");
+    TORCH_CHECK(B.size(1) == A.size(1), "B must have shape (N, K) with same K as A");
     TORCH_CHECK(alphaRow.numel() == A.size(0), "alphaRow must have M elements");
     TORCH_CHECK(alphaCol.numel() == B.size(0), "alphaCol must have N elements");
 
-    int32_t M = A.size(0);
-    int32_t N = B.size(0);
-    int32_t K = A.size(1);
+    int32_t M = static_cast<int32_t>(A.size(0));
+    int32_t N = static_cast<int32_t>(B.size(0));
+    int32_t K = static_cast<int32_t>(A.size(1));
 
-    TORCH_CHECK(B.size(1) == K, "B must have shape (N, K)");
-    TORCH_CHECK(K % 16 == 0, "K must be multiple of 16");
-
-    auto tensor_a  = A.contiguous();
-    auto tensor_b  = B.contiguous();
-    auto tensor_v1 = alphaRow.contiguous();
-    auto tensor_v2 = alphaCol.contiguous();
-
-    auto D = torch::empty({M, N},
-        torch::TensorOptions().device(A.device()).dtype(torch::kBFloat16));
+    TORCH_CHECK(M > 0 && N > 0 && K > 0, "M, N, K must be > 0");
 
     using ElementA = int8_t;
     using ElementB = int8_t;
@@ -454,11 +464,53 @@ torch::Tensor matmul_w8a8(
     using LayoutB = cutlass::layout::ColumnMajor;
     using LayoutC = cutlass::layout::RowMajor;
 
-    constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
-    constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
-    constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
-
+    constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;  // 16 int8
+    constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;  // 16 int8
+    constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;  // 8 bf16
     constexpr int EVTEpilogueStages = 1;
+
+    // For SM80 int8 Tensor Core MMA, K=32 is the natural instruction granularity.
+    // For output/epilogue, padding N to AlignmentC (=8) is usually the safe choice.
+    int32_t K_gemm = static_cast<int32_t>(((K + 31) / 32) * 32);
+    int32_t N_gemm = static_cast<int32_t>(((N + AlignmentC - 1) / AlignmentC) * AlignmentC);
+
+    bool padK = (K_gemm != K);
+    bool padN = (N_gemm != N);
+
+    auto A_used = A.contiguous();
+    auto B_used = B.contiguous();
+    auto alphaRow_used = alphaRow.contiguous().view({M});
+    auto alphaCol_used = alphaCol.contiguous().view({N});
+
+    // Pad A: [M, K] -> [M, K_gemm]
+    if (padK) {
+        auto A_pad = torch::zeros({M, K_gemm}, A.options());
+        A_pad.index_put_({torch::indexing::Slice(), torch::indexing::Slice(0, K)}, A_used);
+        A_used = A_pad;
+    }
+
+    // Pad B: [N, K] -> [N_gemm, K_gemm]
+    if (padN || padK) {
+        auto B_pad = torch::zeros({N_gemm, K_gemm}, B.options());
+        B_pad.index_put_(
+            {torch::indexing::Slice(0, N), torch::indexing::Slice(0, K)},
+            B_used
+        );
+        B_used = B_pad;
+    }
+
+    // alphaRow is indexed by M only, so it does not need padding.
+    // alphaCol is indexed by N, so it must match padded output width.
+    if (padN) {
+        auto alphaCol_pad = torch::zeros({N_gemm}, alphaCol.options());
+        alphaCol_pad.index_put_({torch::indexing::Slice(0, N)}, alphaCol_used);
+        alphaCol_used = alphaCol_pad;
+    }
+
+    auto D_full = torch::empty(
+        {M, N_gemm},
+        torch::TensorOptions().device(A.device()).dtype(torch::kBFloat16)
+    );
 
     using namespace cute;
 
@@ -530,33 +582,33 @@ torch::Tensor matmul_w8a8(
         {
             {
                 {},
-                {tensor_v1.data_ptr<float>(), ElementScale(0), {_1{}, _0{}, int32_t(M)}},
+                {alphaRow_used.data_ptr<float>(), ElementScale(0), {_1{}, _0{}, int32_t(M)}},
                 {}
             },
-            {tensor_v2.data_ptr<float>(), ElementScale(0), {_0{}, _1{}, int32_t(N)}},
+            {alphaCol_used.data_ptr<float>(), ElementScale(0), {_0{}, _1{}, int32_t(N_gemm)}},
             {}
         },
         {
-            reinterpret_cast<ElementOutput*>(D.data_ptr<at::BFloat16>()),
-            {int64_t{N}, _1{}, int64_t{M * N}}
+            reinterpret_cast<ElementOutput*>(D_full.data_ptr<at::BFloat16>()),
+            {int64_t{N_gemm}, _1{}, int64_t{M * N_gemm}}
         }
     };
 
     typename DeviceGemm::Arguments arguments(
         cutlass::gemm::GemmUniversalMode::kGemm,
-        {M, N, K},
+        {M, N_gemm, K_gemm},
         1,
         callback_args,
-        tensor_a.data_ptr<ElementA>(),
-        tensor_b.data_ptr<ElementB>(),
+        A_used.data_ptr<ElementA>(),
+        B_used.data_ptr<ElementB>(),
         nullptr,
         nullptr,
-        int64_t(M) * K,
-        int64_t(N) * K,
+        int64_t(M) * K_gemm,
+        int64_t(N_gemm) * K_gemm,
         0,
         0,
-        tensor_a.stride(0),
-        tensor_b.stride(0),
+        A_used.stride(0),
+        B_used.stride(0),
         0,
         0
     );
@@ -576,10 +628,187 @@ torch::Tensor matmul_w8a8(
     status = gemm_op(stream.stream());
     TORCH_CHECK(status == cutlass::Status::kSuccess, "run failed");
 
-    return D;
+    // Slice back to original shape [M, N]
+    if (padN) {
+        return D_full.index({torch::indexing::Slice(), torch::indexing::Slice(0, N)}).contiguous();
+    }
+    return D_full;
 }
 
-torch::Tensor matmul_w8a8_host(
+// template <typename TileShape, typename WarpShape, int kStages>
+// torch::Tensor matmul_w8a8(
+//     const torch::Tensor &A,         // int8 [M, K]
+//     const torch::Tensor &B,         // int8 [N, K]
+//     const torch::Tensor &alphaRow,  // float [M, 1]
+//     const torch::Tensor &alphaCol   // float [1, N]
+// ) {
+//     TORCH_CHECK(A.is_cuda() && B.is_cuda() 
+//                 && alphaRow.is_cuda() && alphaCol.is_cuda());
+//     TORCH_CHECK(A.scalar_type() == torch::kInt8, "A must be int8");
+//     TORCH_CHECK(B.scalar_type() == torch::kInt8, "B must be int8");
+//     TORCH_CHECK(alphaCol.scalar_type() == torch::kFloat32, 
+//                 "alphaCol must be float32");
+//     TORCH_CHECK(alphaRow.scalar_type() == torch::kFloat32, 
+//                 "alphaRow must be float32");
+//     TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "A and B must be 2D");
+//     TORCH_CHECK(alphaRow.numel() == A.size(0), "alphaRow must have M elements");
+//     TORCH_CHECK(alphaCol.numel() == B.size(0), "alphaCol must have N elements");
+
+//     int32_t M = A.size(0);
+//     int32_t N = B.size(0);
+//     int32_t K = A.size(1);
+
+//     TORCH_CHECK(B.size(1) == K, "B must have shape (N, K)");
+
+//     int64_t K_gemm = ((K + 31) / 32) * 32;  // pad K to multiple of 32 for int8 Tensor Cores
+
+
+//     auto tensor_a  = A.contiguous();
+//     auto tensor_b  = B.contiguous();
+//     auto tensor_v1 = alphaRow.contiguous();
+//     auto tensor_v2 = alphaCol.contiguous();
+
+//     auto D = torch::empty({M, N},
+//         torch::TensorOptions().device(A.device()).dtype(torch::kBFloat16));
+
+//     using ElementA = int8_t;
+//     using ElementB = int8_t;
+//     using ElementScale = float;
+//     using ElementC = cutlass::bfloat16_t;
+//     using ElementOutput = cutlass::bfloat16_t;
+//     using ElementAccumulator = int32_t;
+//     using ElementCompute = float;
+
+//     using LayoutA = cutlass::layout::RowMajor;
+//     using LayoutB = cutlass::layout::ColumnMajor;
+//     using LayoutC = cutlass::layout::RowMajor;
+
+//     constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+//     constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+//     constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+
+//     constexpr int EVTEpilogueStages = 1;
+
+//     using namespace cute;
+
+//     using OutputTileThreadMap =
+//         cutlass::epilogue::threadblock::OutputTileThreadLayout<
+//             TileShape, WarpShape, ElementC, AlignmentC, EVTEpilogueStages>;
+
+//     using Accum = cutlass::epilogue::threadblock::VisitorAccFetch;
+
+//     using V1Broadcast =
+//         cutlass::epilogue::threadblock::VisitorColBroadcast<
+//             OutputTileThreadMap, ElementScale,
+//             cute::Stride<_1, _0, int32_t>>;
+
+//     using V2Broadcast =
+//         cutlass::epilogue::threadblock::VisitorRowBroadcast<
+//             OutputTileThreadMap, ElementScale,
+//             cute::Stride<_0, _1, int32_t>>;
+
+//     using Compute0 =
+//         cutlass::epilogue::threadblock::VisitorCompute<
+//             cutlass::multiplies, ElementCompute, ElementCompute,
+//             cutlass::FloatRoundStyle::round_to_nearest>;
+
+//     using EVTCompute0 =
+//         cutlass::epilogue::threadblock::Sm80EVT<
+//             Compute0, Accum, V1Broadcast>;
+
+//     using Compute1 =
+//         cutlass::epilogue::threadblock::VisitorCompute<
+//             cutlass::multiplies, ElementCompute, ElementCompute,
+//             cutlass::FloatRoundStyle::round_to_nearest>;
+
+//     using EVTCompute1 =
+//         cutlass::epilogue::threadblock::Sm80EVT<
+//             Compute1, EVTCompute0, V2Broadcast>;
+
+//     using StoreD =
+//         cutlass::epilogue::threadblock::VisitorAuxStore<
+//             OutputTileThreadMap, ElementOutput,
+//             cutlass::FloatRoundStyle::round_to_nearest,
+//             cute::Stride<int64_t, _1, int64_t>>;
+
+//     using EVTD =
+//         cutlass::epilogue::threadblock::Sm80EVT<StoreD, EVTCompute1>;
+
+//     using Kernel =
+//         typename cutlass::gemm::kernel::DefaultGemmWithVisitor<
+//             ElementA, LayoutA, cutlass::ComplexTransform::kNone, AlignmentA,
+//             ElementB, LayoutB, cutlass::ComplexTransform::kNone, AlignmentB,
+//             ElementC, LayoutC, AlignmentC,
+//             ElementAccumulator,
+//             ElementCompute,
+//             cutlass::arch::OpClassTensorOp,
+//             cutlass::arch::Sm80,
+//             TileShape,
+//             WarpShape,
+//             cutlass::gemm::GemmShape<16, 8, 32>,
+//             EVTD,
+//             cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+//             kStages,
+//             cutlass::arch::OpMultiplyAddSaturate,
+//             EVTEpilogueStages
+//         >::GemmKernel;
+
+//     using DeviceGemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+
+//     typename EVTD::Arguments callback_args{
+//         {
+//             {
+//                 {},
+//                 {tensor_v1.data_ptr<float>(), ElementScale(0), {_1{}, _0{}, int32_t(M)}},
+//                 {}
+//             },
+//             {tensor_v2.data_ptr<float>(), ElementScale(0), {_0{}, _1{}, int32_t(N)}},
+//             {}
+//         },
+//         {
+//             reinterpret_cast<ElementOutput*>(D.data_ptr<at::BFloat16>()),
+//             {int64_t{N}, _1{}, int64_t{M * N}}
+//         }
+//     };
+
+//     typename DeviceGemm::Arguments arguments(
+//         cutlass::gemm::GemmUniversalMode::kGemm,
+//         {M, N, K},
+//         1,
+//         callback_args,
+//         tensor_a.data_ptr<ElementA>(),
+//         tensor_b.data_ptr<ElementB>(),
+//         nullptr,
+//         nullptr,
+//         int64_t(M) * K,
+//         int64_t(N) * K,
+//         0,
+//         0,
+//         tensor_a.stride(0),
+//         tensor_b.stride(0),
+//         0,
+//         0
+//     );
+
+//     DeviceGemm gemm_op;
+//     auto stream = at::cuda::getCurrentCUDAStream(A.get_device());
+
+//     size_t workspace_size = DeviceGemm::get_workspace_size(arguments);
+//     cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+
+//     auto status = gemm_op.can_implement(arguments);
+//     TORCH_CHECK(status == cutlass::Status::kSuccess, "can_implement failed");
+
+//     status = gemm_op.initialize(arguments, workspace.get(), stream.stream());
+//     TORCH_CHECK(status == cutlass::Status::kSuccess, "initialize failed");
+
+//     status = gemm_op(stream.stream());
+//     TORCH_CHECK(status == cutlass::Status::kSuccess, "run failed");
+
+//     return D;
+// }
+
+torch::Tensor matmul_w8a8_2D_host(
     const torch::Tensor &A,          // int8 [M, K]
     const torch::Tensor &B,          // int8 [N, K]
     const torch::Tensor &alphaRow,    // float [M, 1]
@@ -615,6 +844,49 @@ torch::Tensor matmul_w8a8_host(
     constexpr int kStages = 3;
     return matmul_w8a8<TileShape, WarpShape, kStages>(A, B, alphaRow, alphaCol);
   }
+}
+
+torch::Tensor matmul_w8a8_3D_host(
+    const torch::Tensor &A,          // int8 [batch_size, M, K]
+    const torch::Tensor &B,          // int8 [batch_size, N, K]
+    const torch::Tensor &alphaRow,    // float [batch_size, M]
+    const torch::Tensor &alphaCol   // float [batch_size, N]
+) {
+    auto batch_size = A.size(0);
+    auto M = A.size(1);
+    auto K = A.size(2);
+    auto N = B.size(1);
+
+    TORCH_CHECK(A.is_cuda() && B.is_cuda() &&
+                alphaRow.is_cuda() && alphaCol.is_cuda(),
+                "All tensors must be CUDA tensors");
+    TORCH_CHECK(A.scalar_type() == torch::kInt8, "A must be int8");
+    TORCH_CHECK(B.scalar_type() == torch::kInt8, "B must be int8");
+    TORCH_CHECK(alphaRow.scalar_type() == torch::kFloat32, "alphaRow must be float32");
+    TORCH_CHECK(alphaCol.scalar_type() == torch::kFloat32, "alphaCol must be float32");
+    TORCH_CHECK(A.dim() == 3 && B.dim() == 3, "A and B must be 3D tensors");
+
+    TORCH_CHECK(B.size(0) == batch_size, "B must have same batch size as A");
+    TORCH_CHECK(alphaRow.size(0) == batch_size && alphaRow.size(1) == M,
+                "alphaRow must have shape (batch_size, M)");
+    TORCH_CHECK(alphaCol.size(0) == batch_size && alphaCol.size(1) == N,
+                "alphaCol must have shape (batch_size, N)");
+
+
+    auto D = torch::empty({batch_size, M, N},
+        torch::TensorOptions().device(A.device()).dtype(torch::kBFloat16));
+    for (int i = 0; i < batch_size; ++i) {
+        auto A_i = A.select(0, i);  // (M, K)
+        auto B_i = B.select(0, i);  // (N, K)
+        auto alphaRow_i = alphaRow.select(0, i);
+        auto alphaCol_i = alphaCol.select(0, i);
+
+        auto D_i = matmul_w8a8_2D_host(
+            A_i, B_i, alphaRow_i, alphaCol_i
+        );
+        D.select(0, i).copy_(D_i);
+    }
+    return D;
 }
 
 
