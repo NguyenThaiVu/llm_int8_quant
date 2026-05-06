@@ -78,15 +78,14 @@ class Custom_Linear(nn.Module):
         
 if __name__ == "__main__":
     
-    in_features = 4096
-    out_features = 4096
+    d_model = 8192
     seq_len = 2048
     d_type = torch.bfloat16
     
     # Create random input and weight
-    X = torch.randn(seq_len, in_features, dtype=d_type).cuda()
+    X = torch.randn(seq_len, d_model, dtype=d_type).cuda()
     
-    linear_layer = Custom_Linear(in_features, out_features, max_seq_len=seq_len, dtype=d_type).cuda().to(d_type)
+    linear_layer = Custom_Linear(d_model, d_model, max_seq_len=seq_len, dtype=d_type).cuda().to(d_type)
     
     # Measure bf16 execution time
     bf16_time = measure_time(linear_layer, X, 1.0)

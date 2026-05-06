@@ -1,6 +1,4 @@
 import os 
-from pathlib import Path
-
 import torch
 torch.manual_seed(123)
 import torch.nn as nn
@@ -13,9 +11,9 @@ from tokenizer import Tokenizer
 from utils_model import *
 from utils_weight import load_weights_into_llama    
 from utils_generation import *
-from utils_evaluation import *
 from utils_quant import *
 from utils_model_quan import *
+from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text
 
 
 LLAMA_SIZE_STR = "3B" # "1B" or "3B"
@@ -351,7 +349,7 @@ if __name__ == "__main__":
     MAX_GENERATED_TOKENS = 2000
     PPL_CONTEXT_TOKENS = 2000
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-    EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
+    EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
     list_prompts = ["What is Dragon Ball story?"]
 

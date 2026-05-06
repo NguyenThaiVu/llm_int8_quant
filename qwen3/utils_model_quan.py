@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import gemm_cutlass
 from utils_quant import quantize_row_int8_symmetric_nd, quantize_tensor
 
-MAX_SEQ_LEN = 2048 # 576 or 1040 or 2112
+MAX_SEQ_LEN = 2112 # 576 or 1040 or 2112
 
 class Custom_Linear(nn.Module):
     """
@@ -82,10 +82,9 @@ class Custom_Linear(nn.Module):
         
         
 class Custom_Softmax(nn.Module):
-    def __init__(self, num_heads=1, max_seq_len=1, dim=None):
+    def __init__(self, num_heads=1, dim=None):
         super(Custom_Softmax, self).__init__()
         self.num_heads = num_heads
-        self.max_seq_len = max_seq_len
         
         self.is_quantized = False
         
@@ -98,12 +97,9 @@ class Custom_Softmax(nn.Module):
             out = torch.softmax(x, dim=-1)
             return out, 1.0
         else:          
-            x_int8 = x
-            
+            assert x.dtype == torch.int8, "Expected int8 in quantization mode"
             out_q, scale_out = gemm_cutlass.func_softmax_lastdim_int8_masking(
-                x_int8, scale_x, mask
-            )
-            
+                x, scale_x, mask)
             return out_q, scale_out
     
     def finish_calibration(self):

@@ -56,7 +56,7 @@ class Custom_RoPE(nn.Module):
         
 if __name__ == "__main__":
     seq_len = 2048
-    num_heads = 64
+    num_heads = 16
     head_dim = 128
     
     dtype = torch.bfloat16
@@ -66,6 +66,8 @@ if __name__ == "__main__":
     sin = torch.randn(seq_len, head_dim, dtype=dtype).cuda()
     
     rope_layer = Custom_RoPE(num_heads=num_heads, head_dim=head_dim).cuda().to(dtype)
+    
+    Y_true, _ = rope_layer(X, 1.0, cos, 1.0, sin, 1.0)
     
     bf16_rope_time = measure_time(rope_layer, X, 1.0, cos, 1.0, sin, 1.0)
     print(f"RoPE time (bf16): {bf16_rope_time:.2f} ms")
@@ -80,3 +82,14 @@ if __name__ == "__main__":
                                     cos_int8, scale_cos, \
                                     sin_int8, scale_sin)
     print(f"RoPE time (int8): {int8_rope_time:.2f} ms")
+    
+    Y_int8, scale_out = rope_layer(X_int8, scale_x, \
+                                    cos_int8, scale_cos, \
+                                    sin_int8, scale_sin)
+    Y_deq = Y_int8.float() * scale_out.unsqueeze(-1)
+    Y_deq = Y_deq.to(dtype)
+    
+    max_diff = (Y_true - Y_deq).abs().max().item()
+    mse = ((Y_true - Y_deq).pow(2).mean().item())
+    print(f"Max absolute difference: {max_diff:.6f}")
+    print(f"MSE: {mse:.6f}")

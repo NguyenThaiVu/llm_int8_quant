@@ -35,11 +35,9 @@ class Custom_Silu(nn.Module):
         
 if __name__ == "__main__":
     seq_len = 2048
-    emb_dim = 8192
+    emb_dim = 5120
     d_type = torch.bfloat16
     
-    # =================================================
-    # =============== 2D input silu ================
     X1 = torch.randn(seq_len, emb_dim, dtype=d_type).cuda()
     X2 = torch.randn(seq_len, emb_dim, dtype=d_type).cuda()
     
@@ -47,6 +45,12 @@ if __name__ == "__main__":
     
     bf16_silu_time = measure_time(silu_layer, X1, 1.0, X2, 1.0)
     print(f"Silu time (bf16): {bf16_silu_time:.2f} ms")
+    
+    Y = silu_layer(X1, 1.0, X2, 1.0)
+    
+    # =================================================
+    # Quantization
+    # =================================================
     
     silu_layer.finish_calibration()
     
@@ -56,3 +60,16 @@ if __name__ == "__main__":
     int8_silu_time = measure_time(silu_layer, X1_int8, scale_x1,\
                                     X2_int8, scale_x2)
     print(f"Silu time (int8): {int8_silu_time:.2f} ms")
+    
+    Y_int8, scale_y = silu_layer(X1_int8, scale_x1,\
+                                    X2_int8, scale_x2)
+    Y_deq = Y_int8.float() * scale_y.unsqueeze(-1)
+    Y_deq = Y_deq.to(d_type)
+    
+    max_diff = (Y - Y_deq).abs().max().item()
+    mse = ((Y - Y_deq).pow(2).mean().item())
+    print(f"Max absolute difference: {max_diff:.6f}")
+    print(f"MSE: {mse:.6f}")
+    
+    print(f"Sample output (bf16): {Y[:5, :5]}")
+    print(f"Sample output (int8 dequantized): {Y_deq[:5, :5]}")

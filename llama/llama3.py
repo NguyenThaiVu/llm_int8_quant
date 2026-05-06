@@ -1,6 +1,4 @@
 import os 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-
 from pathlib import Path
 from safetensors.torch import load_file
 
@@ -14,7 +12,7 @@ from config import get_llama_config
 from tokenizer import Tokenizer
 from utils_weight import load_weights_into_llama    
 from utils_generation import *
-from utils_evaluation import *
+from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text
 
 
 LLAMA_SIZE_STR = "3B" # "1B" or "3B"
@@ -99,8 +97,8 @@ print(f"[INFO] Weights loaded successfully.\n")
 # ===============================================
 # 4. Generate Text
 # ===============================================
-MAX_GENERATED_TOKENS = 2000
-PPL_CONTEXT_TOKENS = 2000
+MAX_GENERATED_TOKENS = 1024
+PPL_CONTEXT_TOKENS = 1024
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 

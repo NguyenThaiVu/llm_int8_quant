@@ -24,7 +24,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
 
 if __name__ == "__main__":
     
@@ -35,6 +35,7 @@ if __name__ == "__main__":
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
+
     print(f"Using device: {device}")
     model.to(device);
 
@@ -66,7 +67,8 @@ if __name__ == "__main__":
         weights_file = hf_hub_download(
             repo_id=repo_id,
             filename="model.safetensors",
-            local_dir=local_dir)
+            local_dir=local_dir,
+        )
         weights_dict = load_file(weights_file)
     else:
         repo_dir = snapshot_download(repo_id=repo_id, local_dir=local_dir)
@@ -114,9 +116,9 @@ if __name__ == "__main__":
     # ================================================================
     # 3. Text generation
     # ================================================================
-    MAX_NEW_TOKENS = 2048
-    PPL_CONTEXT_TOKENS = 2048
-    EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
+    MAX_NEW_TOKENS = 2000
+    PPL_CONTEXT_TOKENS = 2000
+    EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
     list_prompt = ["What is the capital of VietNam?",\
@@ -138,15 +140,28 @@ if __name__ == "__main__":
         
     
     # ================================================================
-    # 4. Perplexity evaluation on Wikitext-2
+    # 4. Evaluate Latency
     # ================================================================
-    print(f"[INFO] Start Evaluation... \n")
-
     samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+    samples = tokenizer.encode(samples)
+    chunk_tokens = samples[0: PPL_CONTEXT_TOKENS]
+    input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
+    print(f"[INFO] Shape of input tokens: {input_ids.shape}")
+    
+    with torch.no_grad():
+        out = model(input_ids)
+    print(f"[INFO] Shape of output tokens: {out.shape}")
+        
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+        with torch.no_grad():
+            out_ids = model(input_ids)
 
-    ppl = compute_ppl_single_text(model,
-                                tokenizer, 
-                                samples,
-                                context_size=PPL_CONTEXT_TOKENS,
-                                stride=PPL_STRIDE)
-    print(f"\nPPL: {ppl} \n")
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))

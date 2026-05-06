@@ -27,7 +27,8 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
+
 
 class Custom_GroupedQueryAttention(nn.Module):
     def __init__(
@@ -56,7 +57,7 @@ class Custom_GroupedQueryAttention(nn.Module):
         self.query_rope = Custom_RoPE(num_heads, max_seq_len=MAX_SEQ_LEN, head_dim=head_dim).to(dtype)
         self.key_rope = Custom_RoPE(num_kv_groups, max_seq_len=MAX_SEQ_LEN, head_dim=head_dim).to(dtype)
         
-        self.softmax_layer = Custom_Softmax(num_heads=num_heads).to(dtype)    
+        self.softmax_layer = Custom_Softmax(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)    
         self.qk_score_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)
         self.context_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN,\
             is_return_float=True).to(dtype)
@@ -242,8 +243,18 @@ class TransformerBlock_Quant(nn.Module):
         # Shortcut connection for feed-forward block
         shortcut = x
         
-        x = self.norm2(x)
-        x, _ = self.ff(x, 1.0)
+        if self.is_quantized == False:
+            
+            x = self.norm2(x)
+            
+            x, _ = self.ff(x, 1.0)
+        
+        else:
+            
+            x, scale_x = self.norm2(x)
+            
+            x, _ = self.ff(x, scale_x)
+            
         
         x = x + shortcut  
 
@@ -253,11 +264,11 @@ class TransformerBlock_Quant(nn.Module):
         self.att.finish_calibration()
         self.norm1.finish_calibration()
         
-        # self.ff.finish_calibration()
+        self.ff.finish_calibration()
         
-        # self.norm2.finish_calibration()
-        # smooth_scale = self.ff.fc1.smooth_alpha
-        # self.norm2.enable_smooth_scale(smooth_scale)
+        self.norm2.finish_calibration()
+        smooth_scale = self.ff.fc1.smooth_alpha
+        self.norm2.enable_smooth_scale(smooth_scale)
         
         self.is_quantized = True
 
@@ -334,7 +345,8 @@ if __name__ == "__main__":
         weights_file = hf_hub_download(
             repo_id=repo_id,
             filename="model.safetensors",
-            local_dir=local_dir)
+            local_dir=local_dir,
+        )
         weights_dict = load_file(weights_file)
     else:
         repo_dir = snapshot_download(repo_id=repo_id, local_dir=local_dir)
@@ -380,83 +392,41 @@ if __name__ == "__main__":
             add_thinking=False)
 
     # ================================================================
-    # 3. Text generation
+    # 3. Measure latency
     # ================================================================
-    MAX_NEW_TOKENS = 2048
-    PPL_CONTEXT_TOKENS = 2048
-    EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
+    MAX_NEW_TOKENS = 2000
+    PPL_CONTEXT_TOKENS = 2000
+    EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
-    list_prompts = ["What is the capital of VietNam?",\
-                    "What is the Dragon Ball story?"]
-
-    for idx, prompt in enumerate(list_prompts):
-        input_token_ids = tokenizer.encode(prompt)
-        input_token_ids_tensor = torch.tensor(input_token_ids, device=device)
-
-        generated_text = func_generate_text(
-            model=model,
-            token_ids=input_token_ids_tensor,
-            max_new_tokens=MAX_NEW_TOKENS,
-            eos_token_id=tokenizer.eos_token_id
-        )
-
-        response = get_clean_generated_text(generated_text, tokenizer)
-        print(f"{idx}. Generated response: {response} \n")
-        
-    # ================================================================
-    # 4. Quantization
-    # ================================================================
-
-    print("\nCollecting calibration for quantization...")
-    calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=100_000)
-    calibrate_tokens = tokenizer.encode(calibrate_samples)
-    print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
-            
-    for i in range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE):
-        chunk_tokens = calibrate_tokens[i:i + PPL_CONTEXT_TOKENS]
-
-        input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
-
-        with torch.no_grad():
-            _ = model(input_ids)
-            
     model.finish_calibration()
-    print(f"[INFO] Finished calibration.")
-
-
-    # ========================================================================
-    # Quantization mode
-    print("\n===== Generated text after quantization: =====\n")
-    list_prompts = ["What is the capital of VietNam?",\
-                    "What is the Dragon Ball story?"]
-
     
-    for idx, prompt in enumerate(list_prompts):
-        input_token_ids = tokenizer.encode(prompt)
-        input_token_ids_tensor = torch.tensor(input_token_ids, device=device)
+    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,\
+                                        split='train') 
+    samples = tokenizer.encode(samples)
 
-        generated_text = func_generate_text(
-            model=model,
-            token_ids=input_token_ids_tensor,
-            max_new_tokens=MAX_NEW_TOKENS,
-            eos_token_id=tokenizer.eos_token_id
-        )
+    chunk_tokens = samples[0: PPL_CONTEXT_TOKENS]
 
-        response = get_clean_generated_text(generated_text, tokenizer)
-        print(f"{idx}. Generated response: {response} \n")
+    input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
+    print(f"[INFO] Input tokens: {input_ids.shape}")
 
-    # ================================================================
-    # 5. Perplexity evaluation on Wikitext-2
-    # ================================================================
-    print(f"[INFO] Start Evaluation... \n")
+    # Warm-up runs
+    with torch.no_grad():
+        out_ids = model(input_ids)
+    print(f"[INFO] Output tokens: {out_ids.shape}")
+    
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+        with torch.no_grad():
+            out_ids = model(input_ids)
 
-    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
-
-    ppl = compute_ppl_single_text(model,
-                                tokenizer,
-                                samples,
-                                context_size=PPL_CONTEXT_TOKENS,
-                                stride=PPL_STRIDE)
-    print(f"\nPPL: {ppl} \n")
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=50))
+    print()
+    
