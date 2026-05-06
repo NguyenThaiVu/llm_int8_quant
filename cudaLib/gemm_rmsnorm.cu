@@ -485,15 +485,15 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_cuda(
 
 /*
 This function has the same computation as rmsnorm_int8_kernel, 
-except that it uses shared memory to store intermediate results.
+except that it EXPLICITLY uses shared memory to store intermediate results.
 */
 template <typename T>
 __global__ void rmsnorm_int8_shared_kernel(
     const int8_t* __restrict__ x_int8,
-    const float* __restrict__ scale_x,
-    const T* __restrict__ gamma,
-    int8_t* __restrict__ y_int8,
-    float* __restrict__ scale_y,
+    const float*  __restrict__ scale_x,
+    const T*      __restrict__ gamma,
+    int8_t*       __restrict__ y_int8,
+    float*        __restrict__ scale_y,
     int d_model,
     float eps
 ) {
@@ -502,69 +502,112 @@ __global__ void rmsnorm_int8_shared_kernel(
 
     int row_offset = row * d_model;
 
-    extern __shared__ float x_fp_s[];
+    extern __shared__ float smem[];
+
+    float* x_fp_s = smem;              // [d_model]
+    float* red_s  = smem + d_model;    // [blockDim.x]
+
+    __shared__ float shared_rms_inv;
+    __shared__ float shared_scale_y;
 
     float sx = scale_x[row];
 
-    // -----------------------------
-    // 1. Dequantize X_int8 -> X_fp
-    // -----------------------------
+    // --------------------------------------------------
+    // 1. Dequantize x_int8 -> x_fp_s
+    //    Also compute local sum of squares
+    // --------------------------------------------------
     float local_sum_sq = 0.0f;
 
     for (int i = tid; i < d_model; i += blockDim.x) {
         float x_fp = static_cast<float>(x_int8[row_offset + i]) * sx;
+
         x_fp_s[i] = x_fp;
+
         local_sum_sq += x_fp * x_fp;
     }
 
     __syncthreads();
 
-    // -----------------------------
-    // 2. Compute RMSNorm scale
-    // -----------------------------
-    float sum_sq = block_reduce_sum(local_sum_sq);
-    __shared__ float shared_sum_sq;
-    if (tid == 0) {
-        shared_sum_sq = sum_sq;
-    }
+    // --------------------------------------------------
+    // 2. Explicit shared-memory reduction for sum_sq
+    // --------------------------------------------------
+    red_s[tid] = local_sum_sq;
     __syncthreads();
 
-    float mean_sq = shared_sum_sq / static_cast<float>(d_model);
-    float rms_inv = rsqrtf(mean_sq + eps);
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            red_s[tid] += red_s[tid + stride];
+        }
+        __syncthreads();
+    }
 
-    // -----------------------------
-    // 3. Compute Y_fp and find absmax
-    // -----------------------------
+    if (tid == 0) {
+        float sum_sq = red_s[0];
+        float mean_sq = sum_sq / static_cast<float>(d_model);
+
+        shared_rms_inv = rsqrtf(mean_sq + eps);
+    }
+
+    __syncthreads();
+
+    float rms_inv = shared_rms_inv;
+
+    // --------------------------------------------------
+    // 3. Compute y_fp and local absmax
+    // --------------------------------------------------
     float local_absmax = 0.0f;
 
     for (int i = tid; i < d_model; i += blockDim.x) {
-        float y_fp = x_fp_s[i] * rms_inv * gamma[i];
-        x_fp_s[i] = y_fp;  // reuse shared memory to store Y_fp
+        float g = static_cast<float>(gamma[i]);
+
+        float y_fp = x_fp_s[i] * rms_inv * g;
+
+        x_fp_s[i] = y_fp;  // reuse x_fp_s for y_fp
+
         local_absmax = fmaxf(local_absmax, fabsf(y_fp));
     }
+
     __syncthreads();
 
-    float absmax = block_reduce_max(local_absmax);
+    // --------------------------------------------------
+    // 4. Explicit shared-memory reduction for absmax
+    // --------------------------------------------------
+    red_s[tid] = local_absmax;
+    __syncthreads();
 
-    __shared__ float shared_scale_y;
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            red_s[tid] = fmaxf(red_s[tid], red_s[tid + stride]);
+        }
+        __syncthreads();
+    }
 
     if (tid == 0) {
-        float sy = (absmax > 0.0f && isfinite(absmax)) ? absmax / 127.0f : 1.0f;
+        float absmax = red_s[0];
+
+        float sy = (absmax > 0.0f && isfinite(absmax))
+                 ? absmax / 127.0f
+                 : 1.0f;
+
         shared_scale_y = sy;
         scale_y[row] = sy;
     }
+
     __syncthreads();
 
     float inv_sy = 1.0f / shared_scale_y;
 
-    // -----------------------------
-    // 4. Quantize Y_fp -> Y_int8
-    // -----------------------------
+    // --------------------------------------------------
+    // 5. Quantize y_fp -> y_int8
+    // --------------------------------------------------
     for (int i = tid; i < d_model; i += blockDim.x) {
         float y_fp = x_fp_s[i];
 
         float qf = y_fp * inv_sy;
-        if (!isfinite(qf)) qf = 0.0f;
+
+        if (!isfinite(qf)) {
+            qf = 0.0f;
+        }
 
         int q = __float2int_rn(qf);
         q = max(-127, min(127, q));
@@ -622,7 +665,7 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_shared_cuda(
 
     dim3 block(threads);
     dim3 grid((unsigned)n_rows);
-    size_t shmem_bytes = d_model * sizeof(float);
+    size_t shmem_bytes = (d_model + threads) * sizeof(float);
     auto stream = at::cuda::getCurrentCUDAStream();
 
     AT_DISPATCH_SWITCH(

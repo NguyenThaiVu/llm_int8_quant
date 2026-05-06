@@ -22,7 +22,9 @@ class Custom_RMSNorm(torch.nn.Module):
     
     def forward(self, x, scale_x):
         if self.is_quantized == False:
+            print(f"Input to PyTorch RMSNorm: {x.shape}, dtype={x.dtype}")
             y = F.rms_norm(x, self.norm_shape, self.weight, eps=self.eps)
+            print(f"Output from PyTorch RMSNorm: {y.shape}, dtype={y.dtype}")
             return y, 1.0
         else:
             x_int8, scale_x = gemm_cutlass.func_rmsnorm_int8(x, scale_x, self.weight, self.eps)

@@ -25,6 +25,7 @@
 #include "gemm_rope.cu"
 #include "gemm_matmul.cu"
 #include "gemm_rmsnorm.cu"
+#include "gemm_layernorm.cu"
 #include "gemm_activation.cu"
 #include "gemm_matrix_utils.cu"
 
@@ -100,6 +101,17 @@ std::tuple<torch::Tensor, torch::Tensor> func_rmsnorm_shared_int8(
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     return rmsnorm_int8_shared_cuda(x, scale_x, gamma, eps);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> func_layernorm_int8_shared(
+    torch::Tensor x,      // INT8, shape (tokens, d_model)
+    torch::Tensor scale_x,
+    torch::Tensor gamma,  // FP32, shape (d_model,)
+    torch::Tensor beta,   // FP32, shape (d_model,)
+    float eps) 
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    return layernorm_int8_shared_cuda(x, scale_x, gamma, beta, eps);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> func_apply_rope_int8(
@@ -231,7 +243,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("func_rmsnorm_shared_int8",
         &func_rmsnorm_shared_int8,
-        "RMSNorm for int8 input with float32 gamma and input scale, using shared memory for reduction");
+        "RMSNorm for int8 input with float32 gamma and input scale, EXPLICITLY using shared memory for reduction");
+
+    m.def("func_layernorm_int8_shared",
+        &func_layernorm_int8_shared,
+        "LayerNorm for int8 input with float32 gamma and beta, EXPLICITLY using shared memory for reduction");
 
     m.def("func_apply_rope_int8",
         &func_apply_rope_int8,

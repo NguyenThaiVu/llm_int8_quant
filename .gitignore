@@ -10,3 +10,6 @@ llama/Llama-3.2-3B-Instruct
 
 *.so
 *.ncu-rep
+
+build/
+*/build/
