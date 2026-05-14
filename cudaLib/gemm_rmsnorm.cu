@@ -104,7 +104,7 @@ torch::Tensor rmsnorm_cuda(torch::Tensor x, torch::Tensor gamma, float eps) {
     int64_t num_tokens = x.size(0);
     int64_t d_model = x.size(1);
 
-    int threads = (int)std::min<int64_t>(d_model, 512);
+    int threads = (int)std::min<int64_t>(d_model, 256);
     if (threads & (threads - 1)) {
         int p = 1;
         while ((p << 1) <= threads) p <<= 1;
@@ -436,7 +436,7 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_cuda(
     auto scale_y = torch::empty({n_rows}, x_contig.options().dtype(torch::kFloat32));
 
     // Determine block and grid sizes
-    int threads = (int)std::min<int64_t>(d_model, 512);
+    int threads = (int)std::min<int64_t>(d_model, 256);
     if (threads & (threads - 1)) {
         int p = 1;
         while ((p << 1) <= threads) p <<= 1;
@@ -446,7 +446,6 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_cuda(
 
     dim3 block(threads);
     dim3 grid((unsigned)n_rows);
-    // size_t shmem_bytes = 2 * threads * sizeof(float);
     size_t shmem_bytes = 0; 
     auto stream = at::cuda::getCurrentCUDAStream();
 

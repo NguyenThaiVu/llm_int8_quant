@@ -236,7 +236,6 @@ torch::Tensor int8_matmul_host(
 // - Output Scale: float - (M,)
 // - Output: INT8 - (M, N)
 // ================================================================
-
 template<int Vec>
 __global__ void dynamic_three_scale_quantize_kernel(
     const cutlass::bfloat16_t* __restrict__ input,   // (M, N)
@@ -315,8 +314,9 @@ std::tuple<torch::Tensor, torch::Tensor> int8_matmul_out_int8_three_scale_host(
     constexpr int Vec = 4;
     int threads = 256;
     int blocks = M; 
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    dynamic_three_scale_quantize_kernel<Vec><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+    dynamic_three_scale_quantize_kernel<Vec><<<blocks, threads, 0, stream>>>(
         reinterpret_cast<cutlass::bfloat16_t*>(bf16_out.data_ptr<torch::BFloat16>()),
         row_scale.data_ptr<float>(),
         col_scale.data_ptr<float>(),
@@ -634,179 +634,6 @@ torch::Tensor matmul_w8a8(
     }
     return D_full;
 }
-
-// template <typename TileShape, typename WarpShape, int kStages>
-// torch::Tensor matmul_w8a8(
-//     const torch::Tensor &A,         // int8 [M, K]
-//     const torch::Tensor &B,         // int8 [N, K]
-//     const torch::Tensor &alphaRow,  // float [M, 1]
-//     const torch::Tensor &alphaCol   // float [1, N]
-// ) {
-//     TORCH_CHECK(A.is_cuda() && B.is_cuda() 
-//                 && alphaRow.is_cuda() && alphaCol.is_cuda());
-//     TORCH_CHECK(A.scalar_type() == torch::kInt8, "A must be int8");
-//     TORCH_CHECK(B.scalar_type() == torch::kInt8, "B must be int8");
-//     TORCH_CHECK(alphaCol.scalar_type() == torch::kFloat32, 
-//                 "alphaCol must be float32");
-//     TORCH_CHECK(alphaRow.scalar_type() == torch::kFloat32, 
-//                 "alphaRow must be float32");
-//     TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "A and B must be 2D");
-//     TORCH_CHECK(alphaRow.numel() == A.size(0), "alphaRow must have M elements");
-//     TORCH_CHECK(alphaCol.numel() == B.size(0), "alphaCol must have N elements");
-
-//     int32_t M = A.size(0);
-//     int32_t N = B.size(0);
-//     int32_t K = A.size(1);
-
-//     TORCH_CHECK(B.size(1) == K, "B must have shape (N, K)");
-
-//     int64_t K_gemm = ((K + 31) / 32) * 32;  // pad K to multiple of 32 for int8 Tensor Cores
-
-
-//     auto tensor_a  = A.contiguous();
-//     auto tensor_b  = B.contiguous();
-//     auto tensor_v1 = alphaRow.contiguous();
-//     auto tensor_v2 = alphaCol.contiguous();
-
-//     auto D = torch::empty({M, N},
-//         torch::TensorOptions().device(A.device()).dtype(torch::kBFloat16));
-
-//     using ElementA = int8_t;
-//     using ElementB = int8_t;
-//     using ElementScale = float;
-//     using ElementC = cutlass::bfloat16_t;
-//     using ElementOutput = cutlass::bfloat16_t;
-//     using ElementAccumulator = int32_t;
-//     using ElementCompute = float;
-
-//     using LayoutA = cutlass::layout::RowMajor;
-//     using LayoutB = cutlass::layout::ColumnMajor;
-//     using LayoutC = cutlass::layout::RowMajor;
-
-//     constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
-//     constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
-//     constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
-
-//     constexpr int EVTEpilogueStages = 1;
-
-//     using namespace cute;
-
-//     using OutputTileThreadMap =
-//         cutlass::epilogue::threadblock::OutputTileThreadLayout<
-//             TileShape, WarpShape, ElementC, AlignmentC, EVTEpilogueStages>;
-
-//     using Accum = cutlass::epilogue::threadblock::VisitorAccFetch;
-
-//     using V1Broadcast =
-//         cutlass::epilogue::threadblock::VisitorColBroadcast<
-//             OutputTileThreadMap, ElementScale,
-//             cute::Stride<_1, _0, int32_t>>;
-
-//     using V2Broadcast =
-//         cutlass::epilogue::threadblock::VisitorRowBroadcast<
-//             OutputTileThreadMap, ElementScale,
-//             cute::Stride<_0, _1, int32_t>>;
-
-//     using Compute0 =
-//         cutlass::epilogue::threadblock::VisitorCompute<
-//             cutlass::multiplies, ElementCompute, ElementCompute,
-//             cutlass::FloatRoundStyle::round_to_nearest>;
-
-//     using EVTCompute0 =
-//         cutlass::epilogue::threadblock::Sm80EVT<
-//             Compute0, Accum, V1Broadcast>;
-
-//     using Compute1 =
-//         cutlass::epilogue::threadblock::VisitorCompute<
-//             cutlass::multiplies, ElementCompute, ElementCompute,
-//             cutlass::FloatRoundStyle::round_to_nearest>;
-
-//     using EVTCompute1 =
-//         cutlass::epilogue::threadblock::Sm80EVT<
-//             Compute1, EVTCompute0, V2Broadcast>;
-
-//     using StoreD =
-//         cutlass::epilogue::threadblock::VisitorAuxStore<
-//             OutputTileThreadMap, ElementOutput,
-//             cutlass::FloatRoundStyle::round_to_nearest,
-//             cute::Stride<int64_t, _1, int64_t>>;
-
-//     using EVTD =
-//         cutlass::epilogue::threadblock::Sm80EVT<StoreD, EVTCompute1>;
-
-//     using Kernel =
-//         typename cutlass::gemm::kernel::DefaultGemmWithVisitor<
-//             ElementA, LayoutA, cutlass::ComplexTransform::kNone, AlignmentA,
-//             ElementB, LayoutB, cutlass::ComplexTransform::kNone, AlignmentB,
-//             ElementC, LayoutC, AlignmentC,
-//             ElementAccumulator,
-//             ElementCompute,
-//             cutlass::arch::OpClassTensorOp,
-//             cutlass::arch::Sm80,
-//             TileShape,
-//             WarpShape,
-//             cutlass::gemm::GemmShape<16, 8, 32>,
-//             EVTD,
-//             cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
-//             kStages,
-//             cutlass::arch::OpMultiplyAddSaturate,
-//             EVTEpilogueStages
-//         >::GemmKernel;
-
-//     using DeviceGemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
-
-//     typename EVTD::Arguments callback_args{
-//         {
-//             {
-//                 {},
-//                 {tensor_v1.data_ptr<float>(), ElementScale(0), {_1{}, _0{}, int32_t(M)}},
-//                 {}
-//             },
-//             {tensor_v2.data_ptr<float>(), ElementScale(0), {_0{}, _1{}, int32_t(N)}},
-//             {}
-//         },
-//         {
-//             reinterpret_cast<ElementOutput*>(D.data_ptr<at::BFloat16>()),
-//             {int64_t{N}, _1{}, int64_t{M * N}}
-//         }
-//     };
-
-//     typename DeviceGemm::Arguments arguments(
-//         cutlass::gemm::GemmUniversalMode::kGemm,
-//         {M, N, K},
-//         1,
-//         callback_args,
-//         tensor_a.data_ptr<ElementA>(),
-//         tensor_b.data_ptr<ElementB>(),
-//         nullptr,
-//         nullptr,
-//         int64_t(M) * K,
-//         int64_t(N) * K,
-//         0,
-//         0,
-//         tensor_a.stride(0),
-//         tensor_b.stride(0),
-//         0,
-//         0
-//     );
-
-//     DeviceGemm gemm_op;
-//     auto stream = at::cuda::getCurrentCUDAStream(A.get_device());
-
-//     size_t workspace_size = DeviceGemm::get_workspace_size(arguments);
-//     cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-
-//     auto status = gemm_op.can_implement(arguments);
-//     TORCH_CHECK(status == cutlass::Status::kSuccess, "can_implement failed");
-
-//     status = gemm_op.initialize(arguments, workspace.get(), stream.stream());
-//     TORCH_CHECK(status == cutlass::Status::kSuccess, "initialize failed");
-
-//     status = gemm_op(stream.stream());
-//     TORCH_CHECK(status == cutlass::Status::kSuccess, "run failed");
-
-//     return D;
-// }
 
 torch::Tensor matmul_w8a8_2D_host(
     const torch::Tensor &A,          // int8 [M, K]

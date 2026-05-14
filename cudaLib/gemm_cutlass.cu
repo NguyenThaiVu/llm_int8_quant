@@ -45,14 +45,27 @@ torch::Tensor func_int8_matmul(
   return int8_matmul_host(input, weight, alpha);
 }
 
+torch::Tensor func_bf16_softmax(
+    torch::Tensor x          // BF16
+) {
+  const at::cuda::OptionalCUDAGuard device_guard(x.device());
+  return softmax_bf16_cuda(x);
+}
 
-torch::Tensor func_softmax_lastdim_int8(
+std::tuple<torch::Tensor, torch::Tensor> func_softmax_int8(
     torch::Tensor x_q,          // int8
-    torch::Tensor scale_x,      // float32, length dim0*dim1
-    torch::Tensor scale_y       // float32, length dim0*dim1
+    torch::Tensor scale_x      // float32, length dim0*dim1
 ) {
   const at::cuda::OptionalCUDAGuard device_guard(x_q.device());
-  return softmax_lastdim_int8_cuda(x_q, scale_x, scale_y);
+  return softmax_int8_cuda(x_q, scale_x);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> func_softmax_int8_shared(
+    torch::Tensor x_q,          // int8, shape (dim0, dim1, dim2)
+    torch::Tensor scale_x      // float32, shape (dim0, dim1) 
+) {
+  const at::cuda::OptionalCUDAGuard device_guard(x_q.device());
+  return softmax_int8_explicit_shared_cuda(x_q, scale_x);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> func_softmax_lastdim_int8_masking(
@@ -101,6 +114,17 @@ std::tuple<torch::Tensor, torch::Tensor> func_rmsnorm_shared_int8(
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     return rmsnorm_int8_shared_cuda(x, scale_x, gamma, eps);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> func_layernorm_int8(
+    torch::Tensor x,      // INT8, shape (tokens, d_model)
+    torch::Tensor scale_x,
+    torch::Tensor gamma,  // FP32, shape (d_model,)
+    torch::Tensor beta,   // FP32, shape (d_model,)
+    float eps) 
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    return layernorm_int8_cuda(x, scale_x, gamma, beta, eps);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> func_layernorm_int8_shared(
@@ -221,9 +245,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &func_int8_matmul,
         "Int8 MatMul using CUTLASS (INT8 input/weight, BFloat16 output)");
 
-    m.def("func_softmax_lastdim_int8",
-        &func_softmax_lastdim_int8,
-        "Softmax along last dimension for 3D int8 with per-row scale");
+    m.def("func_bf16_softmax",
+        &func_bf16_softmax,
+        "Softmax along last dimension for BF16 tensor");
+
+    m.def("func_softmax_int8",
+        &func_softmax_int8,
+        "Softmax along last dimension for int8 with per-row scale");
+
+    m.def("func_softmax_int8_shared",
+        &func_softmax_int8_shared,
+        "Softmax along last dimension for int8 with per-row scale, EXPLICITLY using shared memory for reduction");
 
     m.def("func_softmax_lastdim_int8_masking",
         &func_softmax_lastdim_int8_masking,
@@ -244,6 +276,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_rmsnorm_shared_int8",
         &func_rmsnorm_shared_int8,
         "RMSNorm for int8 input with float32 gamma and input scale, EXPLICITLY using shared memory for reduction");
+
+    m.def("func_layernorm_int8",
+        &func_layernorm_int8,
+        "LayerNorm for int8 input with float32 gamma and beta, using global memory for reduction");
 
     m.def("func_layernorm_int8_shared",
         &func_layernorm_int8_shared,

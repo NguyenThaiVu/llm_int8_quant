@@ -2,4 +2,4 @@
   --kernel-name rmsnorm_int8_kernel \
   --set full \
   -o report_rmsnorm_int8 \
-  python compare_rmsnorm.py
+  python profile_rmsnorm_bf16_int8.py

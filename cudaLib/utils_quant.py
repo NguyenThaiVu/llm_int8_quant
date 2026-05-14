@@ -78,7 +78,7 @@ def measure_time(func, *args, repeat=100):
     float: Average execution time in milliseconds.
     """
     # warm-up
-    for _ in range(10):
+    for _ in range(5):
         func(*args)
 
     torch.cuda.synchronize()
