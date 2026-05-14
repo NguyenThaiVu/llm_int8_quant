@@ -6,6 +6,7 @@ kernel with:
 """
 
 import os 
+import time
 import math
 import numpy as np
 import torch
@@ -36,9 +37,9 @@ if __name__ == "__main__":
     # N = 4096
     # K = 1024 * 6
     dtype = torch.bfloat16
-    list_M = [2048, 2048, 4096, 4096, 8192, 8192, 12288]
-    list_N = [2048, 4096, 4096, 8192, 8192, 12288, 12288]
-    list_K = [2048, 4096, 4096, 8192, 8192, 12288, 12288]
+    list_M = [2048, 2048, 4096, 4096, 8192]
+    list_N = [2048, 4096, 4096, 8192, 8192]
+    list_K = [2048, 4096, 4096, 8192, 8192]
     
     for (M, N, K) in zip(list_M, list_N, list_K):
         print(f"\n\nTesting matmul with M={M}, N={N}, K={K}")
@@ -61,9 +62,8 @@ if __name__ == "__main__":
         row_scale = scale_X / scale_Y
         
         # 2. bitsandbytes INT8 matmul
-        Y_bf16_bnb = bnb_int8_and_dequantize(X_int8, W_int8, scale_X, scale_W)
         time_bnb = measure_time(bnb_int8_and_dequantize, X_int8, W_int8, scale_X, scale_W)
-        print(f"bitsandbytes INT8 matmul latency: {time_bnb:.2f} ms")
+        print(f"bitsandbytes INT8 matmul (FP16 output) latency: {time_bnb:.2f} ms")
         
         time_bnb_int32 = measure_time(int8_linear_matmul, X_int8, W_int8)
         print(f"bitsandbytes INT8 matmul (INT32 output) latency: {time_bnb_int32:.2f} ms")
@@ -78,9 +78,15 @@ if __name__ == "__main__":
         time_int8 = measure_time(gemm_cutlass.func_w8a8o8_matmul, X_int8, W_int8, row_scale, scale_W)
         print(f"Custom INT8 matmul latency: {time_int8:.2f} ms")
         print(f"Speedup over Pytorch BF16: {time_torch / time_int8:.2f}x")
-        print(f"Speedup over bitsandbytes INT8: {time_bnb / time_int8:.2f}x")
+        print(f"Speedup over bitsandbytes INT8 (FP16 output): {time_bnb / time_int8:.2f}x")
         print(f"Speedup over bitsandbytes INT8 (INT32 output): {time_bnb_int32 / time_int8:.2f}x")
         print(f"Speedup over Torch INT8: {time_torch_int8 / time_int8:.2f}x")
+        
+        # Clear cache
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        time.sleep(1) 
+        
 
 
         
