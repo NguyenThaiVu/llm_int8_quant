@@ -16,7 +16,7 @@ from utils_model_quan import *
 from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text
 
 
-LLAMA_SIZE_STR = "3B" # "1B" or "3B"
+LLAMA_SIZE_STR = "1B" # "1B" or "3B"
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
 
 MODEL_FOLDER = f"Llama-3.2-{LLAMA_SIZE_STR}-Instruct"
@@ -346,10 +346,10 @@ if __name__ == "__main__":
     # ===============================================
     # 4. Generate Text
     # ===============================================
-    MAX_GENERATED_TOKENS = 2000
-    PPL_CONTEXT_TOKENS = 2000
+    MAX_GENERATED_TOKENS = 1024
+    PPL_CONTEXT_TOKENS = 1024
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-    EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
+    EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
 
     list_prompts = ["What is Dragon Ball story?"]
 
@@ -380,7 +380,7 @@ if __name__ == "__main__":
 
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=50_000)
+                                                    split="train", n=100_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             

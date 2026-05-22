@@ -27,7 +27,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
 
 class Custom_GroupedQueryAttention(nn.Module):
     def __init__(
@@ -242,8 +242,16 @@ class TransformerBlock_Quant(nn.Module):
         # Shortcut connection for feed-forward block
         shortcut = x
         
-        x = self.norm2(x)
-        x, _ = self.ff(x, 1.0)
+        # x = self.norm2(x)
+        # x, _ = self.ff(x, 1.0)
+        
+        if self.is_quantized == False:
+            x = self.norm2(x)
+            x, _ = self.ff(x, 1.0)
+        
+        else:
+            x, scale_x = self.norm2(x)
+            x, _ = self.ff(x, scale_x)
         
         x = x + shortcut  
 
@@ -253,11 +261,11 @@ class TransformerBlock_Quant(nn.Module):
         self.att.finish_calibration()
         self.norm1.finish_calibration()
         
-        # self.ff.finish_calibration()
+        self.ff.finish_calibration()
         
-        # self.norm2.finish_calibration()
-        # smooth_scale = self.ff.fc1.smooth_alpha
-        # self.norm2.enable_smooth_scale(smooth_scale)
+        self.norm2.finish_calibration()
+        smooth_scale = self.ff.fc1.smooth_alpha
+        self.norm2.enable_smooth_scale(smooth_scale)
         
         self.is_quantized = True
 
@@ -410,7 +418,7 @@ if __name__ == "__main__":
 
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=100_000)
+                                                    split="train", n=200_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             

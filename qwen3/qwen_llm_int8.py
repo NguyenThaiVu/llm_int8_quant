@@ -13,6 +13,9 @@ import json
 from safetensors.torch import load_file
 from huggingface_hub import hf_hub_download, snapshot_download
 
+import bitsandbytes as bnb
+from bitsandbytes.nn import Linear8bitLt
+
 from utils_tokenizer import Qwen3Tokenizer
 from config import get_model_config, load_weights_into_qwen
 from utils_model import *
@@ -24,7 +27,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
 
 if __name__ == "__main__":
     
@@ -37,8 +40,6 @@ if __name__ == "__main__":
         device = torch.device("cpu")
     print(f"Using device: {device}")
     model.to(device);
-
-            
 
     if USE_REASONING_MODEL or USE_INSTRUCT_MODEL:
         repo_id = f"Qwen/Qwen3-{CHOOSE_MODEL}"
@@ -114,8 +115,8 @@ if __name__ == "__main__":
     # ================================================================
     # 3. Text generation
     # ================================================================
-    MAX_NEW_TOKENS = 1024
-    PPL_CONTEXT_TOKENS = 1024
+    MAX_NEW_TOKENS = 2048
+    PPL_CONTEXT_TOKENS = 2048
     EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
@@ -136,17 +137,97 @@ if __name__ == "__main__":
         response = get_clean_generated_text(generated_text, tokenizer)
         print(f"{idx}. Generated response: {response} \n")
         
+    # ================================================================
+    # 4. Quantization to LLM.int8() format and evaluation
+    # ================================================================
+    def convert_linear_to_llm_int8(module, threshold=6.0, skip_names=()):
+        for name, child in list(module.named_children()):
+            if name in skip_names:
+                continue
+
+            if isinstance(child, nn.Linear):
+                int8_linear = bnb.nn.Linear8bitLt(
+                    child.in_features,
+                    child.out_features,
+                    bias=child.bias is not None,
+                    has_fp16_weights=False,
+                    threshold=threshold,
+                )
+
+                int8_linear.weight.data = child.weight.data.clone()
+
+                if child.bias is not None:
+                    int8_linear.bias.data = child.bias.data.clone()
+
+                setattr(module, name, int8_linear)
+            else:
+                convert_linear_to_llm_int8(child, threshold, skip_names)
+
+        return module
     
-    # ================================================================
-    # 4. Perplexity evaluation on Wikitext-2
-    # ================================================================
-    print(f"[INFO] Start Evaluation... \n")
+    model = model.cpu() # Move model to CPU for quantization
+    int8_model = convert_linear_to_llm_int8(model, threshold=6.0)
+    int8_model = int8_model.to(0) # Quantization happens here
+    print(f"\n[INFO] Model converted to LLM.int8() format successfully.\n")
+    print(f"Sample Weight after quantization: {int8_model.trf_blocks[0].att.W_query.weight.data[:5, :5]}")
+
+    for idx, prompt in enumerate(list_prompt):
+        input_token_ids = tokenizer.encode(prompt)
+        input_token_ids_tensor = torch.tensor(input_token_ids, device=device)
+
+        generated_text = func_generate_text(
+            model=int8_model,
+            token_ids=input_token_ids_tensor,
+            max_new_tokens=MAX_NEW_TOKENS,
+            eos_token_id=tokenizer.eos_token_id
+        )
+
+        response = get_clean_generated_text(generated_text, tokenizer)
+        print(f"{idx}. Generated response: {response} \n")
+        
+    # # ================================================
+    # # Evaluation
+    # # ===============================================
 
     samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
 
-    ppl = compute_ppl_single_text(model,
+    ppl = compute_ppl_single_text(int8_model,
                                 tokenizer, 
                                 samples,
                                 context_size=PPL_CONTEXT_TOKENS,
                                 stride=PPL_STRIDE)
-    print(f"\nPPL: {ppl} \n")
+    print(f"\nPPL (LLM.int() technique): {ppl} \n")
+
+
+    # =================================================
+    # Measure Latency 
+    # =================================================
+
+    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+    samples = tokenizer.encode(samples)
+
+    chunk_tokens = samples[0: PPL_CONTEXT_TOKENS]
+
+    input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
+    print(f"[INFO] Input tokens: {input_ids.shape}")
+
+    with torch.no_grad():
+        out_ids = int8_model(input_ids)
+    print(f"[INFO] Output tokens: {out_ids.shape}")
+        
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+        with torch.no_grad():
+            out_ids = int8_model(input_ids)
+
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
+    
+    
+    

@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import gemm_cutlass
 from utils_quant import quantize_row_int8_symmetric_nd, quantize_tensor
 
-MAX_SEQ_LEN = 2048 # 576 or 1040 or 2112
+MAX_SEQ_LEN = 2112 # 576 or 1040 or 2112
 
 class Custom_Linear(nn.Module):
     """
@@ -468,7 +468,7 @@ class Custom_Silu(nn.Module):
 
             x_int8, x_scale = gemm_cutlass.func_silu_mul_int8(\
                 x1, scale_x1,\
-                x2, scale_x2, self.smooth_alpha)
+                x2, scale_x2, self.smooth_alpha, True)
             
             return x_int8, x_scale
 

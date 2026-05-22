@@ -47,6 +47,7 @@ def load_wikitext2_samples(n=1_000, min_length=10):
 def load_wikitext_single_text(dataset_name="wikitext-2", split="validation", n=None):
     """
     dataset_name: "wikitext-2" or "wikitext-103"
+    split: "train", "validation", or "test"
     """
 
     config = f"{dataset_name}-raw-v1"

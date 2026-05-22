@@ -30,10 +30,13 @@
 using namespace torch::indexing;
 
 // ================================================================
-// Custom RMSNorm kernel for BF16 input and gamma, BF16 output
-// - Input: BF16 - (tokens, d_model)
-// - gamma: BF16 - (d_model)
-// - Output: BF16 - (tokens, d_model)
+// RMSNorm kernel for BF16 input and gamma, BF16 output
+// - Input:  BF16 - [num_tokens, d_model]
+// - gamma:  BF16 - [d_model]
+// - Output: BF16 - [num_tokens, d_model]
+//
+// One CUDA block handles one token/row.
+// Uses shared-memory reduction.
 // ================================================================
 
 __global__ void rmsnorm_kernel(
@@ -46,11 +49,18 @@ __global__ void rmsnorm_kernel(
     const int token_idx = blockIdx.x;
     const int tid = threadIdx.x;
 
-    const __nv_bfloat16* x_ptr = x + static_cast<size_t>(token_idx) * d_model;
-    __nv_bfloat16* y_ptr = y + static_cast<size_t>(token_idx) * d_model;
+    const __nv_bfloat16* x_ptr =
+        x + static_cast<size_t>(token_idx) * d_model;
+
+    __nv_bfloat16* y_ptr =
+        y + static_cast<size_t>(token_idx) * d_model;
+
+    // Dynamic shared memory:
+    // launch with shared_mem_bytes = threads * sizeof(float)
+    extern __shared__ float sdata[];
 
     // ------------------------------------------------------------
-    // Step 1: each thread computes a partial sum of squares in FP32
+    // Step 1: each thread computes partial sum of squares in FP32
     // ------------------------------------------------------------
     float local_sum_sq = 0.0f;
 
@@ -59,21 +69,29 @@ __global__ void rmsnorm_kernel(
         local_sum_sq += v * v;
     }
 
-    // ------------------------------------------------------------
-    // Step 2: block-wide reduction using warp reduction
-    // ------------------------------------------------------------
-    float block_sum_sq = block_reduce_sum(local_sum_sq);
+    sdata[tid] = local_sum_sq;
+    __syncthreads();
 
-    // Broadcast rms_inv through shared memory
+    // ------------------------------------------------------------
+    // Step 2: Block-wide shared-memory reduction
+    // ------------------------------------------------------------
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    // Now sdata[0] contains sum of squares for this token
     __shared__ float shared_rms_inv;
 
     if (tid == 0) {
-        float mean_sq = block_sum_sq / static_cast<float>(d_model);
+        float mean_sq = sdata[0] / static_cast<float>(d_model);
         shared_rms_inv = rsqrtf(mean_sq + eps);
     }
+
     __syncthreads();
 
-    // all threads can read shared_rms_inv
     const float rms_inv = shared_rms_inv;
 
     // ------------------------------------------------------------
@@ -83,7 +101,9 @@ __global__ void rmsnorm_kernel(
     for (int i = tid; i < d_model; i += blockDim.x) {
         float x_val = __bfloat162float(x_ptr[i]);
         float g_val = __bfloat162float(gamma[i]);
+
         float y_val = x_val * rms_inv * g_val;
+
         y_ptr[i] = __float2bfloat16(y_val);
     }
 }
@@ -453,6 +473,10 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_cuda(
         gamma_contig.scalar_type(),
         "rmsnorm_int8_cuda",
         AT_DISPATCH_CASE(at::ScalarType::Float, [&] {
+
+            cudaFuncAttributes attr;
+            cudaFuncGetAttributes(&attr, rmsnorm_int8_kernel<float>);
+
             rmsnorm_int8_kernel<float><<<grid, block, shmem_bytes, stream>>>(
                 x_contig.data_ptr<int8_t>(),
                 scale_x_contig.data_ptr<float>(),
@@ -463,7 +487,12 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_cuda(
                 eps
             );
         })
+
         AT_DISPATCH_CASE(at::ScalarType::BFloat16, [&] {
+
+            cudaFuncAttributes attr;
+            cudaFuncGetAttributes(&attr, rmsnorm_int8_kernel<at::BFloat16>);
+
             rmsnorm_int8_kernel<at::BFloat16><<<grid, block, shmem_bytes, stream>>>(
                 x_contig.data_ptr<int8_t>(),
                 scale_x_contig.data_ptr<float>(),
@@ -654,7 +683,7 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_shared_cuda(
     auto scale_y = torch::empty({n_rows}, x_contig.options().dtype(torch::kFloat32));
 
     // Determine block and grid sizes
-    int threads = (int)std::min<int64_t>(d_model, 512);
+    int threads = (int)std::min<int64_t>(d_model, 256);
     if (threads & (threads - 1)) {
         int p = 1;
         while ((p << 1) <= threads) p <<= 1;
@@ -695,6 +724,12 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_shared_cuda(
     );
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA error after rmsnorm_int8_shared_kernel: %s\n", cudaGetErrorString(err));
+        throw std::runtime_error("CUDA kernel launch failed");
+    }
 
     return std::make_tuple(y.view(x.sizes()), scale_y.view(scale_x.sizes()));  
 }

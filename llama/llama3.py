@@ -15,7 +15,7 @@ from utils_generation import *
 from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text
 
 
-LLAMA_SIZE_STR = "3B" # "1B" or "3B"
+LLAMA_SIZE_STR = "1B" # "1B" or "3B"
 IS_INSTRUCT = True # True or False
 
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)

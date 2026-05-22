@@ -485,7 +485,7 @@ class Custom_Silu(nn.Module):
 
             x_int8, x_scale = gemm_cutlass.func_silu_mul_int8(\
                 x1, scale_x1,\
-                x2, scale_x2, self.smooth_alpha)
+                x2, scale_x2, self.smooth_alpha, True)
             
             return x_int8, x_scale
 

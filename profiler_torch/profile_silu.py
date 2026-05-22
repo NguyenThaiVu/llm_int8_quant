@@ -26,7 +26,7 @@ class Custom_Silu(nn.Module):
 
             x_int8, x_scale = gemm_cutlass.func_silu_mul_int8(\
                 x1, scale_x1,\
-                x2, scale_x2, self.smooth_alpha)
+                x2, scale_x2, self.smooth_alpha, True)
             
             return x_int8, x_scale
 
@@ -58,7 +58,7 @@ if __name__ == "__main__":
     X2_int8, scale_x2 = quantize_row_int8_symmetric_nd(X2)
     
     int8_silu_time = measure_time(silu_layer, X1_int8, scale_x1,\
-                                    X2_int8, scale_x2)
+                                    X2_int8, scale_x2, repeat=10)
     print(f"Silu time (int8): {int8_silu_time:.2f} ms")
     
     Y_int8, scale_y = silu_layer(X1_int8, scale_x1,\

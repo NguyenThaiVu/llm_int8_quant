@@ -1,21 +1,52 @@
-import os 
 import torch
+import torch.nn as nn
 
-from llama3_quan import *
+import bitsandbytes as bnb
+from bitsandbytes.nn import Linear8bitLt
 
-M = 512
-N = 4096
-dtype = torch.bfloat16
 
-LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
+def convert_linear_to_llm_int8(module, threshold=6.0, skip_names=()):
+    for name, child in list(module.named_children()):
+        if name in skip_names:
+            continue
 
-X = torch.randn((1, M, N), dtype=dtype).cuda()
-cos = torch.randn((1, M, N), dtype=dtype).cuda()
-sin = torch.randn((1, M, N), dtype=dtype).cuda()
-mask = torch.ones((1, M, M), dtype=torch.bool).cuda()
+        if isinstance(child, nn.Linear):
+            int8_linear = bnb.nn.Linear8bitLt(
+                child.in_features,
+                child.out_features,
+                bias=child.bias is not None,
+                has_fp16_weights=False,
+                threshold=threshold,
+            )
 
-gqa = Custom_GroupedQueryAttention(d_in=4096, num_heads=16,\
-	num_kv_groups=4, dtype=dtype).cuda()
+            int8_linear.weight.data = child.weight.data.clone()
 
-Y = gqa(X, 1.0, mask, cos, sin)
-print(Y.shape)
+            if child.bias is not None:
+                int8_linear.bias.data = child.bias.data.clone()
+
+            setattr(module, name, int8_linear)
+        else:
+            convert_linear_to_llm_int8(child, threshold, skip_names)
+
+    return module
+
+fp16_model = nn.Sequential(
+    nn.Linear(1024, 1024),
+    nn.ReLU(),
+    nn.Linear(1024, 1024)
+)
+
+# int8_model = nn.Sequential(
+#     Linear8bitLt(64, 64, has_fp16_weights=False),
+#     Linear8bitLt(64, 64, has_fp16_weights=False)
+# )
+
+# int8_model.load_state_dict(fp16_model.state_dict())
+
+int8_model = convert_linear_to_llm_int8(fp16_model, 6.0)
+
+print(f"Weight before quantization: {int8_model[0].weight.data[:5, :5]}")
+
+int8_model = int8_model.to(0) # Quantization happens here
+
+print(f"Weight after quantization: {int8_model[0].weight.data[:5, :5]}")

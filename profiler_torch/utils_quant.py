@@ -88,3 +88,20 @@ def measure_time(func, *args, repeat=100):
     torch.cuda.synchronize()
     elapsed_time = start_event.elapsed_time(end_event) / repeat
     return elapsed_time
+
+
+def measure_peak_memory_usage(func, *args):
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    
+    before_alloc = torch.cuda.memory_allocated()
+    out = func(*args)
+    torch.cuda.synchronize()
+    peak_alloc = torch.cuda.max_memory_allocated()
+    
+    peak_alloc_delta = peak_alloc - before_alloc
+    peak_alloc_delta_MB = peak_alloc_delta / (1024 * 1024) 
+    
+    return out, peak_alloc_delta_MB
+
