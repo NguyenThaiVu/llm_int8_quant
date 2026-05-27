@@ -1,4 +1,9 @@
 import os
+
+# Use second GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  
+
+
 from pathlib import Path
 import zipfile
 import math
@@ -114,8 +119,8 @@ if __name__ == "__main__":
     # ================================================================
     # 3. Text generation
     # ================================================================
-    MAX_NEW_TOKENS = 1024
-    PPL_CONTEXT_TOKENS = 1024
+    MAX_NEW_TOKENS = 2048
+    PPL_CONTEXT_TOKENS = 2048
     EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
@@ -149,4 +154,8 @@ if __name__ == "__main__":
                                 samples,
                                 context_size=PPL_CONTEXT_TOKENS,
                                 stride=PPL_STRIDE)
-    print(f"\nPPL: {ppl} \n")
+    print(f"\nPPL (BF16): {ppl} \n")
+    print(f"Model Information: ")
+    print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")

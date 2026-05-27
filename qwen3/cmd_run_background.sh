@@ -1,0 +1,1 @@
+tmux new-session -d -s gpu_wait './cmd_wait_for_gpu.sh > run.log 2>&1'

@@ -1,7 +1,11 @@
-import os
+"""
+This script demonstrates how to convert a Qwen3 model to quantization model 
+using LLM.int8() technique. 
+"""
+import os 
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  
+
 from pathlib import Path
-import zipfile
-import math
 from datasets import load_dataset
 import re
 import torch
@@ -27,7 +31,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B"
 
 if __name__ == "__main__":
     
@@ -197,6 +201,10 @@ if __name__ == "__main__":
                                 context_size=PPL_CONTEXT_TOKENS,
                                 stride=PPL_STRIDE)
     print(f"\nPPL (LLM.int() technique): {ppl} \n")
+    print(f"Model Information: ")
+    print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")
 
 
     # =================================================

@@ -1,11 +1,12 @@
 """
 This script demonstrates how to convert a LLaMA 3 model to SmoothQuant technique. 
 """
-
 import os 
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  
+
 from pathlib import Path
 from safetensors.torch import load_file
-
+from tqdm import tqdm
 import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
@@ -52,7 +53,66 @@ LOCAL_DIR = os.path.join(MODEL_HUB, MODEL_FOLDER)
 # 1. Define Model Architecture
 # ===============================================
 
-MAX_SEQ_LEN = 1040 # 576 or 1040 or 2112
+MAX_SEQ_LEN = 2112 # 576 or 1040 or 2112
+
+class Custom_Linear(nn.Module):
+    """
+    Linear layer with two execution modes:
+    1. Calibration mode
+        - Input: bf16
+        - Weight: bf16
+        - Output: bf16
+        - Behavior: computes `x @ weight.T` and updates output observer
+    
+    2. Quantization mode
+        - Input: int8
+        - Weight: int8
+        - Output: bf16
+        - Behavior: computes quantized matmul with per-row scaling
+                    and returns quantized output and its scale
+    
+    This layer has: per-row scale for activation
+                    per-tensor scale for weight. 
+                    The output scale is per-row
+                    
+    Input shapes: (M, K) or (B, M, K)
+    Weight shapes: (N, K)
+    Output shapes: (M, N) or (B, M, N)
+    """
+    def __init__(self, in_features, out_features, dtype=torch.bfloat16):
+        super(Custom_Linear, self).__init__()
+        
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, 
+                                               dtype=dtype))
+        
+        # Weight quantization
+        self.weight_q = torch.empty(out_features, in_features, dtype=torch.int8)
+        self.scale_w = torch.ones((1), dtype=torch.float32)
+        self.is_quantized = False
+        
+    def forward(self, x, scale_x=1.0):
+        if not self.is_quantized:  
+            out = torch.matmul(x, self.weight.t())  
+            return out
+        else:
+            assert x.dtype == torch.int8, "Expected int8 input in quantization"
+            row_scale = scale_x  
+            col_scale = self.scale_w.expand(self.out_features)
+            
+            out = gemm_cutlass.func_w8a8_matmul(x, self.weight_q,\
+                row_scale, col_scale)
+
+            return out
+        
+    def finish_calibration(self):
+        weight_q, scale_w = quantize_tensor(self.weight)
+        self.weight_q = weight_q
+        self.scale_w = scale_w
+        self.is_quantized = True  
+        del self.weight
+        torch.cuda.empty_cache()
 
 class SmoothQuant_Linear(nn.Module):
     """
@@ -66,7 +126,7 @@ class SmoothQuant_Linear(nn.Module):
     2. Quantization mode
         - Input: int8
         - Weight: int8
-        - Output: int8
+        - Output: bf16
         - Behavior: computes quantized matmul with per-row scaling
                     and returns quantized output and its scale
     
@@ -78,8 +138,7 @@ class SmoothQuant_Linear(nn.Module):
     Weight shapes: (N, K)
     Output shapes: (M, N) or (B, M, N)
     """
-    def __init__(self, in_features, out_features, 
-                 max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16):
+    def __init__(self, in_features, out_features, dtype=torch.bfloat16):
         super(SmoothQuant_Linear, self).__init__()
         
         self.weight = nn.Parameter(torch.empty(out_features, in_features, 
@@ -96,8 +155,6 @@ class SmoothQuant_Linear(nn.Module):
         self.in_observer = PerChannelAbsMaxObserver(in_features)
         
         # Output scale quantization
-        self.out_observer = MinMaxObserverPerLastDim(max_seq_len=max_seq_len)
-        self.scale_y = torch.ones(max_seq_len, dtype=torch.float32, device='cuda')
         self.is_quantized = False
         
     def forward(self, x, scale_x=1.0):
@@ -107,62 +164,71 @@ class SmoothQuant_Linear(nn.Module):
                 self.in_observer(x) # Calibrate input for SmoothQuant
              
             out = torch.matmul(x, self.weight.t())  
-            
-            if self.is_quantized == False:
-                self.out_observer(out) # Calibrate output for matmul
             return out
         else:
             assert x.dtype == torch.int8, "Expect int8 input in quantization"
-            seq_len = x.shape[0]
-            scale_y_value = self.scale_y[:seq_len]
             
-            row_scale = scale_x / scale_y_value  
+            row_scale = scale_x 
             col_scale = self.scale_w.expand(self.out_features)
             
-            out_q = gemm_cutlass.func_w8a8_matmul(x, self.weight_q,\
-                row_scale, col_scale)
-            
-            return out_q, scale_y_value
+            out = gemm_cutlass.func_w8a8_matmul(x, self.weight_q, row_scale, col_scale)
+            return out
         
     def finish_calibration(self, alpha=None):
         if alpha is None:
             alpha = compute_smooth_alpha(self.in_observer, self.weight)
         self.smooth_alpha = alpha
         
-        # Quantize the smoothed weight
+        # # Quantize the smoothed weight
         w_smooth = self.weight * alpha.unsqueeze(0) 
         self.weight_q, self.scale_w = quantize_row_int8_symmetric_nd(w_smooth)
 
-        self.scale_y = self.out_observer.get_scale().to(self.scale_w.device)
         self.is_quantized = True  
 
 
 class SmoothQuant_FeedForward(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        # self.fc1 = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
-        # self.fc2 = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
-        # self.fc3 = nn.Linear(cfg["hidden_dim"], cfg["emb_dim"], dtype=cfg["dtype"], bias=False)
-        
-        self.fc1 = SmoothQuant_Linear(cfg["emb_dim"], cfg["hidden_dim"],\
-                                    max_seq_len=cfg["context_length"], dtype=cfg["dtype"])
-        self.fc2 = SmoothQuant_Linear(cfg["emb_dim"], cfg["hidden_dim"],\
-                                    max_seq_len=cfg["context_length"], dtype=cfg["dtype"])
-        self.fc3 = SmoothQuant_Linear(cfg["hidden_dim"], cfg["emb_dim"],\
-                                    max_seq_len=cfg["context_length"], dtype=cfg["dtype"])
+        self.fc1 = SmoothQuant_Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"])
+        self.fc2 = SmoothQuant_Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"])
+        self.fc3 = SmoothQuant_Linear(cfg["hidden_dim"], cfg["emb_dim"], dtype=cfg["dtype"])
         
         self.is_quantized = False
 
     def forward(self, x):
-        x_fc1 = self.fc1(x)
-        x_fc2 = self.fc2(x)
-        x = nn.functional.silu(x_fc1) * x_fc2
-        return self.fc3(x)
+        if self.is_quantized == False:
+            x_fc1 = self.fc1(x)
+            x_fc2 = self.fc2(x)
+            x = nn.functional.silu(x_fc1) * x_fc2
+            x = self.fc3(x)
+            return x
+        else:
+            # Smooth input activation
+            smooth_scale = self.fc1.smooth_alpha
+            x = x / smooth_scale.unsqueeze(0)
+            x_int8, scale_x = quantize_row_int8_symmetric_nd(x)
+            
+            x_fc1 = self.fc1(x_int8, scale_x)
+            x_fc2 = self.fc2(x_int8, scale_x)
+
+            x = nn.functional.silu(x_fc1) * x_fc2
+            
+            # Smooth for FC3
+            smooth_scale_fc3 = self.fc3.smooth_alpha
+            x = x / smooth_scale_fc3.unsqueeze(0)
+            x_int8, scale_x = quantize_row_int8_symmetric_nd(x)
+            
+            x = self.fc3(x_int8, scale_x)
+            return x
     
     def finish_calibration(self):
         self.fc1.finish_calibration()
-        self.fc2.finish_calibration()
-        # self.fc3.finish_calibration()
+        fc1_smooth_alpha = self.fc1.smooth_alpha
+
+        # fc2 uses the same smooth_alpha as fc1 
+        self.fc2.finish_calibration(alpha=fc1_smooth_alpha) 
+        
+        self.fc3.finish_calibration()
         self.is_quantized = True
 
 
@@ -182,14 +248,15 @@ class GroupedQueryAttention(nn.Module):
         self.num_kv_groups = num_kv_groups
         self.group_size = num_heads // num_kv_groups
 
-        self.W_key = SmoothQuant_Linear(d_in, num_kv_groups * self.head_dim,\
-                                    max_seq_len=MAX_SEQ_LEN, dtype=dtype)
-        self.W_value = SmoothQuant_Linear(d_in, num_kv_groups * self.head_dim,\
-                                    max_seq_len=MAX_SEQ_LEN, dtype=dtype)
-        self.W_query = SmoothQuant_Linear(d_in, d_out,\
-                                    max_seq_len=MAX_SEQ_LEN, dtype=dtype)
-        self.out_proj = SmoothQuant_Linear(d_out, d_out,\
-                                    max_seq_len=MAX_SEQ_LEN, dtype=dtype)
+        # self.W_key = Custom_Linear(d_in, num_kv_groups * self.head_dim, dtype=dtype)
+        # self.W_value = Custom_Linear(d_in, num_kv_groups * self.head_dim, dtype=dtype)
+        # self.W_query = Custom_Linear(d_in, d_out, dtype=dtype)
+        # self.out_proj = Custom_Linear(d_out, d_out, dtype=dtype)
+        
+        self.W_key = SmoothQuant_Linear(d_in, num_kv_groups * self.head_dim, dtype=dtype)
+        self.W_value = SmoothQuant_Linear(d_in, num_kv_groups * self.head_dim, dtype=dtype)
+        self.W_query = SmoothQuant_Linear(d_in, d_out, dtype=dtype)
+        self.out_proj = SmoothQuant_Linear(d_out, d_out, dtype=dtype)
         
         self.is_quantized = False
 
@@ -238,7 +305,11 @@ class GroupedQueryAttention(nn.Module):
         else:
             num_tokens, d_in = x.shape
 
+            # smooth quantization for input activation
+            smooth_value = self.W_query.smooth_alpha
+            x = x / smooth_value.unsqueeze(0)
             x_int8, scale_x = quantize_row_int8_symmetric_nd(x)
+            
             queries = self.W_query(x_int8, scale_x)  
             keys = self.W_key(x_int8, scale_x)  
             values = self.W_value(x_int8, scale_x) 
@@ -275,15 +346,19 @@ class GroupedQueryAttention(nn.Module):
             # Combine heads, where self.d_out = self.num_heads * self.head_dim
             context_vec = context_vec.reshape(num_tokens, self.d_out)
             
+            # Smooth quantization for output activation of attention
+            smooth_value_attn = self.out_proj.smooth_alpha
+            context_vec = context_vec / smooth_value_attn.unsqueeze(0)
             context_vec_int8, scale_context_vec = quantize_row_int8_symmetric_nd(context_vec)
             context_vec = self.out_proj(context_vec_int8, scale_context_vec)  
             return context_vec
             
-    
     def finish_calibration(self):
-        self.W_key.finish_calibration()
-        self.W_value.finish_calibration()
         self.W_query.finish_calibration()
+        smooth_query = self.W_query.smooth_alpha
+        self.W_key.finish_calibration(alpha=smooth_query)
+        self.W_value.finish_calibration(alpha=smooth_query)
+         
         self.out_proj.finish_calibration()
         self.is_quantized = True
     
@@ -319,6 +394,7 @@ class TransformerBlock(nn.Module):
     
     def finish_calibration(self):
         self.att.finish_calibration()
+        self.ff.finish_calibration()
     
     
 class Llama3Model(nn.Module):
@@ -361,7 +437,6 @@ class Llama3Model(nn.Module):
         for block in self.trf_blocks:
             block.finish_calibration()
         
-
 
 
 model = Llama3Model(LLAMA32_CONFIG)
@@ -419,10 +494,10 @@ print(f"[INFO] Weights loaded successfully.\n")
 # ===============================================
 # 4. Generate Text
 # ===============================================
-MAX_GENERATED_TOKENS = 1024
-PPL_CONTEXT_TOKENS = 1024
+MAX_GENERATED_TOKENS = 2048
+PPL_CONTEXT_TOKENS = 2048
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
+EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
 
 list_prompts = ["What is Dragon Ball story?"]
 
@@ -448,7 +523,8 @@ calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
 calibrate_tokens = tokenizer.encode(calibrate_samples)
 print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
         
-for i in range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE):
+# for i in range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE):
+for i in tqdm(range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE)):
     chunk_tokens = calibrate_tokens[i:i + PPL_CONTEXT_TOKENS]
 
     input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
@@ -471,4 +547,8 @@ ppl = compute_ppl_single_text(model,
                             context_size=PPL_CONTEXT_TOKENS,
                             stride=PPL_STRIDE)
 print(f"\nPPL (SmoothQuant technique): {ppl} \n")
+print(f"Evaluation Information:")
+print(f"Model: LLaMA 3.2 {LLAMA_SIZE_STR} {'Instruct' if IS_INSTRUCT else 'Base'}")
+print(f"Context size for evaluation: {PPL_CONTEXT_TOKENS}")
+print(f"Dataset: {EVALUATION_DATASET}")
 

@@ -1,9 +1,12 @@
 import os
+# Use second GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  
+
 from pathlib import Path
 import zipfile
 import math
 from datasets import load_dataset
-import re
+from tqdm import tqdm
 import torch
 torch.manual_seed(123)
 import torch.nn as nn
@@ -27,7 +30,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B"
 
 class Custom_GroupedQueryAttention(nn.Module):
     def __init__(
@@ -248,7 +251,6 @@ class TransformerBlock_Quant(nn.Module):
         if self.is_quantized == False:
             x = self.norm2(x)
             x, _ = self.ff(x, 1.0)
-        
         else:
             x, scale_x = self.norm2(x)
             x, _ = self.ff(x, scale_x)
@@ -390,8 +392,8 @@ if __name__ == "__main__":
     # ================================================================
     # 3. Text generation
     # ================================================================
-    MAX_NEW_TOKENS = 2048
-    PPL_CONTEXT_TOKENS = 2048
+    MAX_NEW_TOKENS = 1024
+    PPL_CONTEXT_TOKENS = 1024
     EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
@@ -422,7 +424,8 @@ if __name__ == "__main__":
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             
-    for i in range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE):
+    # for i in range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE):
+    for i in tqdm(range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE)):
         chunk_tokens = calibrate_tokens[i:i + PPL_CONTEXT_TOKENS]
 
         input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
@@ -440,7 +443,6 @@ if __name__ == "__main__":
     list_prompts = ["What is the capital of VietNam?",\
                     "What is the Dragon Ball story?"]
 
-    
     for idx, prompt in enumerate(list_prompts):
         input_token_ids = tokenizer.encode(prompt)
         input_token_ids_tensor = torch.tensor(input_token_ids, device=device)
@@ -468,3 +470,7 @@ if __name__ == "__main__":
                                 context_size=PPL_CONTEXT_TOKENS,
                                 stride=PPL_STRIDE)
     print(f"\nPPL: {ppl} \n")
+    print(f"Model Information: ")
+    print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")
