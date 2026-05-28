@@ -977,83 +977,281 @@ torch::Tensor matmul_w8a8o8_2D_host(
 }
 
 torch::Tensor matmul_w8a8o8_3D_host(
-    const torch::Tensor &A,          // int8 [batch_size, M, K]
-    const torch::Tensor &B,          // int8 [N, K] or [batch_size, N, K]
-    const torch::Tensor &alphaRow,    // float [M] or [batch_size, M] 
-    const torch::Tensor &alphaCol   // float [N] or [batch_size, N]
+    const torch::Tensor &A,          // int8 [B, M, K]
+    const torch::Tensor &Bmat,       // int8 [N, K] or [B, N, K]
+    const torch::Tensor &alphaRow,   // float [M] or [B, M]
+    const torch::Tensor &alphaCol    // float [N] or [B, N]
 ) {
-    TORCH_CHECK(A.is_cuda() && B.is_cuda() &&
+    TORCH_CHECK(A.is_cuda() && Bmat.is_cuda() &&
                 alphaRow.is_cuda() && alphaCol.is_cuda(),
                 "All tensors must be CUDA tensors");
 
     TORCH_CHECK(A.scalar_type() == torch::kInt8, "A must be int8");
-    TORCH_CHECK(B.scalar_type() == torch::kInt8, "B must be int8");
-    TORCH_CHECK(alphaRow.scalar_type() == torch::kFloat32, 
+    TORCH_CHECK(Bmat.scalar_type() == torch::kInt8, "B must be int8");
+    TORCH_CHECK(alphaRow.scalar_type() == torch::kFloat32,
                 "alphaRow must be float32");
-    TORCH_CHECK(alphaCol.scalar_type() == torch::kFloat32, 
+    TORCH_CHECK(alphaCol.scalar_type() == torch::kFloat32,
                 "alphaCol must be float32");
 
-    TORCH_CHECK(A.dim() == 3, "A must be 3D tensor (batched)");
-    TORCH_CHECK(B.dim() == 2 || B.dim() == 3, "B must be 2D or 3D tensor");
-
-    if (alphaRow.dim() == 1) {
-        TORCH_CHECK(alphaRow.size(0) == A.size(1), "alphaRow must have M elements");
-    } else if (alphaRow.dim() == 2) {
-        TORCH_CHECK(alphaRow.dim() == 2 && alphaRow.size(0) == A.size(0) &&
-                    alphaRow.size(1) == A.size(1),
-                    "alphaRow must have shape (batch_size, M)");
-    } else {
-        TORCH_CHECK(false, "alphaRow must be 1D or 2D tensor");
-    }
-
-    if (alphaCol.dim() == 1) {
-        TORCH_CHECK(alphaCol.size(0) == B.size(0), "alphaCol must have N elements");
-    } else if (alphaCol.dim() == 2) {
-        TORCH_CHECK(alphaCol.dim() == 2 && alphaCol.size(0) == A.size(0) &&
-                    alphaCol.size(1) == B.size(1),
-                    "alphaCol must have shape (batch_size, N)");
-    } else {
-        TORCH_CHECK(false, "alphaCol must be 1D or 2D tensor");
-    }
+    TORCH_CHECK(A.dim() == 3,
+                "A must be 3D tensor with shape [B, M, K]");
+    TORCH_CHECK(Bmat.dim() == 2 || Bmat.dim() == 3,
+                "B must be [N, K] or [B, N, K]");
 
     const int64_t batch_size = A.size(0);
     const int64_t M = A.size(1);
     const int64_t K = A.size(2);
-    int64_t N;
-    bool shared_B = false;
 
-    if (B.dim() == 2) {
+    TORCH_CHECK(K % 16 == 0, "K must be multiple of 16");
+
+    bool shared_B = false;
+    int64_t N = 0;
+
+    if (Bmat.dim() == 2) {
+        // Bmat: [N, K]
         shared_B = true;
-        TORCH_CHECK(B.size(0) > 0 && B.size(1) == K,
-                    "B shape must be (N, K) with same K as A");
-        N = B.size(0);
+        TORCH_CHECK(Bmat.size(1) == K, "B [N, K] must have same K as A");
+        N = Bmat.size(0);
     } else {
-        TORCH_CHECK(B.size(0) == batch_size &&
-                    B.size(2) == K,
-                    "B shape must be (batch_size, N, K) with same K as A");
-        N = B.size(1);
+        // Bmat: [B, N, K]
+        shared_B = false;
+        TORCH_CHECK(Bmat.size(0) == batch_size &&
+                    Bmat.size(2) == K, "B [B, N, K] must match A batch size and K");
+        N = Bmat.size(1);
     }
+
+    auto A_contig = A.contiguous();
+    auto B_contig = Bmat.contiguous();
+    auto alphaRow_contig = alphaRow.contiguous();
+    auto alphaCol_contig = alphaCol.contiguous();
 
     auto out = torch::empty({batch_size, M, N},
                         A.options().dtype(torch::kChar));
     for (int64_t b = 0; b < batch_size; ++b) {
-        auto A_b = A.select(0, b).contiguous();  // (M, K)
+        auto A_b = A_contig.select(0, b);  // (M, K)
         torch::Tensor B_b;
-        torch::Tensor alphaRow_b;
+        torch::Tensor alphaRow_b = alphaRow_contig.select(0, b).view({M});  // (M,)
         torch::Tensor alphaCol_b;
         if (shared_B) {
-            B_b = B;  // shared weight
-            alphaRow_b = alphaRow.contiguous();  // (M,)
-            alphaCol_b = alphaCol.contiguous();  // (N,)
+            B_b = B_contig;  // shared weight
+            alphaCol_b = alphaCol_contig.view({N});  // (N,)
         } else {
-            B_b = B.select(0, b).contiguous();  // (N, K)
-            alphaRow_b = alphaRow.select(0, b).contiguous();  // (M,)
-            alphaCol_b = alphaCol.select(0, b).contiguous();  // (N,)
+            B_b = B_contig.select(0, b);  // (N, K)
+            alphaCol_b = alphaCol_contig.select(0, b).view({N});  // (N,)
         }
         
-        auto out_b_result = matmul_w8a8o8_2D_host(A_b, B_b,
-                                     alphaRow_b, alphaCol_b);
+        auto out_b_result = matmul_w8a8o8_2D_host(A_b, B_b, alphaRow_b, alphaCol_b);
         out.select(0, b).copy_(out_b_result);
     }
     return out;
 }
+
+torch::Tensor matmul_w8a8o8_4D_host(
+    const torch::Tensor &A,          // int8 [B0, B1, M, K]
+    const torch::Tensor &Bmat,       // int8 [N, K], [B0*B1, N, K], or [B0, B1, N, K]
+    const torch::Tensor &alphaRow,   // float [M], [B0*B1, M], or [B0, B1, M]
+    const torch::Tensor &alphaCol    // float [N], [B0*B1, N], or [B0, B1, N]
+) {
+    TORCH_CHECK(A.is_cuda() && Bmat.is_cuda() &&
+                alphaRow.is_cuda() && alphaCol.is_cuda(),
+                "All tensors must be CUDA tensors");
+
+    TORCH_CHECK(A.scalar_type() == torch::kInt8, "A must be int8");
+    TORCH_CHECK(Bmat.scalar_type() == torch::kInt8, "B must be int8");
+    TORCH_CHECK(alphaRow.scalar_type() == torch::kFloat32,
+                "alphaRow must be float32");
+    TORCH_CHECK(alphaCol.scalar_type() == torch::kFloat32,
+                "alphaCol must be float32");
+
+    TORCH_CHECK(A.dim() == 4,
+                "A must be 4D tensor with shape [B0, B1, M, K]");
+
+    const int64_t B0 = A.size(0);
+    const int64_t B1 = A.size(1);
+    const int64_t M  = A.size(2);
+    const int64_t K  = A.size(3);
+
+    const int64_t flat_batch = B0 * B1;
+
+    TORCH_CHECK(K % 16 == 0, "K must be multiple of 16");
+
+    auto A_3d = A.contiguous().view({flat_batch, M, K});
+
+    torch::Tensor B_3d_or_2d;
+
+    if (Bmat.dim() == 2) {
+        // Bmat: [N, K], shared across all B0 * B1 batches
+        TORCH_CHECK(Bmat.size(1) == K,
+                    "B [N, K] must have same K as A");
+        B_3d_or_2d = Bmat.contiguous();
+
+    } else if (Bmat.dim() == 3) {
+        // Bmat: [B0*B1, N, K]
+        TORCH_CHECK(Bmat.size(0) == flat_batch &&
+                    Bmat.size(2) == K,
+                    "B [B0*B1, N, K] must match flattened batch and K");
+        B_3d_or_2d = Bmat.contiguous();
+
+    } else if (Bmat.dim() == 4) {
+        // Bmat: [B0, B1, N, K]
+        TORCH_CHECK(Bmat.size(0) == B0 &&
+                    Bmat.size(1) == B1 &&
+                    Bmat.size(3) == K,
+                    "B [B0, B1, N, K] must match A batch dims and K");
+
+        const int64_t N = Bmat.size(2);
+        B_3d_or_2d = Bmat.contiguous().view({flat_batch, N, K});
+
+    } else {
+        TORCH_CHECK(false,
+                    "B must be [N, K], [B0*B1, N, K], or [B0, B1, N, K]");
+    }
+
+    torch::Tensor alphaRow_3d_or_1d;
+
+    if (alphaRow.dim() == 1) {
+        // alphaRow: [M], shared
+        TORCH_CHECK(alphaRow.size(0) == M,
+                    "alphaRow [M] must have M elements");
+        alphaRow_3d_or_1d = alphaRow.contiguous();
+
+    } else if (alphaRow.dim() == 2) {
+        // alphaRow: [B0*B1, M]
+        TORCH_CHECK(alphaRow.size(0) == flat_batch &&
+                    alphaRow.size(1) == M,
+                    "alphaRow [B0*B1, M] must match flattened batch and M");
+        alphaRow_3d_or_1d = alphaRow.contiguous();
+
+    } else if (alphaRow.dim() == 3) {
+        // alphaRow: [B0, B1, M]
+        TORCH_CHECK(alphaRow.size(0) == B0 &&
+                    alphaRow.size(1) == B1 &&
+                    alphaRow.size(2) == M,
+                    "alphaRow [B0, B1, M] must match A batch dims and M");
+
+        alphaRow_3d_or_1d = alphaRow.contiguous().view({flat_batch, M});
+
+    } else {
+        TORCH_CHECK(false,
+                    "alphaRow must be [M], [B0*B1, M], or [B0, B1, M]");
+    }
+
+    torch::Tensor alphaCol_3d_or_1d;
+
+    if (alphaCol.dim() == 1) {
+        // alphaCol: [N], shared
+        alphaCol_3d_or_1d = alphaCol.contiguous();
+
+    } else if (alphaCol.dim() == 2) {
+        // alphaCol: [B0*B1, N]
+        TORCH_CHECK(alphaCol.size(0) == flat_batch,
+                    "alphaCol [B0*B1, N] must match flattened batch");
+        alphaCol_3d_or_1d = alphaCol.contiguous();
+
+    } else if (alphaCol.dim() == 3) {
+        // alphaCol: [B0, B1, N]
+        TORCH_CHECK(alphaCol.size(0) == B0 &&
+                    alphaCol.size(1) == B1,
+                    "alphaCol [B0, B1, N] must match A batch dims");
+
+        const int64_t N = alphaCol.size(2);
+        alphaCol_3d_or_1d = alphaCol.contiguous().view({flat_batch, N});
+
+    } else {
+        TORCH_CHECK(false,
+                    "alphaCol must be [N], [B0*B1, N], or [B0, B1, N]");
+    }
+
+    auto out_3d = matmul_w8a8o8_3D_host(
+        A_3d,
+        B_3d_or_2d,
+        alphaRow_3d_or_1d,
+        alphaCol_3d_or_1d
+    );
+
+    const int64_t N = out_3d.size(2);
+
+    return out_3d.view({B0, B1, M, N});
+}
+
+// torch::Tensor matmul_w8a8o8_3D_host(
+//     const torch::Tensor &A,          // int8 [batch_size, M, K]
+//     const torch::Tensor &B,          // int8 [N, K] or [batch_size, N, K]
+//     const torch::Tensor &alphaRow,    // float [M] or [batch_size, M] 
+//     const torch::Tensor &alphaCol   // float [N] or [batch_size, N]
+// ) {
+//     TORCH_CHECK(A.is_cuda() && B.is_cuda() &&
+//                 alphaRow.is_cuda() && alphaCol.is_cuda(),
+//                 "All tensors must be CUDA tensors");
+
+//     TORCH_CHECK(A.scalar_type() == torch::kInt8, "A must be int8");
+//     TORCH_CHECK(B.scalar_type() == torch::kInt8, "B must be int8");
+//     TORCH_CHECK(alphaRow.scalar_type() == torch::kFloat32, 
+//                 "alphaRow must be float32");
+//     TORCH_CHECK(alphaCol.scalar_type() == torch::kFloat32, 
+//                 "alphaCol must be float32");
+
+//     TORCH_CHECK(A.dim() == 3, "A must be 3D tensor (batched)");
+//     TORCH_CHECK(B.dim() == 2 || B.dim() == 3, "B must be 2D or 3D tensor");
+
+//     if (alphaRow.dim() == 1) {
+//         TORCH_CHECK(alphaRow.size(0) == A.size(1), "alphaRow must have M elements");
+//     } else if (alphaRow.dim() == 2) {
+//         TORCH_CHECK(alphaRow.dim() == 2 && alphaRow.size(0) == A.size(0) &&
+//                     alphaRow.size(1) == A.size(1),
+//                     "alphaRow must have shape (batch_size, M)");
+//     } else {
+//         TORCH_CHECK(false, "alphaRow must be 1D or 2D tensor");
+//     }
+
+//     if (alphaCol.dim() == 1) {
+//         TORCH_CHECK(alphaCol.size(0) == B.size(0), "alphaCol must have N elements");
+//     } else if (alphaCol.dim() == 2) {
+//         TORCH_CHECK(alphaCol.dim() == 2 && alphaCol.size(0) == A.size(0) &&
+//                     alphaCol.size(1) == B.size(1),
+//                     "alphaCol must have shape (batch_size, N)");
+//     } else {
+//         TORCH_CHECK(false, "alphaCol must be 1D or 2D tensor");
+//     }
+
+//     const int64_t batch_size = A.size(0);
+//     const int64_t M = A.size(1);
+//     const int64_t K = A.size(2);
+//     int64_t N;
+//     bool shared_B = false;
+
+//     if (B.dim() == 2) {
+//         shared_B = true;
+//         TORCH_CHECK(B.size(0) > 0 && B.size(1) == K,
+//                     "B shape must be (N, K) with same K as A");
+//         N = B.size(0);
+//     } else {
+//         TORCH_CHECK(B.size(0) == batch_size &&
+//                     B.size(2) == K,
+//                     "B shape must be (batch_size, N, K) with same K as A");
+//         N = B.size(1);
+//     }
+
+//     auto out = torch::empty({batch_size, M, N},
+//                         A.options().dtype(torch::kChar));
+//     for (int64_t b = 0; b < batch_size; ++b) {
+//         auto A_b = A.select(0, b).contiguous();  // (M, K)
+//         torch::Tensor B_b;
+//         torch::Tensor alphaRow_b;
+//         torch::Tensor alphaCol_b;
+//         if (shared_B) {
+//             B_b = B;  // shared weight
+//             alphaRow_b = alphaRow.contiguous();  // (M,)
+//             alphaCol_b = alphaCol.contiguous();  // (N,)
+//         } else {
+//             B_b = B.select(0, b).contiguous();  // (N, K)
+//             alphaRow_b = alphaRow.select(0, b).contiguous();  // (M,)
+//             alphaCol_b = alphaCol.select(0, b).contiguous();  // (N,)
+//         }
+        
+//         auto out_b_result = matmul_w8a8o8_2D_host(A_b, B_b,
+//                                      alphaRow_b, alphaCol_b);
+//         out.select(0, b).copy_(out_b_result);
+//     }
+//     return out;
+// }

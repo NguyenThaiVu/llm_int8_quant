@@ -227,6 +227,8 @@ torch::Tensor func_w8a8o8_matmul(
         return matmul_w8a8o8_2D_host(input, weight, alphaRow, alphaCol);
     } else if (input.dim() == 3) {
         return matmul_w8a8o8_3D_host(input, weight, alphaRow, alphaCol);
+    } else if (input.dim() == 4) {
+        return matmul_w8a8o8_4D_host(input, weight, alphaRow, alphaCol);
     } else {
         throw std::invalid_argument("Input tensor must be 2D or 3D");
     }

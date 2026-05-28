@@ -196,7 +196,8 @@ class Qwen3Model(nn.Module):
         cos, sin = compute_rope_params(
             head_dim=head_dim,
             theta_base=cfg["rope_base"],
-            context_length=cfg["context_length"]
+            # context_length=cfg["context_length"]
+            context_length=1024 * 10
         )
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)

@@ -2,7 +2,7 @@
 This script demonstrates how to convert a Qwen3 model to SmoothQuant technique. 
 """
 import os 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"  
 
 from pathlib import Path
 from tqdm import tqdm
@@ -478,7 +478,7 @@ if __name__ == "__main__":
     # # =================================================
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=100_000)
+                                                    split="train", n=1)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             
@@ -507,7 +507,38 @@ if __name__ == "__main__":
                                 context_size=PPL_CONTEXT_TOKENS,
                                 stride=PPL_STRIDE)
     print(f"\nPPL (SmoothQuant technique): {ppl} \n")
-    print(f"Model Information: ")
+    
+    # ================================================================
+    # 3. Measure latency
+    # ================================================================
+    print(f"\n[INFO] Measuring latency ...")
+    samples = tokenizer.encode(samples)
+
+    chunk_tokens = samples[0: PPL_CONTEXT_TOKENS]
+
+    input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
+    print(f"[INFO] Input tokens: {input_ids.shape}")
+
+    # Warm-up runs
+    with torch.no_grad():
+        out_ids = model(input_ids)
+    print(f"[INFO] Output tokens: {out_ids.shape}")
+    
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+        with torch.no_grad():
+            out_ids = model(input_ids)
+
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=50))
+    print()
+    print("Model Information:")
     print(f"Model: Qwen3-{CHOOSE_MODEL}")
     print(f"Context size: {PPL_CONTEXT_TOKENS}")
     print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")

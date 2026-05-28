@@ -27,8 +27,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
-
+CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B"
 
 class Custom_GroupedQueryAttention(nn.Module):
     def __init__(
@@ -57,7 +56,7 @@ class Custom_GroupedQueryAttention(nn.Module):
         self.query_rope = Custom_RoPE(num_heads, max_seq_len=MAX_SEQ_LEN, head_dim=head_dim).to(dtype)
         self.key_rope = Custom_RoPE(num_kv_groups, max_seq_len=MAX_SEQ_LEN, head_dim=head_dim).to(dtype)
         
-        self.softmax_layer = Custom_Softmax(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)    
+        self.softmax_layer = Custom_Softmax(num_heads=num_heads).to(dtype)    
         self.qk_score_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)
         self.context_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN,\
             is_return_float=True).to(dtype)
@@ -206,7 +205,8 @@ class TransformerBlock_Quant(nn.Module):
         cos, sin = compute_rope_params(
             head_dim=head_dim,
             theta_base=cfg["rope_base"],
-            context_length=cfg["context_length"]
+            # context_length=cfg["context_length"]
+            context_length=1024 * 10
         )
         self.register_buffer("cos", cos.to(cfg["dtype"]))
         self.register_buffer("sin", sin.to(cfg["dtype"]))
@@ -243,18 +243,15 @@ class TransformerBlock_Quant(nn.Module):
         # Shortcut connection for feed-forward block
         shortcut = x
         
-        if self.is_quantized == False:
-            
-            x = self.norm2(x)
-            
-            x, _ = self.ff(x, 1.0)
+        # x = self.norm2(x)
+        # x, _ = self.ff(x, 1.0)
         
+        if self.is_quantized == False:
+            x = self.norm2(x)
+            x, _ = self.ff(x, 1.0)
         else:
-            
             x, scale_x = self.norm2(x)
-            
             x, _ = self.ff(x, scale_x)
-            
         
         x = x + shortcut  
 
@@ -302,7 +299,7 @@ class Qwen3Model_Quant(nn.Module):
     def finish_calibration(self):
         for block in self.trf_blocks:
             block.finish_calibration()
-    
+            
 
 if __name__ == "__main__":
     
@@ -394,8 +391,8 @@ if __name__ == "__main__":
     # ================================================================
     # 3. Measure latency
     # ================================================================
-    MAX_NEW_TOKENS = 2000
-    PPL_CONTEXT_TOKENS = 2000
+    MAX_NEW_TOKENS = 2048
+    PPL_CONTEXT_TOKENS = 2048
     EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
@@ -429,4 +426,7 @@ if __name__ == "__main__":
 
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=50))
     print()
-    
+    print("Model Information:")
+    print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")
