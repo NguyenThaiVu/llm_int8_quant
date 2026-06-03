@@ -325,7 +325,7 @@ class Qwen3Model(nn.Module):
 
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
 
-        self.trf_blocks = nn.ModuleList(  # ModuleList since Sequential can only accept one input, and we need `x, mask, cos, sin`
+        self.trf_blocks = nn.ModuleList(  
             [TransformerBlock(cfg) for i in range(cfg["n_layers"])]
         )
         

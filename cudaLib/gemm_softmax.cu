@@ -522,13 +522,24 @@ std::tuple<torch::Tensor, torch::Tensor> softmax_int8_explicit_shared_cuda(
 
 bool check_broadcastable(const at::Tensor& x, const at::Tensor& mask) {
     // Check if mask can be broadcast to x's shape
+
+    // 2D input
     if (mask.sizes() == x.sizes()) return true;
 
+    // 3D input with broadcasting 
     if (mask.dim() + 1 == x.dim()) {
         auto x_last2 = x.sizes().slice(x.dim() - 2);
         auto m_last2 = mask.sizes().slice(mask.dim() - 2);
         return (x_last2 == m_last2) && (mask.size(0) == x_last2[0]);
     }
+
+    // 4D input with broadcasting
+    if (mask.dim() + 2 == x.dim()) {
+        auto x_last2 = x.sizes().slice(x.dim() - 2);
+        auto m_last2 = mask.sizes().slice(mask.dim() - 2);
+        return (x_last2 == m_last2) && (mask.size(0) == x_last2[0]) && (mask.size(1) == x_last2[0]);
+    }
+
     return false;
 }
 

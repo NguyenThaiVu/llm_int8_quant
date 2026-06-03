@@ -1,4 +1,5 @@
 import os 
+import time
 from pathlib import Path
 from safetensors.torch import load_file
 
@@ -38,6 +39,7 @@ else:
     raise ValueError("Model hub folder not found. Please check the paths.")
 
 LOCAL_DIR = os.path.join(MODEL_HUB, MODEL_FOLDER)
+print(f"[INFO] Local directory: {LOCAL_DIR}")
 
 # ===============================================
 # 1. Define Model Architecture
@@ -60,7 +62,8 @@ model.to(device);
 tokenizer_file_path = hf_hub_download(
     repo_id=HF_REPO_ID,
     filename="original/tokenizer.model",
-    local_dir=LOCAL_DIR
+    local_dir=LOCAL_DIR,
+    local_files_only=True
 )
 
 tokenizer = Tokenizer(tokenizer_file_path)
@@ -73,7 +76,8 @@ if LLAMA_SIZE_STR == "1B":
     weights_file = hf_hub_download(
         repo_id=HF_REPO_ID,
         filename="model.safetensors",
-        local_dir=LOCAL_DIR
+        local_dir=LOCAL_DIR,
+        local_files_only=True
     )
     combined_weights = load_file(weights_file)
 else:
@@ -82,7 +86,8 @@ else:
         weights_file = hf_hub_download(
             repo_id=HF_REPO_ID,
             filename=f"model-0000{i}-of-00002.safetensors",
-            local_dir=LOCAL_DIR
+            local_dir=LOCAL_DIR,
+            local_files_only=True
         )
         current_weights = load_file(weights_file)
         combined_weights.update(current_weights)
@@ -96,12 +101,12 @@ del combined_weights  # free up memory
 # 4. Generate Text
 # ===============================================
 
-MAX_GENERATED_TOKENS = 2000
-PPL_CONTEXT_TOKENS = 2000
+MAX_GENERATED_TOKENS = 2048
+PPL_CONTEXT_TOKENS = 2048
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
-    
+
 # ================================================
 # Evaluation Latency
 # ===============================================
@@ -117,7 +122,22 @@ print(f"[INFO] Input tokens: {input_ids.shape}")
 with torch.no_grad():
     out_ids = model(input_ids)
 print(f"[INFO] Output tokens: {out_ids.shape}")
+
+# Measure Latency
+for _ in range(5):
+    with torch.no_grad():
+        out_ids = model(input_ids)
+        
+n_iter = 10
+start_time = time.time()
+for _ in range(n_iter):
+    with torch.no_grad():
+        out_ids = model(input_ids)
+end_time = time.time()
+avg_latency = (end_time - start_time) / n_iter
+print(f"\n[INFO] Average latency: {avg_latency:.4f} seconds per generation (BATCH = 1).")
     
+print(f"\nProfiling the model...")
 with torch.profiler.profile(
     activities=[
         torch.profiler.ProfilerActivity.CPU,

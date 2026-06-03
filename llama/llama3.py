@@ -1,4 +1,5 @@
 import os 
+import time
 from pathlib import Path
 from safetensors.torch import load_file
 
@@ -15,7 +16,7 @@ from utils_generation import *
 from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text
 
 
-LLAMA_SIZE_STR = "1B" # "1B" or "3B"
+LLAMA_SIZE_STR = "3B" # "1B" or "3B"
 IS_INSTRUCT = True # True or False
 
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
@@ -38,6 +39,7 @@ else:
     raise ValueError("Model hub folder not found. Please check the paths.")
 
 LOCAL_DIR = os.path.join(MODEL_HUB, MODEL_FOLDER)
+print(f"[INFO] Using model hub directory: {LOCAL_DIR}")
 
 # ===============================================
 # 1. Define Model Architecture
@@ -60,7 +62,8 @@ model.to(device);
 tokenizer_file_path = hf_hub_download(
     repo_id=HF_REPO_ID,
     filename="original/tokenizer.model",
-    local_dir=LOCAL_DIR
+    local_dir=LOCAL_DIR,
+    local_files_only=True
 )
 
 tokenizer = Tokenizer(tokenizer_file_path)
@@ -97,8 +100,8 @@ print(f"[INFO] Weights loaded successfully.\n")
 # ===============================================
 # 4. Generate Text
 # ===============================================
-MAX_GENERATED_TOKENS = 1024
-PPL_CONTEXT_TOKENS = 1024
+MAX_GENERATED_TOKENS = 2048
+PPL_CONTEXT_TOKENS = 2048
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
@@ -117,7 +120,7 @@ for prompt in list_prompts:
     print("\nResponse:\n", clean_text(output_text))
     
 # ================================================
-# Evaluation
+# 5. Evaluation
 # ===============================================
 
 samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
@@ -128,3 +131,22 @@ ppl = compute_ppl_single_text(model,
                             context_size=PPL_CONTEXT_TOKENS,
                             stride=PPL_STRIDE)
 print(f"\nPPL: {ppl} \n")
+print("Model information:")
+print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
+print(f"Context size: {PPL_CONTEXT_TOKENS}")
+
+# ===============================================
+# 6. Measure Latency 
+# ===============================================
+start_time = time.time()
+for _ in range(10):
+    token_ids = generate(
+        model=model,
+        idx=text_to_token_ids(prompt, tokenizer).to(device),
+        max_new_tokens=MAX_GENERATED_TOKENS,
+        context_size=LLAMA32_CONFIG["context_length"],
+        top_k=1,
+    )
+end_time = time.time()
+avg_latency = (end_time - start_time) / 10
+print(f"\n[INFO] Average latency (before quantization): {avg_latency:.4f} seconds per generation (BATCH = 1).")

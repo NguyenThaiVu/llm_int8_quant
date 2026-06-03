@@ -6,6 +6,7 @@ import gemm_cutlass
 from utils_quant import quantize_row_int8_symmetric_nd, quantize_tensor
 
 MAX_SEQ_LEN = 2112 # 576 or 1040 or 2112
+BATCH_SIZE = 1 # 1, 4, 16, 64, 128
 
 class Custom_Linear(nn.Module):
     """
@@ -58,8 +59,14 @@ class Custom_Linear(nn.Module):
             assert x.dtype == torch.int8,\
                 "Expected int8 input in quantization"
             
-            seq_len = x.shape[0]
-            scale_y_value = self.scale_y[:seq_len]
+            if x.dim() == 2:
+                seq_len = x.shape[0]
+                scale_y_value = self.scale_y[:seq_len]
+            elif x.dim() == 3:
+                seq_len = x.shape[1]
+                scale_y_value = self.scale_y[:, :seq_len]
+            else:
+                raise ValueError(f"Unsupported input dimensions: {x.dim()}")
             
             row_scale = scale_x / scale_y_value  
             col_scale = self.scale_w.expand(self.out_features)
@@ -99,7 +106,6 @@ class Custom_Softmax(nn.Module):
             return out, 1.0
         else:          
             x_int8 = x
-            
             out_q, scale_out = gemm_cutlass.func_softmax_lastdim_int8_masking(
                 x_int8, scale_x, mask
             )
@@ -186,7 +192,14 @@ class Custom_RoPE(nn.Module):
         origin_shape = x.shape
         origin_dtype = x.dtype
         
-        num_heads, seq_len, head_dim = x.shape
+        if x.dim() == 2:
+            seq_len, head_dim = x.shape
+        elif x.dim() == 3:
+            num_heads, seq_len, head_dim = x.shape
+        elif x.dim() == 4:
+            batch_size, num_heads, seq_len, head_dim = x.shape
+        else:
+            raise ValueError(f"Unsupported input dimensions: {x.dim()}")
         assert head_dim % 2 == 0, "Head dimension must be even"
         
         if self.is_quantized == False:
@@ -208,7 +221,6 @@ class Custom_RoPE(nn.Module):
             return out, 1.0
         else:
             assert x.dtype == torch.int8, "Expected int8 input in quantized mode"
-            seq_len = x.shape[1]
             
             cos = cos[:seq_len, :]
             sin = sin[:seq_len, :]
@@ -216,6 +228,8 @@ class Custom_RoPE(nn.Module):
             Y_int8, scale_out = gemm_cutlass.func_apply_rope_int8(x, scale_x, \
                             cos, scale_cos,
                             sin, scale_sin)
+            Y_int8 = Y_int8.view(origin_shape)
+            scale_out = scale_out.view(origin_shape[:-1])
             return Y_int8, scale_out
     
     def finish_calibration(self):
@@ -256,7 +270,11 @@ class Custom_Matmul(nn.Module):
             if A.dim() == 2:
                 C = torch.matmul(A, B.T)
             elif A.dim() == 3:
-                C = torch.matmul(A, B.transpose(-1, -2))
+                C = torch.matmul(A, B.transpose(-2, -1))
+            elif A.dim() == 4:
+                C = torch.matmul(A, B.transpose(-2, -1))
+            else:
+                raise ValueError(f"Unsupported input dimensions: {A.dim()}")
             return C, 1.0
         else:
             if A.dim() == 2:
@@ -277,6 +295,15 @@ class Custom_Matmul(nn.Module):
                         A, B, scale_A, scale_B
                     )
                     return C_int8, scale_C
+            elif A.dim() == 4:
+                if self.is_return_float:
+                    C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)
+                    return C, 1.0
+                else:
+                    C_int8, scale_C = gemm_cutlass.func_int8_matmul_out_int8_three_scale_batched(
+                        A, B, scale_A, scale_B
+                    )
+                    return C_int8, scale_C
             else:
                 raise ValueError(f"Unsupported input dimensions: {A.dim()}")
         
@@ -285,7 +312,7 @@ class Custom_Matmul(nn.Module):
         
 
 class MinMaxObserverPerLastDim(nn.Module): 
-    def __init__(self, max_batch=1, max_seq_len=MAX_SEQ_LEN): 
+    def __init__(self, max_batch=BATCH_SIZE, max_seq_len=MAX_SEQ_LEN): 
         super().__init__() 
         self.max_batch = max_batch 
         self.max_seq_len = max_seq_len 
@@ -422,8 +449,14 @@ class Custom_Linear_PerRow(nn.Module):
             return out, 1.0
         else:
             assert x.dtype == torch.int8, "Expect int8 input in quantization"
-            seq_len = x.shape[0]
-            scale_y_value = self.scale_y[:seq_len]
+            if x.dim() == 2:
+                seq_len = x.shape[0]
+                scale_y_value = self.scale_y[:seq_len]
+            elif x.dim() == 3:
+                seq_len = x.shape[1]
+                scale_y_value = self.scale_y[:, :seq_len]
+            else:
+                raise ValueError(f"Unsupported input dimensions: {x.dim()}")
             
             row_scale = scale_x / scale_y_value  
             col_scale = self.scale_w.expand(self.out_features)

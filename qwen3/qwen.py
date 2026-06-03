@@ -29,7 +29,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "32B"  # Options: "4B", "8B", "14B", or "32B"
 
 if __name__ == "__main__":
     
@@ -43,7 +43,6 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
     model.to(device);
 
-            
 
     if USE_REASONING_MODEL or USE_INSTRUCT_MODEL:
         repo_id = f"Qwen/Qwen3-{CHOOSE_MODEL}"
@@ -66,27 +65,40 @@ if __name__ == "__main__":
 
     local_dir = Path(repo_id).parts[-1]
     local_dir = os.path.join(MODEL_HUD_FOLDER, local_dir)
+    if not os.path.isdir(local_dir):
+        raise FileNotFoundError(f"Model folder does not exist: {local_dir}")
+    print(f"[INFO] Loading model weights from disk: {local_dir} \n")
 
     if CHOOSE_MODEL == "0.6B":
-        weights_file = hf_hub_download(
-            repo_id=repo_id,
-            filename="model.safetensors",
-            local_dir=local_dir)
+        weights_file = os.path.join(local_dir, "model.safetensors")
+        if not os.path.isfile(weights_file):
+            raise FileNotFoundError(f"Missing weights file: {weights_file}")
         weights_dict = load_file(weights_file)
     else:
-        repo_dir = snapshot_download(repo_id=repo_id, local_dir=local_dir)
+        repo_dir = local_dir
         index_path = os.path.join(repo_dir, "model.safetensors.index.json")
+        if not os.path.isfile(index_path):
+            raise FileNotFoundError(f"Missing index file: {index_path}")
+
         with open(index_path, "r") as f:
             index = json.load(f)
 
         weights_dict = {}
-        for filename in set(index["weight_map"].values()):
+
+        shard_files = sorted(set(index["weight_map"].values()))
+
+        for filename in shard_files:
             shard_path = os.path.join(repo_dir, filename)
+
+            if not os.path.isfile(shard_path):
+                raise FileNotFoundError(f"Missing shard file: {shard_path}")
+
             shard = load_file(shard_path)
             weights_dict.update(shard)
 
     load_weights_into_qwen(model, QWEN3_CONFIG, weights_dict)
     model.to(device)
+    print(f"[INFO] Model weights loaded successfully. \n")
     del weights_dict
 
     # ================================================================
@@ -119,8 +131,8 @@ if __name__ == "__main__":
     # ================================================================
     # 3. Text generation
     # ================================================================
-    MAX_NEW_TOKENS = 2048
-    PPL_CONTEXT_TOKENS = 2048
+    MAX_NEW_TOKENS = 1024
+    PPL_CONTEXT_TOKENS = 1024
     EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 

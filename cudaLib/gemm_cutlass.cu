@@ -209,9 +209,11 @@ torch::Tensor func_w8a8_matmul(
     if (input.dim() == 2) {
         return matmul_w8a8_2D_host(input, weight, alphaRow, alphaCol);
     } else if (input.dim() == 3) {
-        return matmul_w8a8_3D_host(input, weight, alphaRow, alphaCol);
+        return matmul_w8a8_batched_host(input, weight, alphaRow, alphaCol);
+    } else if (input.dim() == 4) {
+        return matmul_w8a8_batched_host(input, weight, alphaRow, alphaCol);
     } else {
-        throw std::invalid_argument("Input tensor must be 2D or 3D");
+        throw std::invalid_argument("Input tensor must be 2D or 3D or 4D");
     }
 }
 
@@ -235,11 +237,18 @@ torch::Tensor func_w8a8o8_matmul(
 }
 
 std::vector<torch::Tensor> func_dequant_transpose_requant(
-    torch::Tensor values_int8,   // int8, [H, L, D]
-    torch::Tensor values_scale   // float, [H, L]
+    torch::Tensor input_int8,   // int8, [H, L, D]
+    torch::Tensor input_scale   // float, [H, L]
 ) {
-    const at::cuda::OptionalCUDAGuard device_guard(values_int8.device());
-    return dequant_transpose_requant_host(values_int8, values_scale);
+    const at::cuda::OptionalCUDAGuard device_guard(input_int8.device());
+
+    if (input_int8.dim() == 3) {
+        return dequant_transpose_requant_3d_host(input_int8, input_scale);
+    } else if (input_int8.dim() == 4) {
+        return dequant_transpose_requant_4d_host(input_int8, input_scale);
+    } else {
+        throw std::invalid_argument("Input tensor must be 3D or 4D");
+    }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

@@ -2,7 +2,7 @@
 
 THRESHOLD_MB=10000
 SLEEP_SECONDS=10
-GPU_ID=0
+GPU_ID=0  # select GPU device 0, 1, 2,...
 PYTHON_FILE="qwen_quant.py" # qwen_quant.py or qwen.py
 
 CMD=(python $PYTHON_FILE)

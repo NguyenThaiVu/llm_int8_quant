@@ -73,7 +73,6 @@ if __name__ == "__main__":
     _, scale_Y = quantize_row_int8_symmetric_nd(y_torch)
     row_scale = scale_X / scale_Y
     col_scale = scale_W
-    print(f"row_scale shape: {row_scale.shape}, col_scale shape: {col_scale.shape}")
     
     Y_int8 = gemm_cutlass.func_w8a8o8_matmul(X_int8, W_int8, row_scale, col_scale)
     time_int8 = measure_time(gemm_cutlass.func_w8a8o8_matmul, X_int8, W_int8, row_scale, col_scale)

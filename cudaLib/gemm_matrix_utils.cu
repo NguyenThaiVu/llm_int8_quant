@@ -96,7 +96,7 @@ __global__ void dequant_transpose_requant_kernel(
     }
 }
 
-std::vector<torch::Tensor> dequant_transpose_requant_host(
+std::vector<torch::Tensor> dequant_transpose_requant_3d_host(
     torch::Tensor values_int8,   // int8, [H, L, D]
     torch::Tensor values_scale   // float, [H, L]
 ) {
@@ -125,6 +125,86 @@ std::vector<torch::Tensor> dequant_transpose_requant_host(
             H, L, D
         );
     });
+
+    return {out_q, out_s};
+}
+
+
+std::vector<torch::Tensor> dequant_transpose_requant_4d_host(
+    torch::Tensor values_int8,   // int8,  [B, H, L, D]
+    torch::Tensor values_scale   // float, [B, H, L]
+) {
+    TORCH_CHECK(values_int8.is_cuda(), "values_int8 must be CUDA");
+    TORCH_CHECK(values_scale.is_cuda(), "values_scale must be CUDA");
+
+    TORCH_CHECK(values_int8.dtype() == torch::kInt8,
+                "values_int8 must be int8");
+
+    TORCH_CHECK(values_scale.dtype() == torch::kFloat32 ||
+                values_scale.dtype() == torch::kFloat16 ||
+                values_scale.dtype() == torch::kBFloat16,
+                "values_scale must be float, half, or bfloat16");
+
+    TORCH_CHECK(values_int8.dim() == 4,
+                "values_int8 must be [B, H, L, D]");
+
+    TORCH_CHECK(values_scale.dim() == 3,
+                "values_scale must be [B, H, L]");
+
+    int64_t B = values_int8.size(0);
+    int64_t H = values_int8.size(1);
+    int64_t L = values_int8.size(2);
+    int64_t D = values_int8.size(3);
+
+    TORCH_CHECK(values_scale.size(0) == B &&
+                values_scale.size(1) == H &&
+                values_scale.size(2) == L,
+                "values_scale shape must be [B, H, L]");
+
+    int64_t BH = B * H;
+
+    auto values_int8_contig = values_int8.contiguous();
+    auto values_scale_contig = values_scale.contiguous();
+
+    // Flatten batch and head:
+    // [B, H, L, D] -> [B*H, L, D]
+    // [B, H, L]    -> [B*H, L]
+    auto values_int8_3d = values_int8_contig.reshape({BH, L, D});
+    auto values_scale_2d = values_scale_contig.reshape({BH, L});
+
+    auto out_q_3d = torch::empty(
+        {BH, D, L},
+        values_int8.options()
+    );
+
+    auto out_s_2d = torch::empty(
+        {BH, D},
+        values_scale.options().dtype(torch::kFloat)
+    );
+
+    dim3 grid((unsigned)D, (unsigned)BH);
+    int threads = 256;
+    size_t shm = threads * sizeof(float);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    dequant_transpose_requant_kernel<<<grid, threads, shm, stream>>>(
+        values_int8_3d.data_ptr<int8_t>(),
+        values_scale_2d.data_ptr<float>(),
+        out_q_3d.data_ptr<int8_t>(),
+        out_s_2d.data_ptr<float>(),
+        (int)BH,
+        (int)L,
+        (int)D
+    );
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    // Restore 4D shape:
+    // [B*H, D, L] -> [B, H, D, L]
+    // [B*H, D]    -> [B, H, D]
+    auto out_q = out_q_3d.reshape({B, H, D, L});
+    auto out_s = out_s_2d.reshape({B, H, D});
 
     return {out_q, out_s};
 }

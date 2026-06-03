@@ -429,9 +429,12 @@ __global__ void silu_mul_int8_kernel_warp_reduction(
 }
 
 std::tuple<torch::Tensor, torch::Tensor> silu_mul_int8_cuda(
-    torch::Tensor x1_int8, torch::Tensor scale_x1,
-    torch::Tensor x2_int8, torch::Tensor scale_x2,
-    torch::Tensor smooth_scale, bool use_warp_reduction
+    torch::Tensor x1_int8, 
+    torch::Tensor scale_x1,
+    torch::Tensor x2_int8, 
+    torch::Tensor scale_x2,
+    torch::Tensor smooth_scale, 
+    bool use_warp_reduction
 ) {
     TORCH_CHECK(x1_int8.is_cuda() && x2_int8.is_cuda(), 
                 "Input int8 tensors must be CUDA");
@@ -439,74 +442,168 @@ std::tuple<torch::Tensor, torch::Tensor> silu_mul_int8_cuda(
                 "Scale tensors must be CUDA");
     TORCH_CHECK(smooth_scale.is_cuda(), 
                 "Smooth scale tensor must be CUDA");
-    
+
     TORCH_CHECK(x1_int8.dtype() == torch::kChar && 
                 x2_int8.dtype() == torch::kChar, 
                 "Input tensors must be int8");
+
     TORCH_CHECK(scale_x1.dtype() == torch::kFloat32 && 
                 scale_x2.dtype() == torch::kFloat32, 
                 "Scale tensors must be float32");
+
     TORCH_CHECK(smooth_scale.dtype() == torch::kFloat32, 
                 "Smooth scale tensor must be float32");
 
-    TORCH_CHECK(x1_int8.dim() == 2 && x2_int8.dim() == 2, 
-                "Input tensors must be 2D");
     TORCH_CHECK(x1_int8.sizes() == x2_int8.sizes(), 
                 "Input tensor sizes must match");
-    TORCH_CHECK(scale_x1.dim() == 1 && scale_x2.dim() == 1, 
-                "Scale tensors must be 1D");
-    TORCH_CHECK(scale_x1.size(0) == x1_int8.size(0) && 
-                scale_x2.size(0) == x2_int8.size(0), 
-                "Scale tensor size must match input rows");
+
+    TORCH_CHECK(x1_int8.dim() == 2 || x1_int8.dim() == 3,
+                "x1_int8 must be 2D [T, D] or 3D [B, T, D]");
+    TORCH_CHECK(x2_int8.dim() == x1_int8.dim(),
+                "x2_int8 must have same number of dims as x1_int8");
+
     TORCH_CHECK(smooth_scale.dim() == 1, 
-                "Smooth scale must be 1D");
-    TORCH_CHECK(smooth_scale.size(0) == x1_int8.size(1), 
-                "Smooth scale size must match input columns");
+                "smooth_scale must be 1D");
 
-    int rows = x1_int8.size(0);
-    int cols = x1_int8.size(1);
+    const bool is_batched = x1_int8.dim() == 3;
 
-    auto out_int8 = torch::empty_like(x1_int8);
-    auto out_scales = torch::empty({rows}, torch::dtype(torch::kFloat32).device(x1_int8.device()));
+    int64_t B = 1;
+    int64_t T;
+    int64_t D;
+    int64_t rows;
+    int64_t cols;
 
-    int threads = (int)std::min<int64_t>(cols, 512);
+    std::vector<int64_t> out_shape;
+    std::vector<int64_t> scale_out_shape;
+
+    torch::Tensor x1_2d;
+    torch::Tensor x2_2d;
+    torch::Tensor scale_x1_1d;
+    torch::Tensor scale_x2_1d;
+
+    if (!is_batched) {
+        // ------------------------------------------------------------
+        // 2D case:
+        // x1_int8:  [T, D]
+        // scale_x1: [T]
+        // ------------------------------------------------------------
+        T = x1_int8.size(0);
+        D = x1_int8.size(1);
+
+        TORCH_CHECK(scale_x1.dim() == 1 && scale_x2.dim() == 1,
+                    "For 2D input, scale_x1 and scale_x2 must be 1D [T]");
+
+        TORCH_CHECK(scale_x1.size(0) == T &&
+                    scale_x2.size(0) == T,
+                    "For 2D input, scale size must match T");
+
+        x1_2d = x1_int8.contiguous();
+        x2_2d = x2_int8.contiguous();
+
+        scale_x1_1d = scale_x1.contiguous();
+        scale_x2_1d = scale_x2.contiguous();
+
+        rows = T;
+        cols = D;
+
+        out_shape = {T, D};
+        scale_out_shape = {T};
+    } else {
+        // ------------------------------------------------------------
+        // 3D case:
+        // x1_int8:  [B, T, D]
+        // scale_x1: [B, T]
+        // ------------------------------------------------------------
+        B = x1_int8.size(0);
+        T = x1_int8.size(1);
+        D = x1_int8.size(2);
+
+        TORCH_CHECK(scale_x1.dim() == 2 && scale_x2.dim() == 2,
+                    "For 3D input, scale_x1 and scale_x2 must be 2D [B, T]");
+
+        TORCH_CHECK(scale_x1.size(0) == B &&
+                    scale_x1.size(1) == T,
+                    "scale_x1 must have shape [B, T]");
+
+        TORCH_CHECK(scale_x2.size(0) == B &&
+                    scale_x2.size(1) == T,
+                    "scale_x2 must have shape [B, T]");
+
+        x1_2d = x1_int8.contiguous().reshape({B * T, D});
+        x2_2d = x2_int8.contiguous().reshape({B * T, D});
+
+        scale_x1_1d = scale_x1.contiguous().reshape({B * T});
+        scale_x2_1d = scale_x2.contiguous().reshape({B * T});
+
+        rows = B * T;
+        cols = D;
+
+        out_shape = {B, T, D};
+        scale_out_shape = {B, T};
+    }
+
+    TORCH_CHECK(smooth_scale.size(0) == D,
+                "smooth_scale size must match last dimension D");
+
+    auto smooth_scale_contig = smooth_scale.contiguous();
+
+    auto out_int8_2d = torch::empty(
+        {rows, cols},
+        x1_int8.options()
+    );
+
+    auto out_scales_1d = torch::empty(
+        {rows},
+        torch::dtype(torch::kFloat32).device(x1_int8.device())
+    );
+
+    int threads = static_cast<int>(std::min<int64_t>(cols, 512));
+
     if (threads & (threads - 1)) {
         int p = 1;
         while ((p << 1) <= threads) p <<= 1;
         threads = p;
     }
+
     threads = std::max(threads, 32);
 
     dim3 block(threads);
     dim3 grid(rows);
+
     auto stream = at::cuda::getCurrentCUDAStream();
 
     if (use_warp_reduction == false) {
-        size_t shared_mem_size = threads * sizeof(float); // for reduction
+        size_t shared_mem_size = threads * sizeof(float);
+
         silu_mul_int8_kernel<<<grid, block, shared_mem_size, stream>>>(
-            x1_int8.data_ptr<int8_t>(),
-            x2_int8.data_ptr<int8_t>(),
-            scale_x1.data_ptr<float>(),
-            scale_x2.data_ptr<float>(),
-            out_int8.data_ptr<int8_t>(),
-            out_scales.data_ptr<float>(),
-            smooth_scale.data_ptr<float>(),
-            rows,
-            cols
+            x1_2d.data_ptr<int8_t>(),
+            x2_2d.data_ptr<int8_t>(),
+            scale_x1_1d.data_ptr<float>(),
+            scale_x2_1d.data_ptr<float>(),
+            out_int8_2d.data_ptr<int8_t>(),
+            out_scales_1d.data_ptr<float>(),
+            smooth_scale_contig.data_ptr<float>(),
+            static_cast<int>(rows),
+            static_cast<int>(cols)
         );
     } else {
         silu_mul_int8_kernel_warp_reduction<<<grid, block, 0, stream>>>(
-            x1_int8.data_ptr<int8_t>(),
-            x2_int8.data_ptr<int8_t>(),
-            scale_x1.data_ptr<float>(),
-            scale_x2.data_ptr<float>(),
-            out_int8.data_ptr<int8_t>(),
-            out_scales.data_ptr<float>(),
-            smooth_scale.data_ptr<float>(),
-            rows,
-            cols
+            x1_2d.data_ptr<int8_t>(),
+            x2_2d.data_ptr<int8_t>(),
+            scale_x1_1d.data_ptr<float>(),
+            scale_x2_1d.data_ptr<float>(),
+            out_int8_2d.data_ptr<int8_t>(),
+            out_scales_1d.data_ptr<float>(),
+            smooth_scale_contig.data_ptr<float>(),
+            static_cast<int>(rows),
+            static_cast<int>(cols)
         );
     }
+
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    auto out_int8 = out_int8_2d.reshape(out_shape);
+    auto out_scales = out_scales_1d.reshape(scale_out_shape);
+
     return std::make_tuple(out_int8, out_scales);
 }

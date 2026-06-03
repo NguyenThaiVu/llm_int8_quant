@@ -1,7 +1,6 @@
 import os 
-from pathlib import Path
 import time
-
+from tqdm import tqdm
 import torch
 torch.manual_seed(123)
 import torch.nn as nn
@@ -14,9 +13,9 @@ from tokenizer import Tokenizer
 from utils_model import *
 from utils_weight import load_weights_into_llama    
 from utils_generation import *
-from utils_evaluation import *
 from utils_quant import *
 from utils_model_quan import *
+from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text
 
 
 LLAMA_SIZE_STR = "3B" # "1B" or "3B"
@@ -34,6 +33,7 @@ elif os.path.exists(MODEL_HUD_FOLDER_2):
 else:
     raise ValueError("Model hub folder not found. Please check the paths.")
 LOCAL_DIR = os.path.join(MODEL_HUB, MODEL_FOLDER)
+
 
 # ===============================================
 # 1. Define Model Architecture
@@ -56,6 +56,7 @@ class Custom_GroupedQueryAttention(nn.Module):
 
         self.head_dim = head_dim
         self.d_out = num_heads * head_dim
+        self.inv_softmax_scale = 1 / (head_dim ** 0.5) # softmax scale: 1/sqrt(d_k)
 
         self.W_query = Custom_Linear(d_in, self.d_out).to(dtype)
         self.W_key = Custom_Linear(d_in, num_kv_groups * head_dim).to(dtype)
@@ -68,12 +69,12 @@ class Custom_GroupedQueryAttention(nn.Module):
         self.softmax_layer = Custom_Softmax(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)    
         self.qk_score_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)
         self.context_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN,\
-                                            is_return_float=True).to(dtype)
+            is_return_float=True).to(dtype)
     
         self.is_quantized = False
 
     def forward(self, x, scale_x, mask, cos, scale_cos, sin, scale_sin):
-        num_tokens, _ = x.shape
+        batch, num_tokens, _ = x.shape
 
         if self.is_quantized == False:  
             queries, _ = self.W_query(x, 1.0)
@@ -81,31 +82,32 @@ class Custom_GroupedQueryAttention(nn.Module):
             values, _ = self.W_value(x, 1.0)
             
             # Reshape and transpose for multi-head attention
-            queries = queries.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
-            keys = keys.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
-            values = values.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+            queries = queries.view(batch, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+            keys = keys.view(batch, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
+            values = values.view(batch, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
             
             # Apply RoPE to Q and K
             queries, _ = self.query_rope(queries, 1.0, cos, 1.0, sin, 1.0)
             keys, _ = self.key_rope(keys, 1.0, cos, 1.0, sin, 1.0)
             
-            keys = keys.repeat_interleave(self.group_size, dim=0)
-            values = values.repeat_interleave(self.group_size, dim=0)
+            # Repeat K and V for grouped attention - shape: (batch, num_heads, num_tokens, head_dim)
+            keys = keys.repeat_interleave(self.group_size, dim=1) 
+            values = values.repeat_interleave(self.group_size, dim=1) 
             
             # Attention score 
             attn_scores, _ = self.qk_score_layer(queries, 1.0, keys, 1.0) 
             
             # Softmax the attention scores
             attn_scores = attn_scores.masked_fill(mask, -torch.inf)
-            attn_scores = attn_scores / (self.head_dim ** 0.5)
+            attn_scores = attn_scores * self.inv_softmax_scale
             attn_weights, _ = self.softmax_layer(attn_scores, 1.0, 1.0)         
             
             # Compute context
-            values = values.transpose(1, 2)  # Shape: (num_heads, head_dim, num_tokens)
+            values = values.transpose(2, 3)  # Shape: (num_heads, head_dim, num_tokens)
             context, _ = self.context_layer(attn_weights, 1.0, values, 1.0)
             
             # Compute output
-            context = context.transpose(0, 1).reshape(num_tokens, self.d_out) 
+            context = context.transpose(1, 2).reshape(batch, num_tokens, self.d_out) 
             out, _ = self.out_proj(context, 1.0)
         else: 
             # === Quantized computation ===
@@ -117,24 +119,25 @@ class Custom_GroupedQueryAttention(nn.Module):
             values_int8, values_scale = self.W_value(x_int8, x_scale)
             
             # Reshape for multi-head 
-            queries_int8 = queries_int8.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
+            queries_int8 = queries_int8.view(batch, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
             
-            keys_int8 = keys_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+            keys_int8 = keys_int8.view(batch, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
             
-            values_int8 = values_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
-            values_scale = values_scale.unsqueeze(0).expand(self.num_kv_groups, -1)
+            values_int8 = values_int8.view(batch, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
+            values_scale = values_scale.unsqueeze(1).expand(-1, self.num_kv_groups, -1)
             
             # Apply RoPE to quantized Q and K
             queries_int8, queries_scale = self.query_rope(queries_int8, queries_scale,\
                                         cos, scale_cos, sin, scale_sin)
+            
             keys_int8, keys_scale = self.key_rope(keys_int8, keys_scale,\
                                         cos, scale_cos, sin, scale_sin)
             
             # Repeat K and V for grouped attention
-            keys_int8 = keys_int8.repeat_interleave(self.group_size, dim=0)
-            keys_scale = keys_scale.repeat_interleave(self.group_size, dim=0)
-            values_int8 = values_int8.repeat_interleave(self.group_size, dim=0)
-            values_scale = values_scale.repeat_interleave(self.group_size, dim=0)
+            keys_int8 = keys_int8.repeat_interleave(self.group_size, dim=1)
+            keys_scale = keys_scale.repeat_interleave(self.group_size, dim=1)
+            values_int8 = values_int8.repeat_interleave(self.group_size, dim=1)
+            values_scale = values_scale.repeat_interleave(self.group_size, dim=1)
             
             # Attention score with quantization    
             attn_scores_int8, attn_scores_scale = self.qk_score_layer(queries_int8,\
@@ -143,7 +146,7 @@ class Custom_GroupedQueryAttention(nn.Module):
                                                         keys_scale)
             
             # Softmax the attention scores with quantization 
-            attn_scores_scale = attn_scores_scale / (self.head_dim ** 0.5)
+            attn_scores_scale = attn_scores_scale * self.inv_softmax_scale  # Adjust scale for softmax
             attn_weights_int8, attn_weights_scale = self.softmax_layer(attn_scores_int8,\
                                                     attn_scores_scale, mask)
             
@@ -156,7 +159,7 @@ class Custom_GroupedQueryAttention(nn.Module):
                                             values_int8,\
                                             values_scale)
 
-            context = context.transpose(0, 1).reshape(num_tokens, self.d_out) 
+            context = context.transpose(1, 2).reshape(batch, num_tokens, self.d_out) 
             out, _ = self.out_proj(context, 1.0)  # Output float for better accuracy
         
         return out
@@ -215,12 +218,16 @@ class TransformerBlock(nn.Module):
         
         if self.is_quantized == False:
             x = self.norm1(x)
-            mask = torch.triu(torch.ones(x.shape[0], x.shape[0],\
+            
+            num_tokens = x.shape[1]
+            mask = torch.triu(torch.ones(num_tokens, num_tokens,\
                                 device=x.device, dtype=torch.bool), diagonal=1)
             x = self.att(x, 1.0, mask, self.cos, 1.0, self.sin, 1.0)  
         else:
             x, scale_x = self.norm1(x)
-            mask = torch.tril(torch.ones((x.shape[0], x.shape[0]),\
+            
+            num_tokens = x.shape[1]
+            mask = torch.tril(torch.ones((num_tokens, num_tokens),\
                             dtype=torch.uint8, device=x.device))
             x = self.att(x, scale_x, mask,\
                         self.cos_int8, self.cos_scale,\
@@ -232,17 +239,12 @@ class TransformerBlock(nn.Module):
         shortcut = x
         
         if self.is_quantized == False:
-            
             x = self.norm2(x)
-            
             x, _ = self.ff(x, 1.0)
         
         else:
-            
             x, scale_x = self.norm2(x)
-            
             x, _ = self.ff(x, scale_x)
-            
         
         x = x + shortcut  
 
@@ -292,6 +294,7 @@ class Llama3Model(nn.Module):
         for block in self.trf_blocks:
             block.finish_calibration()
             
+            
 if __name__ == "__main__":
 
     model = Llama3Model(LLAMA32_CONFIG)
@@ -322,7 +325,6 @@ if __name__ == "__main__":
     # ===============================================
     # 3. Load Weights into Llama
     # ===============================================
-    print(f"\n[INFO] Loading weights into model...")
     if LLAMA_SIZE_STR == "1B":
         weights_file = hf_hub_download(
             repo_id=f"meta-llama/Llama-3.2-{LLAMA_SIZE_STR}-Instruct",
@@ -343,11 +345,9 @@ if __name__ == "__main__":
             current_weights = load_file(weights_file)
             combined_weights.update(current_weights)
 
-
     load_weights_into_llama(model, LLAMA32_CONFIG, combined_weights)
     model.to(device)
     del combined_weights  # free up memory
-    print(f"[INFO] Finished loading weights into model.\n")
 
     # ===============================================
     # 4. Generate Text
@@ -357,24 +357,113 @@ if __name__ == "__main__":
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
     EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
-
-    # ================================================
-    # Evaluation Latency
-    # ===============================================
-    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,\
-                                        split='train') 
-    samples = tokenizer.encode(samples)
-
-    chunk_tokens = samples[0: PPL_CONTEXT_TOKENS]
-
-    input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
-    print(f"[INFO] Input tokens: {input_ids.shape}")
-
-    # Warm-up runs
-    with torch.no_grad():
-        out_ids = model(input_ids)
-    print(f"[INFO] Output tokens: {out_ids.shape}")
+    prompt = "What is Dragon Ball story?"
+    list_prompts = []
+    for _ in range(BATCH_SIZE):
+        list_prompts.append(prompt)
     
+    batch_input_ids = torch.stack([
+        text_to_token_ids(prompt, tokenizer, batch_dim=True).squeeze(0)
+        for prompt in list_prompts
+    ], dim=0).to(device)
+
+    token_ids_batch = generate_batch(
+        model=model,
+        idx=batch_input_ids,
+        max_new_tokens=MAX_GENERATED_TOKENS,
+        context_size=PPL_CONTEXT_TOKENS,
+        temperature=0.0,
+        top_k=1,
+        eos_id=None
+    )
+
+    for i in range(token_ids_batch.shape[0]):
+        output_text = token_ids_to_text(token_ids_batch[i].unsqueeze(0), tokenizer, batch_dim=True)
+        print(f"\nResponse {i}:\n", clean_text(output_text))
+    
+        
+    # ===============================================
+    # 5. Quantization
+    # ===============================================
+
+    print("\nCollecting calibration for quantization...")
+    calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
+                                                    split="train", n=100)
+    calibrate_tokens = tokenizer.encode(calibrate_samples)
+    print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
+
+    # Construct calibration batches
+    CALIBRATION_BATCH_SIZE = BATCH_SIZE
+
+    calibration_chunks = [
+        calibrate_tokens[i:i + PPL_CONTEXT_TOKENS]
+        for i in range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE)
+    ]
+
+    model.eval()
+
+    for i in range(0, len(calibration_chunks), CALIBRATION_BATCH_SIZE):
+        batch_chunks = calibration_chunks[i:i + CALIBRATION_BATCH_SIZE]
+
+        if len(batch_chunks) < CALIBRATION_BATCH_SIZE:
+            break
+
+        input_ids = torch.tensor(
+            batch_chunks,
+            dtype=torch.long,
+            device=device
+        )  # [B, T]
+
+        with torch.no_grad():
+            _ = model(input_ids)
+            
+    
+    # Measure Latency before quantization
+    for _ in range(5):
+        with torch.no_grad():
+            _ = model(input_ids)
+            
+    n_iter = 10
+    start_time = time.time()
+    for _ in range(n_iter):
+        with torch.no_grad():
+            _ = model(input_ids)
+    end_time = time.time()
+    avg_latency = (end_time - start_time) / n_iter
+    print(f"\n[INFO] Average latency (before quantization): {avg_latency:.4f} seconds (batch = {BATCH_SIZE}).")
+    print("Model information:")
+    print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
+    print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    print(f"Batch size: {BATCH_SIZE}\n\n")        
+
+    model.finish_calibration()
+    print(f"[INFO] Finished calibration.")
+
+
+    # ===============================================
+    # Measure Latency after quantization
+    # ===============================================
+    # Warm-up runs
+    for _ in range(5):
+        with torch.no_grad():
+            out_ids = model(input_ids)
+    print(f"[INFO] Output quantization tokens: {out_ids.shape}")
+    
+    n_iter = 10
+    start_time = time.time()
+    for _ in range(n_iter):
+        with torch.no_grad():
+            out_ids = model(input_ids)
+    end_time = time.time()
+    avg_latency = (end_time - start_time) / n_iter
+    print(f"\n[INFO] Average latency (after quantization): {avg_latency:.4f} seconds (batch = {BATCH_SIZE}).")
+    print("Model information:")
+    print(f"Model: Llama-3.2-{LLAMA_SIZE_STR} with QUANTIZATION")
+    print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    print(f"Batch size: {CALIBRATION_BATCH_SIZE}\n")
+        
+    
+    print("\nProfiling the quantized model...")
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
@@ -388,41 +477,4 @@ if __name__ == "__main__":
             out_ids = model(input_ids)
 
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=50))
-    print()
-    
-    # ===============================================
-    # 5. Quantization latency
-    # ===============================================
-            
-    model.finish_calibration()
-    print(f"\n[INFO] Finished calibration.\n")
-
-    # Measure Latency
-    for _ in range(5):
-        with torch.no_grad():
-            out_ids = model(input_ids)
-            
-    n_iter = 10
-    start_time = time.time()
-    for _ in range(n_iter):
-        with torch.no_grad():
-            out_ids = model(input_ids)
-    end_time = time.time()
-    avg_latency = (end_time - start_time) / n_iter
-    print(f"\n[INFO] Average latency: {avg_latency:.4f} seconds per generation (BATCH = 1).")
         
-    print(f"\nProfiling the model...")
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-    ) as prof:
-        with torch.no_grad():
-            out_ids = model(input_ids)
-
-    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
-    

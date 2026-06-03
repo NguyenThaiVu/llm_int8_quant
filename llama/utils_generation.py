@@ -40,6 +40,83 @@ def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=No
     return idx
 
 
+def generate_batch(
+    model,
+    idx,
+    max_new_tokens,
+    context_size,
+    temperature=0.0,
+    top_k=None,
+    eos_id=None
+):
+    """
+    Batched generation.
+
+    idx:
+        [B, T]
+
+    Returns:
+        [B, T + max_new_tokens]
+    """
+
+    assert idx.dim() == 2, f"Expected idx shape [B, T], got {idx.shape}"
+
+    model.eval()
+
+    B = idx.shape[0]
+
+    # Track which sequences have already produced EOS
+    finished = torch.zeros(B, dtype=torch.bool, device=idx.device)
+
+    for _ in range(max_new_tokens):
+        # Correct batch-aware context slicing
+        idx_cond = idx[:, -context_size:]
+
+        with torch.no_grad():
+            logits = model(idx_cond)
+
+        # logits: [B, T, vocab_size]
+        # Take only the last token position for every batch item
+        logits = logits[:, -1, :]
+
+        # Optional top-k filtering
+        if top_k is not None:
+            top_logits, top_indices = torch.topk(logits, top_k, dim=-1)
+
+            if temperature == 0.0:
+                selected = torch.argmax(top_logits, dim=-1, keepdim=True)
+                idx_next = top_indices.gather(dim=-1, index=selected)
+            else:
+                top_logits = top_logits / temperature
+                probs = torch.softmax(top_logits, dim=-1)
+                selected = torch.multinomial(probs, num_samples=1)
+                idx_next = top_indices.gather(dim=-1, index=selected)
+
+        else:
+            if temperature == 0.0:
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
+            else:
+                logits = logits / temperature
+                probs = torch.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+
+        # Handle EOS per batch item
+        if eos_id is not None:
+            idx_next = torch.where(
+                finished.unsqueeze(1),
+                torch.full_like(idx_next, eos_id),
+                idx_next
+            )
+
+            finished = finished | (idx_next.squeeze(1) == eos_id)
+
+        idx = torch.cat((idx, idx_next), dim=1)
+
+        if eos_id is not None and finished.all():
+            break
+
+    return idx
+
 def clean_text(text, start_token="<|start_of_text|>", end_token="<|end_of_text|>"):
     if text is None:
         return text
