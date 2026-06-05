@@ -6,86 +6,86 @@ import gemm_cutlass
 from utils_quant import quantize_row_int8_symmetric_nd, quantize_tensor
 
 MAX_SEQ_LEN = 2112 # 576 or 1040 or 2112
-BATCH_SIZE = 1 # 1, 2, 16, 64, 128
+BATCH_SIZE = 16 # 1, 2, 16, 64, 128
 
-class Custom_Linear(nn.Module):
-    """
-    Linear layer with two execution modes:
-    1. Calibration mode
-        - Input: bf16
-        - Weight: bf16
-        - Output: bf16
-        - Behavior: computes `x @ weight.T` and updates output observer
+# class Custom_Linear(nn.Module):
+#     """
+#     Linear layer with two execution modes:
+#     1. Calibration mode
+#         - Input: bf16
+#         - Weight: bf16
+#         - Output: bf16
+#         - Behavior: computes `x @ weight.T` and updates output observer
     
-    2. Quantization mode
-        - Input: int8
-        - Weight: int8
-        - Output: int8
-        - Behavior: computes quantized matmul with per-row scaling
-                    and returns quantized output and its scale
+#     2. Quantization mode
+#         - Input: int8
+#         - Weight: int8
+#         - Output: int8
+#         - Behavior: computes quantized matmul with per-row scaling
+#                     and returns quantized output and its scale
     
-    This layer has: per-row scale for activation
-                    per-tensor scale for weight. 
-                    The output scale is per-row
+#     This layer has: per-row scale for activation
+#                     per-tensor scale for weight. 
+#                     The output scale is per-row
                     
-    Input shapes: (M, K) or (B, M, K)
-    Weight shapes: (N, K)
-    Output shapes: (M, N) or (B, M, N)
-    """
-    def __init__(self, in_features, out_features, 
-                 max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16):
-        super(Custom_Linear, self).__init__()
+#     Input shapes: (M, K) or (B, M, K)
+#     Weight shapes: (N, K)
+#     Output shapes: (M, N) or (B, M, N)
+#     """
+#     def __init__(self, in_features, out_features, 
+#                  max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16):
+#         super(Custom_Linear, self).__init__()
         
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, 
-                                               dtype=dtype))
+#         self.in_features = in_features
+#         self.out_features = out_features
+#         self.weight = nn.Parameter(torch.empty(out_features, in_features, 
+#                                                dtype=dtype))
         
-        # Weight quantization
-        self.weight_q = torch.empty(out_features, in_features, dtype=torch.int8)
-        self.scale_w = torch.ones((1), dtype=torch.float32)
+#         # Weight quantization
+#         self.weight_q = torch.empty(out_features, in_features, dtype=torch.int8)
+#         self.scale_w = torch.ones((1), dtype=torch.float32)
         
-        # Output scale quantization
-        self.scale_y = torch.ones((out_features), dtype=torch.float32)  
-        self.out_observer = MinMaxObserverPerLastDim(max_seq_len=max_seq_len)
-        self.is_quantized = False
+#         # Output scale quantization
+#         self.scale_y = torch.ones((out_features), dtype=torch.float32)  
+#         self.out_observer = MinMaxObserverPerLastDim(max_seq_len=max_seq_len)
+#         self.is_quantized = False
         
-    def forward(self, x, scale_x):
-        if not self.is_quantized:  
-            out = torch.matmul(x, self.weight.t())  
-            self.out_observer(out)
-            return out, 1.0
-        else:
-            assert x.dtype == torch.int8,\
-                "Expected int8 input in quantization"
+#     def forward(self, x, scale_x):
+#         if not self.is_quantized:  
+#             out = torch.matmul(x, self.weight.t())  
+#             self.out_observer(out)
+#             return out, 1.0
+#         else:
+#             assert x.dtype == torch.int8,\
+#                 "Expected int8 input in quantization"
             
-            if x.dim() == 2:
-                seq_len = x.shape[0]
-                scale_y_value = self.scale_y[:seq_len]
-            elif x.dim() == 3:
-                seq_len = x.shape[1]
-                scale_y_value = self.scale_y[:, :seq_len]
-            else:
-                raise ValueError(f"Unsupported input dimensions: {x.dim()}")
+#             if x.dim() == 2:
+#                 seq_len = x.shape[0]
+#                 scale_y_value = self.scale_y[:seq_len]
+#             elif x.dim() == 3:
+#                 seq_len = x.shape[1]
+#                 scale_y_value = self.scale_y[:, :seq_len]
+#             else:
+#                 raise ValueError(f"Unsupported input dimensions: {x.dim()}")
             
-            row_scale = scale_x / scale_y_value  
-            col_scale = self.scale_w.expand(self.out_features)
+#             row_scale = scale_x / scale_y_value  
+#             col_scale = self.scale_w.expand(self.out_features)
             
-            out_q = gemm_cutlass.func_w8a8o8_matmul(x, self.weight_q,\
-                row_scale, col_scale)
+#             out_q = gemm_cutlass.func_w8a8o8_matmul(x, self.weight_q,\
+#                 row_scale, col_scale)
 
-            return out_q, scale_y_value
+#             return out_q, scale_y_value
         
-    def finish_calibration(self):
-        weight_q, scale_w = quantize_tensor(self.weight)
-        self.weight_q = weight_q
-        self.scale_w = scale_w
+#     def finish_calibration(self):
+#         weight_q, scale_w = quantize_tensor(self.weight)
+#         self.weight_q = weight_q
+#         self.scale_w = scale_w
         
-        self.scale_y = self.out_observer.get_scale().to(self.scale_w.device)
+#         self.scale_y = self.out_observer.get_scale().to(self.scale_w.device)
         
-        self.is_quantized = True  
-        del self.weight
-        torch.cuda.empty_cache()
+#         self.is_quantized = True  
+#         del self.weight
+#         torch.cuda.empty_cache()
         
         
 class Custom_Softmax(nn.Module):
@@ -252,6 +252,28 @@ class Custom_RoPE(nn.Module):
     
     def finish_calibration(self):
         self.is_quantized = True
+        
+
+def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=torch.float32):
+    assert head_dim % 2 == 0, "Embedding dimension must be even"
+
+    # Compute the inverse frequencies
+    inv_freq = 1.0 / (theta_base ** (torch.arange(0, head_dim, 2, dtype=dtype)[: (head_dim // 2)].float() / head_dim))
+
+    # Generate position indices
+    positions = torch.arange(context_length, dtype=dtype)
+
+    # Compute the angles
+    angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)  # Shape: (context_length, head_dim // 2)
+
+    # Expand angles to match the head_dim
+    angles = torch.cat([angles, angles], dim=1)  # Shape: (context_length, head_dim)
+
+    # Precompute sine and cosine
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+
+    return cos, sin
         
 
 class Custom_Matmul(nn.Module):
@@ -438,9 +460,9 @@ def compute_smooth_alpha(input_observer, weight, lambd=0.5):
     return alpha
 
 
-class Custom_Linear_PerRow(nn.Module):
+class Custom_Linear(nn.Module):
     def __init__(self, in_features, out_features, max_seq_len=MAX_SEQ_LEN):
-        super(Custom_Linear_PerRow, self).__init__()
+        super(Custom_Linear, self).__init__()
         
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         self.in_features = in_features
@@ -553,11 +575,11 @@ class Custom_FeedForward(nn.Module):
     def __init__(self, cfg):
         super().__init__()
 
-        self.fc1 = Custom_Linear_PerRow(cfg["emb_dim"], cfg["hidden_dim"],\
+        self.fc1 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"],\
                                         max_seq_len=MAX_SEQ_LEN)
-        self.fc2 = Custom_Linear_PerRow(cfg["emb_dim"], cfg["hidden_dim"],\
+        self.fc2 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"],\
                                         max_seq_len=MAX_SEQ_LEN)
-        self.fc3 = Custom_Linear_PerRow(cfg["hidden_dim"], cfg["emb_dim"],\
+        self.fc3 = Custom_Linear(cfg["hidden_dim"], cfg["emb_dim"],\
                                         max_seq_len=MAX_SEQ_LEN)
         self.silu_layer = Custom_Silu(cfg["hidden_dim"])
         
@@ -599,5 +621,240 @@ class Custom_FeedForward(nn.Module):
         fc3_smooth_alpha = self.fc3.smooth_alpha
         self.silu_layer.enable_smooth_scale(fc3_smooth_alpha)
         self.silu_layer.finish_calibration()
+        
+        self.is_quantized = True
+
+
+class Custom_GroupedQueryAttention(nn.Module):
+    def __init__(
+        self, d_in, num_heads, num_kv_groups, head_dim=None, dtype=torch.bfloat16
+    ):
+        super().__init__()
+        assert num_heads % num_kv_groups == 0, "num_heads must be divisible by num_kv_groups"
+
+        self.num_heads = num_heads
+        self.num_kv_groups = num_kv_groups
+        self.group_size = num_heads // num_kv_groups
+        self.dtype = dtype
+
+        if head_dim is None:
+            assert d_in % num_heads == 0, "`d_in` must be divisible by `num_heads` if `head_dim` is not set"
+            head_dim = d_in // num_heads
+
+        self.head_dim = head_dim
+        self.d_out = num_heads * head_dim
+
+        self.W_query = Custom_Linear(d_in, self.d_out).to(dtype)
+        self.W_key = Custom_Linear(d_in, num_kv_groups * head_dim).to(dtype)
+        self.W_value = Custom_Linear(d_in, num_kv_groups * head_dim).to(dtype)
+        self.out_proj = Custom_Linear(self.d_out, d_in).to(dtype)
+
+        self.query_rope = Custom_RoPE(num_heads, max_seq_len=MAX_SEQ_LEN, head_dim=head_dim).to(dtype)
+        self.key_rope = Custom_RoPE(num_kv_groups, max_seq_len=MAX_SEQ_LEN, head_dim=head_dim).to(dtype)
+        
+        self.softmax_layer = Custom_Softmax(num_heads=num_heads).to(dtype)    
+        self.qk_score_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)
+        self.context_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN,\
+            is_return_float=True).to(dtype)
+        
+        self.q_norm = Custom_RMSNorm(head_dim, eps=1e-6).to(dtype)
+        self.k_norm = Custom_RMSNorm(head_dim, eps=1e-6).to(dtype)
+    
+        self.is_quantized = False
+
+    def forward(self, x, scale_x, mask, cos, scale_cos, sin, scale_sin):
+        num_tokens, _ = x.shape
+
+        if self.is_quantized == False:  
+            queries, _ = self.W_query(x, 1.0)
+            keys, _ = self.W_key(x, 1.0)
+            values, _ = self.W_value(x, 1.0)
+            
+            # Reshape and transpose for multi-head attention
+            queries = queries.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
+            keys = keys.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+            values = values.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+            
+            # Normalize Q and K
+            queries = self.q_norm(queries, 1.0)
+            keys = self.k_norm(keys, 1.0)
+            
+            # Apply RoPE to Q and K
+            queries, _ = self.query_rope(queries, 1.0, cos, 1.0, sin, 1.0)
+            keys, _ = self.key_rope(keys, 1.0, cos, 1.0, sin, 1.0)
+            
+            keys = keys.repeat_interleave(self.group_size, dim=0)
+            values = values.repeat_interleave(self.group_size, dim=0)
+            
+            # Attention score 
+            attn_scores, _ = self.qk_score_layer(queries, 1.0, keys, 1.0) 
+            attn_scores = attn_scores.masked_fill(mask, -torch.inf)
+            attn_scores = attn_scores / (self.head_dim ** 0.5)
+            attn_weights, _ = self.softmax_layer(attn_scores, 1.0, 1.0)         
+            
+            # Compute context
+            values = values.transpose(1, 2)  # Shape: (num_heads, head_dim, num_tokens)
+            context, _ = self.context_layer(attn_weights, 1.0, values, 1.0)
+            
+            # Compute output
+            context = context.transpose(0, 1).reshape(num_tokens, self.d_out) 
+            out, _ = self.out_proj(context, 1.0)
+        else: 
+            # === Quantized computation ===
+            x_int8 = x
+            x_scale = scale_x
+            
+            queries_int8, queries_scale = self.W_query(x_int8, x_scale)
+            keys_int8, keys_scale = self.W_key(x_int8, x_scale)
+            values_int8, values_scale = self.W_value(x_int8, x_scale)
+            
+            # Reshape for multi-head 
+            queries_int8 = queries_int8.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
+            queries_scale = queries_scale.unsqueeze(0).expand(self.num_heads, -1)
+            
+            keys_int8 = keys_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+            keys_scale = keys_scale.unsqueeze(0).expand(self.num_kv_groups, -1)
+
+            values_int8 = values_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+            values_scale = values_scale.unsqueeze(0).expand(self.num_kv_groups, -1)
+            
+            # Normalize Q and K
+            queries_int8, queries_scale = self.q_norm(queries_int8, queries_scale)
+            keys_int8, keys_scale = self.k_norm(keys_int8, keys_scale)
+            
+            # Apply RoPE to quantized Q and K
+            queries_int8, queries_scale = self.query_rope(queries_int8, queries_scale,\
+                                        cos, scale_cos, sin, scale_sin)
+            
+            keys_int8, keys_scale = self.key_rope(keys_int8, keys_scale,\
+                                        cos, scale_cos, sin, scale_sin)
+            
+            # Repeat K and V for grouped attention
+            keys_int8 = keys_int8.repeat_interleave(self.group_size, dim=0)
+            keys_scale = keys_scale.repeat_interleave(self.group_size, dim=0)
+            values_int8 = values_int8.repeat_interleave(self.group_size, dim=0)
+            values_scale = values_scale.repeat_interleave(self.group_size, dim=0)
+            
+            # Attention score 
+            attn_scores_int8, attn_scores_scale = self.qk_score_layer(queries_int8,\
+                                                        queries_scale,\
+                                                        keys_int8,\
+                                                        keys_scale)
+            
+            attn_scores_scale = attn_scores_scale / (self.head_dim ** 0.5)
+            attn_weights_int8, attn_weights_scale = self.softmax_layer(attn_scores_int8,\
+                                                    attn_scores_scale, mask)
+            
+            # Compute context 
+            values_int8, values_scale = gemm_cutlass.func_dequant_transpose_requant(values_int8,\
+                                                        values_scale)
+            
+            context, _ = self.context_layer(attn_weights_int8,\
+                                            attn_weights_scale,\
+                                            values_int8,\
+                                            values_scale)
+
+            # Output projection
+            context = context.transpose(0, 1).reshape(num_tokens, self.d_out) 
+            out, _ = self.out_proj(context, 1.0)  # Output float for better accuracy
+        
+        return out
+    
+    def finish_calibration(self):
+        self.W_query.finish_calibration()
+        # Key and Value use the same smooth alpha as Query
+        smooth_query = self.W_query.smooth_alpha
+        self.W_key.finish_calibration(alpha=smooth_query) 
+        self.W_value.finish_calibration(alpha=smooth_query) 
+        
+        self.q_norm.finish_calibration()
+        self.k_norm.finish_calibration()
+        self.query_rope.finish_calibration()
+        self.key_rope.finish_calibration()
+        self.softmax_layer.finish_calibration()
+        self.qk_score_layer.finish_calibration()
+        self.context_layer.finish_calibration()
+        # self.out_proj.finish_calibration()
+        self.is_quantized = True
+
+
+class TransformerBlock_Quant(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.att = Custom_GroupedQueryAttention(
+            d_in=cfg["emb_dim"],
+            num_heads=cfg["n_heads"],
+            head_dim=cfg["head_dim"],
+            num_kv_groups=cfg["n_kv_groups"],
+            dtype=cfg["dtype"])
+        
+        self.norm1 = RMSNorm_Fuse_Quant(cfg["emb_dim"], eps=1e-6, dtype=cfg["dtype"])
+        
+        self.norm2 = RMSNorm_Fuse_Quant(cfg["emb_dim"], eps=1e-6, dtype=cfg["dtype"])
+        
+        self.ff = Custom_FeedForward(cfg).to(cfg["dtype"])
+        
+        if cfg["head_dim"] is None:
+            head_dim = cfg["emb_dim"] // cfg["n_heads"]
+        else:
+            head_dim = cfg["head_dim"]
+        cos, sin = compute_rope_params(
+            head_dim=head_dim,
+            theta_base=cfg["rope_base"],
+            context_length=cfg["context_length"]
+            # context_length=MAX_SEQ_LEN
+        )
+        self.register_buffer("cos", cos.to(cfg["dtype"]))
+        self.register_buffer("sin", sin.to(cfg["dtype"]))
+        
+        cos_int8, cos_scale = quantize_tensor(cos)
+        sin_int8, sin_scale = quantize_tensor(sin)
+        self.register_buffer("cos_int8", cos_int8)
+        self.register_buffer("cos_scale", cos_scale)
+        self.register_buffer("sin_int8", sin_int8)
+        self.register_buffer("sin_scale", sin_scale)
+
+        self.is_quantized = False
+
+    def forward(self, x):
+        # 1. Shortcut for attention block
+        shortcut = x
+        seq_len = x.shape[0]
+        
+        if self.is_quantized == False:
+            x = self.norm1(x) 
+            mask = torch.triu(torch.ones(seq_len, seq_len,\
+                                device=x.device, dtype=torch.bool), diagonal=1)
+            x = self.att(x, 1.0, mask, self.cos, 1.0, self.sin, 1.0)  
+        else:
+            x, x_scale = self.norm1(x)
+            mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.uint8, device=x.device))
+            x = self.att(x, x_scale, mask, self.cos_int8, self.cos_scale,\
+                                            self.sin_int8, self.sin_scale)
+            
+        x = x + shortcut  
+
+        # Shortcut connection for feed-forward block
+        shortcut = x
+        if self.is_quantized == False:
+            x = self.norm2(x)
+            x, _ = self.ff(x, 1.0)
+        else:
+            x, scale_x = self.norm2(x)
+            x, _ = self.ff(x, scale_x)
+        x = x + shortcut  
+
+        return x
+    
+    def finish_calibration(self):
+        self.att.finish_calibration()
+        self.norm1.finish_calibration()
+        smooth_scale = self.att.W_query.smooth_alpha
+        self.norm1.enable_smooth_scale(smooth_scale)
+        
+        self.ff.finish_calibration()
+        self.norm2.finish_calibration()
+        smooth_scale = self.ff.fc1.smooth_alpha
+        self.norm2.enable_smooth_scale(smooth_scale)
         
         self.is_quantized = True

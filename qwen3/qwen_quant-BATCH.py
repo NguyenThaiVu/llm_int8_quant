@@ -1,11 +1,9 @@
 import os
-# Use second GPU
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # select GPU "0", "1", "2",...
 
 import time
 from pathlib import Path
-from datasets import load_dataset
-from tqdm import tqdm
+
 import torch
 torch.manual_seed(123)
 import torch.nn as nn
@@ -99,8 +97,6 @@ class Custom_GroupedQueryAttention(nn.Module):
             
             # Attention score 
             attn_scores, _ = self.qk_score_layer(queries, 1.0, keys, 1.0) 
-            
-            # Softmax the attention scores
             attn_scores = attn_scores.masked_fill(mask, -torch.inf)
             attn_scores = attn_scores / (self.head_dim ** 0.5)
             attn_weights, _ = self.softmax_layer(attn_scores, 1.0, 1.0)         
@@ -147,13 +143,12 @@ class Custom_GroupedQueryAttention(nn.Module):
             values_int8 = values_int8.repeat_interleave(self.group_size, dim=1)
             values_scale = values_scale.repeat_interleave(self.group_size, dim=1)
             
-            # Attention score with quantization    
+            # Attention score 
             attn_scores_int8, attn_scores_scale = self.qk_score_layer(queries_int8,\
                                                         queries_scale,\
                                                         keys_int8,\
                                                         keys_scale)
             
-            # Softmax the attention scores with quantization 
             attn_scores_scale = attn_scores_scale / (self.head_dim ** 0.5)
             attn_weights_int8, attn_weights_scale = self.softmax_layer(attn_scores_int8,\
                                                     attn_scores_scale, mask)
@@ -174,8 +169,11 @@ class Custom_GroupedQueryAttention(nn.Module):
     
     def finish_calibration(self):
         self.W_query.finish_calibration()
-        self.W_key.finish_calibration()
-        self.W_value.finish_calibration()
+        # Key and Value use the same smooth alpha as Query
+        smooth_query = self.W_query.smooth_alpha
+        self.W_key.finish_calibration(alpha=smooth_query) 
+        self.W_value.finish_calibration(alpha=smooth_query) 
+        
         self.q_norm.finish_calibration()
         self.k_norm.finish_calibration()
         self.query_rope.finish_calibration()
@@ -227,29 +225,21 @@ class TransformerBlock_Quant(nn.Module):
         self.is_quantized = False
 
     def forward(self, x):
+        
+        if x.dim() == 2:
+            num_tokens, _ = x.shape
+        elif x.dim() == 3:
+            batch, num_tokens, _ = x.shape
+        
         # 1. Shortcut for attention block
         shortcut = x
-        
         if self.is_quantized == False:
             x = self.norm1(x) 
-            if x.dim() == 2:
-                num_tokens, _ = x.shape
-            elif x.dim() == 3:
-                batch, num_tokens, _ = x.shape
-            
-            mask = torch.triu(torch.ones(num_tokens, num_tokens,\
-                                device=x.device, dtype=torch.bool), diagonal=1)
+            mask = torch.triu(torch.ones(num_tokens, num_tokens, device=x.device, dtype=torch.bool), diagonal=1)
             x = self.att(x, 1.0, mask, self.cos, 1.0, self.sin, 1.0)  
         else:
             x, x_scale = self.norm1(x)
-            
-            if x.dim() == 2:
-                num_tokens, _ = x.shape
-            elif x.dim() == 3:
-                batch, num_tokens, _ = x.shape
-            
-            mask = torch.tril(torch.ones((num_tokens, num_tokens),\
-                            dtype=torch.uint8, device=x.device))
+            mask = torch.tril(torch.ones((num_tokens, num_tokens), dtype=torch.uint8, device=x.device))
             x = self.att(x, x_scale, mask, self.cos_int8, self.cos_scale,\
                                             self.sin_int8, self.sin_scale)
             
@@ -257,14 +247,12 @@ class TransformerBlock_Quant(nn.Module):
 
         # Shortcut connection for feed-forward block
         shortcut = x
-    
         if self.is_quantized == False:
             x = self.norm2(x)
             x, _ = self.ff(x, 1.0)
         else:
             x, scale_x = self.norm2(x)
             x, _ = self.ff(x, scale_x)
-        
         x = x + shortcut  
 
         return x
@@ -272,9 +260,10 @@ class TransformerBlock_Quant(nn.Module):
     def finish_calibration(self):
         self.att.finish_calibration()
         self.norm1.finish_calibration()
+        smooth_scale = self.att.W_query.smooth_alpha
+        self.norm1.enable_smooth_scale(smooth_scale)
         
         self.ff.finish_calibration()
-        
         self.norm2.finish_calibration()
         smooth_scale = self.ff.fc1.smooth_alpha
         self.norm2.enable_smooth_scale(smooth_scale)
@@ -345,9 +334,7 @@ if __name__ == "__main__":
         MODEL_HUD_FOLDER = MODEL_HUD_FOLDER_2
     else:
         raise ValueError("Please update the MODEL_HUD_FOLDER.")
-
-    local_dir = Path(repo_id).parts[-1]
-    local_dir = os.path.join(MODEL_HUD_FOLDER, local_dir)
+    local_dir = os.path.join(MODEL_HUD_FOLDER, repo_id)
     print(f"[INFO] Loading model weights from disk: {local_dir} \n")
 
     if CHOOSE_MODEL == "0.6B":
@@ -385,7 +372,7 @@ if __name__ == "__main__":
     else:
         tokenizer_file_path = f"Qwen3-{CHOOSE_MODEL}-Base/tokenizer.json"
 
-    tokenizer_file_path = os.path.join(MODEL_HUD_FOLDER, f"Qwen3-{CHOOSE_MODEL}-Base/tokenizer.json")
+    tokenizer_file_path = os.path.join(MODEL_HUD_FOLDER, tokenizer_file_path)
 
     hf_hub_download(repo_id=repo_id, filename="tokenizer.json", local_dir=local_dir)
 
@@ -444,7 +431,7 @@ if __name__ == "__main__":
 
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=100)
+                                                    split="train", n=1_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
 
@@ -457,27 +444,13 @@ if __name__ == "__main__":
     ]
 
     model.eval()
-
-    # for i in range(0, len(calibration_chunks), CALIBRATION_BATCH_SIZE):
-    #     batch_chunks = calibration_chunks[i:i + CALIBRATION_BATCH_SIZE]
-
-    #     if len(batch_chunks) < CALIBRATION_BATCH_SIZE:
-    #         break
-
-    #     input_ids = torch.tensor(
-    #         batch_chunks,
-    #         dtype=torch.long,
-    #         device=device
-    #     )  # [B, T]
-
-    #     with torch.no_grad():
-    #         _ = model(input_ids)
     
     input_ids = torch.tensor(
         calibration_chunks[:CALIBRATION_BATCH_SIZE],
         dtype=torch.long,
         device=device
     )  # [B, T]
+    print(f"[INFO] Input shape: {input_ids.shape}")
             
     
     # Measure Latency before quantization
@@ -509,7 +482,6 @@ if __name__ == "__main__":
     for _ in range(5):
         with torch.no_grad():
             out_ids = model(input_ids)
-    print(f"[INFO] Output quantization tokens: {out_ids.shape}")
     
     n_iter = 10
     start_time = time.time()
