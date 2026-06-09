@@ -77,13 +77,23 @@ std::tuple<torch::Tensor, torch::Tensor> func_softmax_lastdim_int8_masking(
   return softmax_lastdim_int8_masking_cuda(x_q, scale_x, mask);
 }
 
-torch::Tensor func_rmsnorm(
+torch::Tensor func_rmsnorm_bf16(
     torch::Tensor x,      // BF16, shape (tokens, d_model)
     torch::Tensor gamma,  // BF16, shape (d_model,)
     float eps) 
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    return rmsnorm_cuda(x, gamma, eps);
+    return rmsnorm_bf16_cuda(x, gamma, eps);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> func_rmsnorm_bf16_to_int8(
+    torch::Tensor x,      // FP32, shape (tokens, d_model)
+    torch::Tensor gamma,  // FP32, shape (d_model,)
+    torch::Tensor smooth_scale, // FP32, shape (d_model,)
+    float eps) 
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    return rmsnorm_bf16_to_int8_cuda(x, gamma, smooth_scale, eps);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> func_rmsnorm_quant(
@@ -272,9 +282,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &func_softmax_lastdim_int8_masking,
         "Softmax along last dimension for 3D int8 with per-row scale and masking");
 
-    m.def("func_rmsnorm",
-        &func_rmsnorm,
-        "RMSNorm for 2D float32 input with float32 gamma");
+    m.def("func_rmsnorm_bf16",
+        &func_rmsnorm_bf16,
+        "RMSNorm for 2D bf16 input and return bf16 output");
+
+    m.def("func_rmsnorm_bf16_to_int8",
+        &func_rmsnorm_bf16_to_int8,
+        "RMSNorm for 2D bf16 input and return quantized int8 output with per-row scale");
 
     m.def("func_rmsnorm_quant",
         &func_rmsnorm_quant,

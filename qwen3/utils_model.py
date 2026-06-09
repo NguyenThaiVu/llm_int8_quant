@@ -79,7 +79,7 @@ def apply_rope(x, cos, sin):
     # It's ok to use lower-precision after applying cos and sin rotation
     return x_rotated.to(dtype=x.dtype)
 
-class GroupedQueryAttention(nn.Module):
+class SmoothQuant_GroupedQueryAttention(nn.Module):
     def __init__(
         self, d_in, num_heads, num_kv_groups, head_dim=None, qk_norm=False, dtype=None
     ):
@@ -148,7 +148,7 @@ class GroupedQueryAttention(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.att = GroupedQueryAttention(
+        self.att = SmoothQuant_GroupedQueryAttention(
             d_in=cfg["emb_dim"],
             num_heads=cfg["n_heads"],
             head_dim=cfg["head_dim"],

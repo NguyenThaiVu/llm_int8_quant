@@ -2,8 +2,6 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # select GPU "0", "1", "2",...
 
 import time
-from pathlib import Path
-
 import torch
 torch.manual_seed(123)
 import torch.nn as nn
@@ -11,13 +9,13 @@ from torch.nn import functional as F
 
 import json
 from safetensors.torch import load_file
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import hf_hub_download
 
 from utils_tokenizer import Qwen3Tokenizer
 from config import get_model_config, load_weights_into_qwen
 from utils_model import *
 from utils_generation import *
-from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text
+from utils_evaluation import load_wikitext_single_text
 from utils_model_quan import *
 
 import gemm_cutlass
@@ -27,7 +25,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B"
 
 class Custom_GroupedQueryAttention(nn.Module):
     def __init__(
@@ -215,11 +213,11 @@ class TransformerBlock_Quant(nn.Module):
         self.register_buffer("cos", cos.to(cfg["dtype"]))
         self.register_buffer("sin", sin.to(cfg["dtype"]))
         
-        cos_int8, cos_scale = quantize_tensor(cos)
-        sin_int8, sin_scale = quantize_tensor(sin)
-        self.register_buffer("cos_int8", cos_int8)
+        cos_i8, cos_scale = quantize_tensor(cos)
+        sin_i8, sin_scale = quantize_tensor(sin)
+        self.register_buffer("cos_i8", cos_i8)
         self.register_buffer("cos_scale", cos_scale)
-        self.register_buffer("sin_int8", sin_int8)
+        self.register_buffer("sin_i8", sin_i8)
         self.register_buffer("sin_scale", sin_scale)
 
         self.is_quantized = False
@@ -227,22 +225,20 @@ class TransformerBlock_Quant(nn.Module):
     def forward(self, x):
         
         if x.dim() == 2:
-            num_tokens, _ = x.shape
+            n_tokens, _ = x.shape
         elif x.dim() == 3:
-            batch, num_tokens, _ = x.shape
+            b, n_tokens, _ = x.shape
         
         # 1. Shortcut for attention block
         shortcut = x
         if self.is_quantized == False:
             x = self.norm1(x) 
-            mask = torch.triu(torch.ones(num_tokens, num_tokens, device=x.device, dtype=torch.bool), diagonal=1)
+            mask = torch.triu(torch.ones(n_tokens, n_tokens, device=x.device, dtype=torch.bool), diagonal=1)
             x = self.att(x, 1.0, mask, self.cos, 1.0, self.sin, 1.0)  
         else:
             x, x_scale = self.norm1(x)
-            mask = torch.tril(torch.ones((num_tokens, num_tokens), dtype=torch.uint8, device=x.device))
-            x = self.att(x, x_scale, mask, self.cos_int8, self.cos_scale,\
-                                            self.sin_int8, self.sin_scale)
-            
+            mask = torch.tril(torch.ones((n_tokens, n_tokens), dtype=torch.uint8, device=x.device))
+            x = self.att(x, x_scale, mask, self.cos_i8, self.cos_scale, self.sin_i8, self.sin_scale)
         x = x + shortcut  
 
         # Shortcut connection for feed-forward block
@@ -315,44 +311,45 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
     model.to(device);
 
-
-    if USE_REASONING_MODEL or USE_INSTRUCT_MODEL:
-        repo_id = f"Qwen/Qwen3-{CHOOSE_MODEL}"
-    else:
-        repo_id = f"Qwen/Qwen3-{CHOOSE_MODEL}-Base"
-
     # =================================================================
     # 1. Load model weights 
     # =================================================================
     # IMPORTANT: Change this path to your desired folder to store model weights
-    MODEL_HUD_FOLDER_1 = "/sciclone/home/tnguyen10/Desktop/LLM_Quantization/model/"
-    MODEL_HUD_FOLDER_2 = "/scratch/tnguyen10/"
-
-    if os.path.exists(MODEL_HUD_FOLDER_1):
-        MODEL_HUD_FOLDER = MODEL_HUD_FOLDER_1
-    elif os.path.exists(MODEL_HUD_FOLDER_2):
-        MODEL_HUD_FOLDER = MODEL_HUD_FOLDER_2
+    MODEL_HUB_FOLDER_1 = "/sciclone/home/tnguyen10/Desktop/LLM_Quantization/model/"
+    MODEL_HUB_FOLDER_2 = "/scratch/tnguyen10/"
+    if os.path.exists(MODEL_HUB_FOLDER_1):
+        MODEL_HUB_FOLDER = MODEL_HUB_FOLDER_1
+    elif os.path.exists(MODEL_HUB_FOLDER_2):
+        MODEL_HUB_FOLDER = MODEL_HUB_FOLDER_2
     else:
-        raise ValueError("Please update the MODEL_HUD_FOLDER.")
-    local_dir = os.path.join(MODEL_HUD_FOLDER, repo_id)
-    print(f"[INFO] Loading model weights from disk: {local_dir} \n")
+        raise ValueError("Please update the MODEL_HUB_FOLDER.")
+    
+    if USE_REASONING_MODEL:
+        hf_repo_id = f"Qwen/Qwen3-{CHOOSE_MODEL}-Thinking-2507"
+        local_model_name = f"Qwen3-{CHOOSE_MODEL}-Thinking-2507"
+    elif USE_INSTRUCT_MODEL:
+        hf_repo_id = f"Qwen/Qwen3-{CHOOSE_MODEL}-Instruct-2507"
+        local_model_name = f"Qwen3-{CHOOSE_MODEL}-Instruct-2507"
+    else:
+        hf_repo_id = f"Qwen/Qwen3-{CHOOSE_MODEL}-Base"
+        local_model_name = f"Qwen3-{CHOOSE_MODEL}-Base"
+
+    local_dir = os.path.join(MODEL_HUB_FOLDER, local_model_name)
+    print(f"[INFO] Local model disk: {local_dir} \n")
 
     if CHOOSE_MODEL == "0.6B":
         weights_file = os.path.join(local_dir, "model.safetensors")
         weights_dict = load_file(weights_file)
     else:
-        repo_dir = local_dir
-        index_path = os.path.join(repo_dir, "model.safetensors.index.json")
+        weights_dict = {}
+        
+        index_path = os.path.join(local_dir, "model.safetensors.index.json")
         with open(index_path, "r") as f:
             index = json.load(f)
 
-        weights_dict = {}
-
         shard_files = sorted(set(index["weight_map"].values()))
-
         for filename in shard_files:
-            shard_path = os.path.join(repo_dir, filename)
-
+            shard_path = os.path.join(local_dir, filename)
             if not os.path.isfile(shard_path):
                 raise FileNotFoundError(f"Missing shard file: {shard_path}")
 
@@ -367,35 +364,26 @@ if __name__ == "__main__":
     # ================================================================
     # 2. Load tokenizer
     # ================================================================
-    if USE_REASONING_MODEL:
-        tokenizer_file_path = f"Qwen3-{CHOOSE_MODEL}/tokenizer.json"
-    else:
-        tokenizer_file_path = f"Qwen3-{CHOOSE_MODEL}-Base/tokenizer.json"
+    tokenizer_file_path = hf_hub_download(
+        repo_id=hf_repo_id,
+        filename="tokenizer.json",
+        local_dir=local_dir
+    )
+    print(f"[INFO] Tokenizer path: {tokenizer_file_path}")
 
-    tokenizer_file_path = os.path.join(MODEL_HUD_FOLDER, tokenizer_file_path)
-
-    hf_hub_download(repo_id=repo_id, filename="tokenizer.json", local_dir=local_dir)
-
-    if USE_REASONING_MODEL or USE_INSTRUCT_MODEL:
-        tokenizer = Qwen3Tokenizer(
-            tokenizer_file_path=tokenizer_file_path,
-            repo_id=repo_id,
-            apply_chat_template=True,
-            add_generation_prompt=True,
-            add_thinking=USE_REASONING_MODEL)
-    else:
-        tokenizer = Qwen3Tokenizer(
-            tokenizer_file_path=tokenizer_file_path,
-            repo_id=repo_id,
-            apply_chat_template=False,
-            add_generation_prompt=False,
-            add_thinking=False)
+    tokenizer = Qwen3Tokenizer(
+        tokenizer_file_path=tokenizer_file_path,
+        repo_id=hf_repo_id,
+        apply_chat_template=USE_REASONING_MODEL or USE_INSTRUCT_MODEL,
+        add_generation_prompt=USE_REASONING_MODEL or USE_INSTRUCT_MODEL,
+        add_thinking=USE_REASONING_MODEL
+    )
 
     # ================================================================
     # 3. Text generation
     # ================================================================
-    MAX_NEW_TOKENS = 1024
-    PPL_CONTEXT_TOKENS = 1024
+    MAX_NEW_TOKENS = 2048
+    PPL_CONTEXT_TOKENS = 2048
     EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 

@@ -2,7 +2,7 @@
 This script demonstrates how to convert a Qwen3 model to SmoothQuant technique. 
 """
 import os 
-# os.environ["CUDA_VISIBLE_DEVICES"] = "1"  
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  
 
 from pathlib import Path
 from tqdm import tqdm
@@ -105,6 +105,44 @@ class SmoothQuant_Linear(nn.Module):
         self.weight_q, self.scale_w = quantize_row_int8_symmetric_nd(w_smooth)
 
         self.is_quantized = True  
+        
+        
+class SmoothQuant_RMSNorm(nn.Module):
+    def __init__(self, emb_dim, eps=1e-6):
+        super(SmoothQuant_RMSNorm, self).__init__()
+        self.normalized_shape = (emb_dim,)
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(emb_dim, dtype=torch.float32))
+        
+        self.is_quantized = False
+        self.is_smooth_scale = False
+        self.smooth_scale = nn.Parameter(torch.ones(emb_dim, dtype=torch.float32))
+        
+    def forward(self, x):
+        if self.is_quantized == False:
+            y = F.rms_norm(x, normalized_shape=self.normalized_shape,\
+                                weight=self.weight, eps=self.eps)
+        else:
+            if self.is_smooth_scale == False:
+                dummy_smooth_scale = torch.ones(self.emb_dim,\
+                                    dtype=torch.float32, device=x.device)
+                y = gemm_cutlass.func_rmsnorm_bf16_to_int8(x, self.weight, dummy_smooth_scale, self.eps)
+            else:
+                y = gemm_cutlass.func_rmsnorm_bf16_to_int8(x, self.weight, self.smooth_scale, self.eps)
+        return y
+        
+    def finish_calibration(self):
+        self.is_quantized = True
+        
+    def enable_smooth_scale(self, smooth_scale):
+        """
+        This function apply smooth scaling to quantization (for input activations) 
+        Note:
+        - Normal quantization: Y_int8 = Y / scale_Y
+        - Smooth quantization: Y_int8 = (Y / smooth_scale) / scale_Y
+        """
+        self.is_smooth_scale = True
+        self.smooth_scale.data.copy_(smooth_scale)
 
 
 class SmoothQuant_FeedForward(nn.Module):
@@ -116,7 +154,7 @@ class SmoothQuant_FeedForward(nn.Module):
         
         self.is_quantized = False
 
-    def forward(self, x):
+    def forward(self, x, scale_x=1.0):
         if self.is_quantized == False:
             x_fc1 = self.fc1(x)
             x_fc2 = self.fc2(x)
@@ -125,12 +163,15 @@ class SmoothQuant_FeedForward(nn.Module):
             return x
         else:
             # Smooth input activation
-            smooth_scale = self.fc1.smooth_alpha
-            x = x / smooth_scale.unsqueeze(0)
-            x_int8, scale_x = quantize_row_int8_symmetric_nd(x)
+            # smooth_scale = self.fc1.smooth_alpha
+            # x = x / smooth_scale.unsqueeze(0)
+            # x_int8, scale_x = quantize_row_int8_symmetric_nd(x)
+            x_i8 = x
+            scale_x = scale_x
+            assert x_i8.dtype == torch.int8, "Expect int8 input in quantization"
             
-            x_fc1 = self.fc1(x_int8, scale_x)
-            x_fc2 = self.fc2(x_int8, scale_x)
+            x_fc1 = self.fc1(x_i8, scale_x)
+            x_fc2 = self.fc2(x_i8, scale_x)
 
             x = nn.functional.silu(x_fc1) * x_fc2
             
@@ -153,7 +194,7 @@ class SmoothQuant_FeedForward(nn.Module):
         self.is_quantized = True
         
         
-class GroupedQueryAttention(nn.Module):
+class SmoothQuant_GroupedQueryAttention(nn.Module):
     def __init__(self, d_in, num_heads, num_kv_groups, head_dim=None, qk_norm=False, dtype=None):
         super().__init__()
         assert num_heads % num_kv_groups == 0, "num_heads must be divisible by num_kv_groups"
@@ -169,11 +210,6 @@ class GroupedQueryAttention(nn.Module):
         self.d_in = d_in
         self.head_dim = head_dim
         self.d_out = num_heads * head_dim
-
-        # self.W_query = nn.Linear(d_in, self.d_out, bias=False, dtype=dtype)
-        # self.W_key = nn.Linear(d_in, num_kv_groups * head_dim, bias=False, dtype=dtype)
-        # self.W_value = nn.Linear(d_in, num_kv_groups * head_dim, bias=False, dtype=dtype)
-        # self.out_proj = nn.Linear(self.d_out, d_in, bias=False, dtype=dtype)
         
         self.W_query = SmoothQuant_Linear(self.d_in, self.d_out, dtype=dtype)
         self.W_key = SmoothQuant_Linear(self.d_in, num_kv_groups * head_dim, dtype=dtype)
@@ -188,7 +224,7 @@ class GroupedQueryAttention(nn.Module):
             
         self.is_quantized = False
 
-    def forward(self, x, mask, cos, sin):
+    def forward(self, x, scale_x, mask, cos, sin):
         
         if self.is_quantized == False:
             num_tokens, _ = x.shape
@@ -229,10 +265,8 @@ class GroupedQueryAttention(nn.Module):
         else:
             num_tokens, _ = x.shape
             
-            # Smooth quantization for input activation
-            smooth_value = self.W_query.smooth_alpha
-            x = x / smooth_value.unsqueeze(0)
-            x_int8, scale_x = quantize_row_int8_symmetric_nd(x)
+            x_int8 = x
+            scale_x = scale_x
 
             # 1. QKV projections
             queries = self.W_query(x_int8, scale_x)  # (b, num_tokens, num_heads * head_dim)
@@ -286,7 +320,7 @@ class GroupedQueryAttention(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.att = GroupedQueryAttention(
+        self.att = SmoothQuant_GroupedQueryAttention(
             d_in=cfg["emb_dim"],
             num_heads=cfg["n_heads"],
             head_dim=cfg["head_dim"],
@@ -294,28 +328,46 @@ class TransformerBlock(nn.Module):
             qk_norm=cfg["qk_norm"],
             dtype=cfg["dtype"]
         )
-        # self.ff = FeedForward(cfg)
         self.ff = SmoothQuant_FeedForward(cfg)
-        self.norm1 = RMSNorm(cfg["emb_dim"], eps=1e-6)
-        self.norm2 = RMSNorm(cfg["emb_dim"], eps=1e-6)
+        self.norm1 = SmoothQuant_RMSNorm(cfg["emb_dim"], eps=1e-6)
+        self.norm2 = SmoothQuant_RMSNorm(cfg["emb_dim"], eps=1e-6)
+        
+        self.is_quantized = False
 
     def forward(self, x, mask, cos, sin):
         # 1. Shortcut for attention block
         shortcut = x
-        x = self.norm1(x)
-        x = self.att(x, mask, cos, sin)  # Shape [batch_size, num_tokens, emb_size]
-        x = x + shortcut  # Add the original input back
+        if self.is_quantized == False:
+            x = self.norm1(x)
+            x = self.att(x, 1.0, mask, cos, sin)  
+        else:
+            x_i8, scale_x = self.norm1(x)
+            x = self.att(x_i8, scale_x, mask, cos, sin)
+        x = x + shortcut  
 
         # 2. Shortcut for feed-forward block
         shortcut = x
-        x = self.norm2(x)
-        x = self.ff(x)
-        x = x + shortcut  # Add the original input back
+        if self.is_quantized == False:
+            x = self.norm2(x)
+            x = self.ff(x)
+        else:
+            x_i8, scale_x = self.norm2(x)
+            x = self.ff(x_i8, scale_x)
+        x = x + shortcut  
         return x
     
     def finish_calibration(self):
         self.att.finish_calibration()
+        self.norm1.finish_calibration()
+        smooth_scale = self.att.W_query.smooth_alpha
+        self.norm1.enable_smooth_scale(smooth_scale)
+        
         self.ff.finish_calibration()
+        self.norm2.finish_calibration()
+        smooth_scale = self.ff.fc1.smooth_alpha
+        self.norm2.enable_smooth_scale(smooth_scale)
+        
+        self.is_quantized = True
         
     
         
@@ -478,7 +530,7 @@ if __name__ == "__main__":
     # # =================================================
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=1)
+                                                    split="train", n=10_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             
@@ -538,7 +590,7 @@ if __name__ == "__main__":
 
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=50))
     print()
-    print("Model Information:")
+    print("Model Information (SmoothQuant technique):")
     print(f"Model: Qwen3-{CHOOSE_MODEL}")
     print(f"Context size: {PPL_CONTEXT_TOKENS}")
     print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")
