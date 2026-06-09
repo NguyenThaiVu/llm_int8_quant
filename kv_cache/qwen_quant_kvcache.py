@@ -20,7 +20,7 @@ from utils_evaluation import load_wikitext_single_text
 from utils_generation import generate_text_autoregressive
 
 
-CHOOSE_MODEL = "8B" # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "14B" # Options: "4B", "8B", "14B"
 
 # Select which model to use via the following flag; only one can be True
 USE_BASE_MODEL = True
@@ -69,8 +69,7 @@ class Qwen3Model(nn.Module):
         x = tok_embeds
         num_tokens = x.shape[1]
         
-        if cache is not None:  
-            # Cache mode
+        if cache is not None:   # Cache mode
             pos_start = self.current_pos
             pos_end = pos_start + num_tokens
             self.current_pos = pos_end
@@ -91,6 +90,7 @@ class Qwen3Model(nn.Module):
             else:
                 mask = torch.tril(torch.ones((num_tokens, num_tokens),\
                                 dtype=torch.uint8, device=x.device))
+        
         
         for i, block in enumerate(self.trf_blocks):
             if cache is not None:
@@ -137,90 +137,89 @@ else:
 model.to(device);
         
 
-# ========================================================
-# 2. Load model weights and tokenizer
-# ========================================================
-MODEL_HUD_FOLDER_1 = "/sciclone/home/tnguyen10/Desktop/LLM_Quantization/model/"
-MODEL_HUD_FOLDER_2 = "/scratch/tnguyen10/"
-
-if os.path.exists(MODEL_HUD_FOLDER_1):
-    MODEL_HUD_FOLDER = MODEL_HUD_FOLDER_1
-elif os.path.exists(MODEL_HUD_FOLDER_2):
-    MODEL_HUD_FOLDER = MODEL_HUD_FOLDER_2
+# =================================================================
+# 2. Load model weights 
+# =================================================================
+# IMPORTANT: Change this path to your desired folder to store model weights
+MODEL_HUB_FOLDER_1 = "/sciclone/home/tnguyen10/Desktop/LLM_Quantization/model/"
+MODEL_HUB_FOLDER_2 = "/scratch/tnguyen10/"
+if os.path.exists(MODEL_HUB_FOLDER_1):
+    MODEL_HUB_FOLDER = MODEL_HUB_FOLDER_1
+elif os.path.exists(MODEL_HUB_FOLDER_2):
+    MODEL_HUB_FOLDER = MODEL_HUB_FOLDER_2
 else:
-    raise ValueError("Please update the MODEL_HUD_FOLDER.")
+    raise ValueError("Please update the MODEL_HUB_FOLDER.")
 
-if USE_REASONING_MODEL or USE_INSTRUCT_MODEL:
-    repo_id = f"Qwen3-{CHOOSE_MODEL}"
+if USE_REASONING_MODEL:
+    hf_repo_id = f"Qwen/Qwen3-{CHOOSE_MODEL}-Thinking-2507"
+    local_model_name = f"Qwen3-{CHOOSE_MODEL}-Thinking-2507"
+elif USE_INSTRUCT_MODEL:
+    hf_repo_id = f"Qwen/Qwen3-{CHOOSE_MODEL}-Instruct-2507"
+    local_model_name = f"Qwen3-{CHOOSE_MODEL}-Instruct-2507"
 else:
-    repo_id = f"Qwen3-{CHOOSE_MODEL}-Base"
+    hf_repo_id = f"Qwen/Qwen3-{CHOOSE_MODEL}-Base"
+    local_model_name = f"Qwen3-{CHOOSE_MODEL}-Base"
 
-local_dir = os.path.join(MODEL_HUD_FOLDER, repo_id)
-print(f"[INFO] Loading model weights from disk: {local_dir} \n")
+local_dir = os.path.join(MODEL_HUB_FOLDER, local_model_name)
+print(f"[INFO] Local model disk: {local_dir} \n")
 
 if CHOOSE_MODEL == "0.6B":
-    weights_file = hf_hub_download(
-        repo_id=repo_id,
-        filename="model.safetensors",
-        local_dir=local_dir,
-        local_files_only=True
-    )
+    weights_file = os.path.join(local_dir, "model.safetensors")
     weights_dict = load_file(weights_file)
 else:
-    repo_dir = snapshot_download(repo_id=repo_id, local_dir=local_dir, local_files_only=True)
-    index_path = os.path.join(repo_dir, "model.safetensors.index.json")
+    weights_dict = {}
+    
+    index_path = os.path.join(local_dir, "model.safetensors.index.json")
     with open(index_path, "r") as f:
         index = json.load(f)
 
-    weights_dict = {}
-    for filename in set(index["weight_map"].values()):
-        shard_path = os.path.join(repo_dir, filename)
+    shard_files = sorted(set(index["weight_map"].values()))
+    for filename in shard_files:
+        shard_path = os.path.join(local_dir, filename)
+        if not os.path.isfile(shard_path):
+            raise FileNotFoundError(f"Missing shard file: {shard_path}")
+
         shard = load_file(shard_path)
         weights_dict.update(shard)
 
 load_weights_into_qwen(model, QWEN3_CONFIG, weights_dict)
 model.to(device)
-print(f"\n[INFO] Loaded weights into model successfully!")
+print(f"[INFO] Model weights loaded successfully. \n")
 del weights_dict
 
-    
-if USE_REASONING_MODEL:
-    tokenizer_file_path = f"Qwen3-{CHOOSE_MODEL}/tokenizer.json"
-else:
-    tokenizer_file_path = f"Qwen3-{CHOOSE_MODEL}-Base/tokenizer.json"
-tokenizer_file_path = os.path.join(MODEL_HUD_FOLDER, tokenizer_file_path)
-
-hf_hub_download(
-    repo_id=repo_id,
+# ================================================================
+# 3. Load tokenizer
+# ================================================================
+tokenizer_file_path = hf_hub_download(
+    repo_id=hf_repo_id,
     filename="tokenizer.json",
-    local_dir=local_dir,
-    local_files_only=True
+    local_dir=local_dir
 )
+print(f"[INFO] Tokenizer path: {tokenizer_file_path}")
 
-if USE_REASONING_MODEL or USE_INSTRUCT_MODEL:
-    tokenizer = Qwen3Tokenizer(
-        tokenizer_file_path=tokenizer_file_path,
-        repo_id=repo_id,
-        apply_chat_template=True,
-        add_generation_prompt=True,
-        add_thinking=USE_REASONING_MODEL)
-else:
-    tokenizer = Qwen3Tokenizer(
-        tokenizer_file_path=tokenizer_file_path,
-        repo_id=repo_id,
-        apply_chat_template=False,
-        add_generation_prompt=False,
-        add_thinking=False) 
+tokenizer = Qwen3Tokenizer(
+    tokenizer_file_path=tokenizer_file_path,
+    repo_id=hf_repo_id,
+    apply_chat_template=USE_REASONING_MODEL or USE_INSTRUCT_MODEL,
+    add_generation_prompt=USE_REASONING_MODEL or USE_INSTRUCT_MODEL,
+    add_thinking=USE_REASONING_MODEL
+)
     
 # ========================================================
-# 3. Text generation with KV cache
+# 4. Text generation with KV cache
 # ========================================================
 
 prompt = "What is the Dragon Ball story?"
 input_token_ids = tokenizer.encode(prompt)
 input_token_tensor = torch.tensor(input_token_ids, device=device).unsqueeze(0)
 print(f"[INFO] Shape of input_token_tensor: {input_token_tensor.shape} \n")
-MAX_NEW_TOKENS = 500
+MAX_NEW_TOKENS = 1024
+END_OFF_TOKEN_ID = None # Option: tokenizer.eos_token_id or None 
+"""
+If END_OFF_TOKEN_ID is set to None, the generation will not stop until reaching MAX_NEW_TOKENS. 
+This is useful for benchmarking the maximum generation speed.
+"""
+
 
 torch.cuda.reset_peak_memory_stats()
 start_time = time.perf_counter()
@@ -229,7 +228,7 @@ for token in generate_text_autoregressive(
     model=model,
     token_ids=input_token_tensor,
     max_new_tokens=MAX_NEW_TOKENS,
-    eos_token_id=tokenizer.eos_token_id
+    eos_token_id=END_OFF_TOKEN_ID
 ):
     generated_tokens += 1
     token_id = token.squeeze(0).tolist()
@@ -280,7 +279,7 @@ for token in generate_text_autoregressive(
     model=model,
     token_ids=input_token_tensor,
     max_new_tokens=MAX_NEW_TOKENS,
-    eos_token_id=tokenizer.eos_token_id
+    eos_token_id=END_OFF_TOKEN_ID
 ):
     generated_tokens += 1
     token_id = token.squeeze(0).tolist()
