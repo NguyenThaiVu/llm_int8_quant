@@ -8,85 +8,6 @@ from utils_quant import quantize_row_int8_symmetric_nd, quantize_tensor
 MAX_SEQ_LEN = 2112 # 576 or 1040 or 2112
 BATCH_SIZE = 16 # 1, 2, 16, 64, 128
 
-# class Custom_Linear(nn.Module):
-#     """
-#     Linear layer with two execution modes:
-#     1. Calibration mode
-#         - Input: bf16
-#         - Weight: bf16
-#         - Output: bf16
-#         - Behavior: computes `x @ weight.T` and updates output observer
-    
-#     2. Quantization mode
-#         - Input: int8
-#         - Weight: int8
-#         - Output: int8
-#         - Behavior: computes quantized matmul with per-row scaling
-#                     and returns quantized output and its scale
-    
-#     This layer has: per-row scale for activation
-#                     per-tensor scale for weight. 
-#                     The output scale is per-row
-                    
-#     Input shapes: (M, K) or (B, M, K)
-#     Weight shapes: (N, K)
-#     Output shapes: (M, N) or (B, M, N)
-#     """
-#     def __init__(self, in_features, out_features, 
-#                  max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16):
-#         super(Custom_Linear, self).__init__()
-        
-#         self.in_features = in_features
-#         self.out_features = out_features
-#         self.weight = nn.Parameter(torch.empty(out_features, in_features, 
-#                                                dtype=dtype))
-        
-#         # Weight quantization
-#         self.weight_q = torch.empty(out_features, in_features, dtype=torch.int8)
-#         self.scale_w = torch.ones((1), dtype=torch.float32)
-        
-#         # Output scale quantization
-#         self.scale_y = torch.ones((out_features), dtype=torch.float32)  
-#         self.out_observer = MinMaxObserverPerLastDim(max_seq_len=max_seq_len)
-#         self.is_quantized = False
-        
-#     def forward(self, x, scale_x):
-#         if not self.is_quantized:  
-#             out = torch.matmul(x, self.weight.t())  
-#             self.out_observer(out)
-#             return out, 1.0
-#         else:
-#             assert x.dtype == torch.int8,\
-#                 "Expected int8 input in quantization"
-            
-#             if x.dim() == 2:
-#                 seq_len = x.shape[0]
-#                 scale_y_value = self.scale_y[:seq_len]
-#             elif x.dim() == 3:
-#                 seq_len = x.shape[1]
-#                 scale_y_value = self.scale_y[:, :seq_len]
-#             else:
-#                 raise ValueError(f"Unsupported input dimensions: {x.dim()}")
-            
-#             row_scale = scale_x / scale_y_value  
-#             col_scale = self.scale_w.expand(self.out_features)
-            
-#             out_q = gemm_cutlass.func_w8a8o8_matmul(x, self.weight_q,\
-#                 row_scale, col_scale)
-
-#             return out_q, scale_y_value
-        
-#     def finish_calibration(self):
-#         weight_q, scale_w = quantize_tensor(self.weight)
-#         self.weight_q = weight_q
-#         self.scale_w = scale_w
-        
-#         self.scale_y = self.out_observer.get_scale().to(self.scale_w.device)
-        
-#         self.is_quantized = True  
-#         del self.weight
-#         torch.cuda.empty_cache()
-        
         
 class Custom_Softmax(nn.Module):
     def __init__(self, num_heads=1):
@@ -519,8 +440,14 @@ class Custom_Linear(nn.Module):
         self.scale_y = self.out_observer.get_scale().to(self.scale_w.device)
         self.is_quantized = True  
         
-        
-        
+        # Delete weight and out_observer to save memory
+        del self.weight
+        del self.out_observer
+        del self.in_observer
+        self.weight = None
+        self.out_observer = None
+        self.in_observer = None
+
 class Custom_Silu(nn.Module):
     def __init__(self, emb_dim, dtype=torch.bfloat16):
         super().__init__()
@@ -745,7 +672,7 @@ class Custom_GroupedQueryAttention(nn.Module):
             attn_weights_int8, attn_weights_scale = self.softmax_layer(attn_scores_int8,\
                                                     attn_scores_scale, mask)
             
-            # Compute context 
+            # Context 
             values_int8, values_scale = gemm_cutlass.func_dequant_transpose_requant(values_int8,\
                                                         values_scale)
             
@@ -754,7 +681,7 @@ class Custom_GroupedQueryAttention(nn.Module):
                                             values_int8,\
                                             values_scale)
 
-            # Output projection
+            # Output
             context = context.transpose(0, 1).reshape(num_tokens, self.d_out) 
             out, _ = self.out_proj(context, 1.0)  # Output float for better accuracy
         

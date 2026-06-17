@@ -3,11 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import gemm_cutlass
-from utils_quant import quantize_row_int8_symmetric_nd, quantize_tensor
+from utils_quant import quantize_row_int8_symmetric_nd
 
 MAX_SEQ_LEN = 576 # 576 or 1040 or 2112
 BATCH_SIZE = 1
-
 
 class Custom_Linear(nn.Module):
     def __init__(self, in_features, out_features, max_seq_len=MAX_SEQ_LEN, is_return_float=False):
@@ -74,6 +73,10 @@ class Custom_Linear(nn.Module):
 
         self.scale_y = self.out_observer.get_scale().to(self.scale_w.device)
         self.is_quantized = True  
+        
+        # Delete weight and observers to save memory
+        del self.weight
+        del self.in_observer
         
         
 class Custom_Softmax(nn.Module):

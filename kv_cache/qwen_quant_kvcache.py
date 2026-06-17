@@ -1,5 +1,5 @@
 import os 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Use second GPU
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Use second GPU
 import time
 import json
 from pathlib import Path
@@ -9,7 +9,7 @@ import torch
 torch.manual_seed(123)
 import torch.nn as nn
 from safetensors.torch import load_file
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import hf_hub_download
 
 from config import *
 from utils_tokenizer import Qwen3Tokenizer
@@ -20,14 +20,14 @@ from utils_evaluation import load_wikitext_single_text
 from utils_generation import generate_text_autoregressive
 
 
-CHOOSE_MODEL = "14B" # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "4B" # Options: "4B", "8B", "14B"
 
 # Select which model to use via the following flag; only one can be True
 USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-    
+
 class Qwen3Model(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -208,39 +208,57 @@ tokenizer = Qwen3Tokenizer(
 # ========================================================
 # 4. Text generation with KV cache
 # ========================================================
+INPUT_PROMPT_LENGTH = None
+MAX_NEW_TOKENS = 2048
 
 prompt = "What is the Dragon Ball story?"
-input_token_ids = tokenizer.encode(prompt)
-input_token_tensor = torch.tensor(input_token_ids, device=device).unsqueeze(0)
+if INPUT_PROMPT_LENGTH is None:
+    input_token_ids = tokenizer.encode(prompt)
+    input_token_tensor = torch.tensor(input_token_ids, device=device).unsqueeze(0)
+else:
+    prompt = prompt * 300
+    input_token_ids = tokenizer.encode(prompt)[-INPUT_PROMPT_LENGTH:]
+    input_token_tensor = torch.tensor(input_token_ids, device=device).unsqueeze(0)
 print(f"[INFO] Shape of input_token_tensor: {input_token_tensor.shape} \n")
-MAX_NEW_TOKENS = 1024
-END_OFF_TOKEN_ID = None # Option: tokenizer.eos_token_id or None 
-"""
-If END_OFF_TOKEN_ID is set to None, the generation will not stop until reaching MAX_NEW_TOKENS. 
-This is useful for benchmarking the maximum generation speed.
-"""
 
+
+END_OFF_TOKEN_ID = None # Option: tokenizer.eos_token_id or None 
+# If END_OFF_TOKEN_ID is set to None, the generation will not stop until reaching MAX_NEW_TOKENS. 
+# This is useful for benchmarking the maximum generation speed.
 
 torch.cuda.reset_peak_memory_stats()
+time.sleep(1)  
 start_time = time.perf_counter()
-generated_tokens = 0
-for token in generate_text_autoregressive(
-    model=model,
-    token_ids=input_token_tensor,
-    max_new_tokens=MAX_NEW_TOKENS,
-    eos_token_id=END_OFF_TOKEN_ID
-):
-    generated_tokens += 1
-    token_id = token.squeeze(0).tolist()
-    print(tokenizer.decode(token_id), end="", flush=True)
+start_gpu_time = torch.cuda.Event(enable_timing=True)
+end_gpu_time = torch.cuda.Event(enable_timing=True)
 
+start_gpu_time.record()
+generated_tokens = 0
+with torch.inference_mode():
+    for token in generate_text_autoregressive(
+        model=model,
+        token_ids=input_token_tensor,
+        max_new_tokens=MAX_NEW_TOKENS,
+        eos_token_id=END_OFF_TOKEN_ID
+    ):
+        generated_tokens += 1
+        token_id = token.squeeze(0).tolist()
+        print(tokenizer.decode(token_id), end="", flush=True)
 elapsed = time.perf_counter() - start_time
+end_gpu_time.record()
+torch.cuda.synchronize()  
+gpu_time = start_gpu_time.elapsed_time(end_gpu_time) / 1000  
+print(f"Elapsed time: {elapsed:.2f} seconds")
+print(f"GPU generation time: {gpu_time:.2f} seconds")
+
 tokens_per_sec = generated_tokens / elapsed if elapsed > 0 else 0.0
 print(f"\n\nGeneration speed: {tokens_per_sec:.2f} tokens/sec")
 
 def calc_gpu_gb(x):
     return f"{x / 1024 / 1024 / 1024:.2f} GB"
 print(f"GPU memory used: {calc_gpu_gb(torch.cuda.max_memory_allocated())}")
+print(f"Input length (tokens): {input_token_tensor.shape[1]}")
+print(f"Number of generated tokens: {generated_tokens}\n")
     
     
 # ========================================================
@@ -249,7 +267,7 @@ print(f"GPU memory used: {calc_gpu_gb(torch.cuda.max_memory_allocated())}")
 PPL_CONTEXT_TOKENS = 512
 EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2 
-N_SAMPLES = 10_000
+N_SAMPLES = 1_000
 
 print("\nCollecting calibration for quantization...")
 calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
@@ -267,26 +285,41 @@ for i in tqdm(range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRID
 model.finish_calibration()
 print(f"\n[INFO] Finished calibration for quantization.")
 
+model.reset_kv_cache()
+model.eval()
+model.to(device)
 
 # ========================================================
 # 5. Text generation with quantized model
 # ========================================================
 torch.cuda.reset_peak_memory_stats()
+time.sleep(1)
 start_time = time.perf_counter()
+start_gpu_time = torch.cuda.Event(enable_timing=True)
+end_gpu_time = torch.cuda.Event(enable_timing=True)
+start_gpu_time.record()
 generated_tokens = 0
-
-for token in generate_text_autoregressive(
-    model=model,
-    token_ids=input_token_tensor,
-    max_new_tokens=MAX_NEW_TOKENS,
-    eos_token_id=END_OFF_TOKEN_ID
-):
-    generated_tokens += 1
-    token_id = token.squeeze(0).tolist()
-    print(tokenizer.decode(token_id), end="", flush=True)
+with torch.inference_mode():
+    for token in generate_text_autoregressive(
+        model=model,
+        token_ids=input_token_tensor,
+        max_new_tokens=MAX_NEW_TOKENS,
+        eos_token_id=END_OFF_TOKEN_ID
+    ):
+        generated_tokens += 1
+        token_id = token.squeeze(0).tolist()
+        print(tokenizer.decode(token_id), end="", flush=True)
 
 elapsed = time.perf_counter() - start_time
+end_gpu_time.record()
+torch.cuda.synchronize()  # Wait for GPU timing to finish
+gpu_time = start_gpu_time.elapsed_time(end_gpu_time) / 1000  # Convert to seconds
+print(f"Elapsed time: {elapsed:.2f} seconds")
+print(f"GPU generation time: {gpu_time:.2f} seconds")
+
 tokens_per_sec = generated_tokens / elapsed if elapsed > 0 else 0.0
 print(f"\n\nGeneration speed: {tokens_per_sec:.2f} tokens/sec")
 print(f"GPU memory used: {calc_gpu_gb(torch.cuda.max_memory_allocated())}")
-    
+
+print(f"Input length (tokens): {input_token_tensor.shape[1]}")
+print(f"Number of generated tokens: {generated_tokens}\n")

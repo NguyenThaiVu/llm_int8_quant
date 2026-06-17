@@ -18,7 +18,7 @@ from utils_model_quan import *
 from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text
 
 
-LLAMA_SIZE_STR = "3B" # "1B" or "3B"
+LLAMA_SIZE_STR = "1B" # "1B" or "3B"
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
 
 MODEL_FOLDER = f"Llama-3.2-{LLAMA_SIZE_STR}-Instruct"
@@ -66,7 +66,7 @@ class Custom_GroupedQueryAttention(nn.Module):
         self.query_rope = Custom_RoPE(num_heads, max_seq_len=MAX_SEQ_LEN, head_dim=head_dim).to(dtype)
         self.key_rope = Custom_RoPE(num_kv_groups, max_seq_len=MAX_SEQ_LEN, head_dim=head_dim).to(dtype)
         
-        self.softmax_layer = Custom_Softmax(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)    
+        self.softmax_layer = Custom_Softmax(num_heads=num_heads).to(dtype)    
         self.qk_score_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)
         self.context_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN,\
             is_return_float=True).to(dtype)
@@ -120,9 +120,9 @@ class Custom_GroupedQueryAttention(nn.Module):
             
             # Reshape for multi-head 
             queries_int8 = queries_int8.view(batch, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-            
+            queries_scale = queries_scale.unsqueeze(1).expand(-1, self.num_heads, -1)
             keys_int8 = keys_int8.view(batch, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
-            
+            keys_scale = keys_scale.unsqueeze(1).expand(-1, self.num_kv_groups, -1)
             values_int8 = values_int8.view(batch, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
             values_scale = values_scale.unsqueeze(1).expand(-1, self.num_kv_groups, -1)
             
@@ -166,8 +166,11 @@ class Custom_GroupedQueryAttention(nn.Module):
     
     def finish_calibration(self):
         self.W_query.finish_calibration()
-        self.W_key.finish_calibration()
-        self.W_value.finish_calibration()
+        # Key and Value use the same smooth alpha as Query
+        smooth_query = self.W_query.smooth_alpha
+        self.W_key.finish_calibration(alpha=smooth_query) 
+        self.W_value.finish_calibration(alpha=smooth_query) 
+        
         self.query_rope.finish_calibration()
         self.key_rope.finish_calibration()
         self.softmax_layer.finish_calibration()
@@ -253,6 +256,8 @@ class TransformerBlock(nn.Module):
     def finish_calibration(self):
         self.att.finish_calibration()
         self.norm1.finish_calibration()
+        smooth_scale = self.att.W_query.smooth_alpha
+        self.norm1.enable_smooth_scale(smooth_scale)
         
         self.ff.finish_calibration()
         
@@ -388,7 +393,7 @@ if __name__ == "__main__":
 
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=100)
+                                                    split="train", n=10_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
 
@@ -398,24 +403,30 @@ if __name__ == "__main__":
     calibration_chunks = [
         calibrate_tokens[i:i + PPL_CONTEXT_TOKENS]
         for i in range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE)
-    ]
+    ] 
+    
+    input_ids = torch.tensor(
+        calibration_chunks[:CALIBRATION_BATCH_SIZE],
+        dtype=torch.long,
+        device=device
+    )  # [B, T]
+    print(f"Shape of input_ids: {input_ids.shape}")
 
-    model.eval()
+    
+    # for i in range(0, len(calibration_chunks), CALIBRATION_BATCH_SIZE):
+    #     batch_chunks = calibration_chunks[i:i + CALIBRATION_BATCH_SIZE]
 
-    for i in range(0, len(calibration_chunks), CALIBRATION_BATCH_SIZE):
-        batch_chunks = calibration_chunks[i:i + CALIBRATION_BATCH_SIZE]
+    #     if len(batch_chunks) < CALIBRATION_BATCH_SIZE:
+    #         break
 
-        if len(batch_chunks) < CALIBRATION_BATCH_SIZE:
-            break
+    #     input_ids = torch.tensor(
+    #         batch_chunks,
+    #         dtype=torch.long,
+    #         device=device
+    #     )  # [B, T]
 
-        input_ids = torch.tensor(
-            batch_chunks,
-            dtype=torch.long,
-            device=device
-        )  # [B, T]
-
-        with torch.no_grad():
-            _ = model(input_ids)
+    #     with torch.no_grad():
+    #         _ = model(input_ids)
             
     
     # Measure Latency before quantization
@@ -436,8 +447,10 @@ if __name__ == "__main__":
     print(f"Context size: {PPL_CONTEXT_TOKENS}")
     print(f"Batch size: {BATCH_SIZE}\n\n")        
 
+
     model.finish_calibration()
     print(f"[INFO] Finished calibration.")
+    model.eval()
 
 
     # ===============================================

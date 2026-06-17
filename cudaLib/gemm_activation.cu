@@ -607,3 +607,142 @@ std::tuple<torch::Tensor, torch::Tensor> silu_mul_int8_cuda(
 
     return std::make_tuple(out_int8, out_scales);
 }
+
+
+// ================================================================
+// Kernel: BF16 x1, x2 -> INT8 y + FP32 row scale
+//
+// x1, x2 : BF16 [M, K]
+// y_i8   : INT8 [M, K]
+// y_scale: FP32 [M]
+//
+// Computation
+// Y = SiLU(x1) * x2
+// Y = Y / smooth_scale 
+// Y_i8, scale = quantize(Y) 
+// ================================================================
+template<int BLOCK_SIZE>
+__global__ void silu_mul_quant_kernel(
+const __nv_bfloat16* __restrict__ x1,
+    const __nv_bfloat16* __restrict__ x2,
+    const float* __restrict__ smooth_scale,
+    int8_t* __restrict__ y_i8,
+    float* __restrict__ y_scale,
+    int M,
+    int K
+) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    if (row >= M) {
+        return;
+    }
+
+    const __nv_bfloat16* x1_row = x1 + static_cast<size_t>(row) * K;
+    const __nv_bfloat16* x2_row = x2 + static_cast<size_t>(row) * K;
+    int8_t* y_row = y_i8 + static_cast<size_t>(row) * K;
+
+    __shared__ float sdata[BLOCK_SIZE];
+
+    // ------------------------------------------------------------
+    // Pass 1: compute absmax after SmoothQuant scaling
+    // ------------------------------------------------------------
+    float local_absmax = 0.0f;
+
+    for (int col = tid; col < K; col += BLOCK_SIZE) {
+        float a = __bfloat162float(x1_row[col]);
+        float b = __bfloat162float(x2_row[col]);
+
+        float sigmoid = 1.0f / (1.0f + expf(-a));
+        float v = a * sigmoid * b;
+
+        // SmoothQuant correction:
+        // x = x / smooth_scale_fc3.unsqueeze(0)
+        float s = smooth_scale[col];
+        v = v / s;
+
+        local_absmax = fmaxf(local_absmax, fabsf(v));
+    }
+
+    sdata[tid] = local_absmax;
+    __syncthreads();
+
+    // Block reduction: max
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] = fmaxf(sdata[tid], sdata[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    float absmax = sdata[0];
+    float scale = absmax > 0.0f ? absmax / 127.0f : 1.0f;
+
+    if (tid == 0) {
+        y_scale[row] = scale;
+    }
+
+    __syncthreads();
+
+    // ------------------------------------------------------------
+    // Pass 2: quantize after SmoothQuant scaling
+    // ------------------------------------------------------------
+    for (int col = tid; col < K; col += BLOCK_SIZE) {
+        float a = __bfloat162float(x1_row[col]);
+        float b = __bfloat162float(x2_row[col]);
+
+        float sigmoid = 1.0f / (1.0f + expf(-a));
+        float v = a * sigmoid * b;
+
+        float s = smooth_scale[col];
+        v = v / s;
+
+        int q = static_cast<int>(nearbyintf(v / scale));
+        q = max(-128, min(127, q));
+
+        y_row[col] = static_cast<int8_t>(q);
+    }
+}
+
+
+
+std::tuple<torch::Tensor, torch::Tensor> silu_mul_quant_cuda(torch::Tensor x1,
+                                                            torch::Tensor x2,
+                                                            torch::Tensor smooth_scale) {
+    TORCH_CHECK(x1.is_cuda() && x2.is_cuda() && smooth_scale.is_cuda(), "Inputs must be CUDA tensors");
+    TORCH_CHECK(x1.dtype() == torch::kBFloat16 && x2.dtype() == torch::kBFloat16, "Inputs must be BFloat16");
+    TORCH_CHECK(smooth_scale.dtype() == torch::kFloat32, "smooth_scale must be float32");
+
+    TORCH_CHECK(x1.sizes() == x2.sizes(), "x1 and x2 must have the same shape");
+
+    const auto M = static_cast<int>(x1.size(0));
+    const auto K = static_cast<int>(x1.size(1));
+
+    TORCH_CHECK(smooth_scale.dim() == 1 && smooth_scale.size(0) == K,
+                "smooth_scale must be 1D and match the last dimension of x1/x2");
+
+    auto y_i8 = torch::empty_like(x1, torch::TensorOptions().dtype(torch::kInt8));
+    auto y_scale = torch::empty({M}, x1.options().dtype(torch::kFloat32));
+
+    constexpr int BLOCK_SIZE = 256;
+
+    dim3 grid(M);
+    dim3 block(BLOCK_SIZE);
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(x1));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    silu_mul_quant_kernel<BLOCK_SIZE><<<grid, block, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x1.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(x2.data_ptr<at::BFloat16>()),
+        smooth_scale.data_ptr<float>(),
+        y_i8.data_ptr<int8_t>(),
+        y_scale.data_ptr<float>(),
+        M,
+        K
+    );
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return std::make_tuple(y_i8, y_scale);
+}

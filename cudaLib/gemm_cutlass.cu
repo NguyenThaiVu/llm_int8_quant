@@ -177,6 +177,15 @@ torch::Tensor func_silu_mul(
     return silu_mul_cuda(fc1, fc2);
 }
 
+std::tuple<torch::Tensor, torch::Tensor> func_silu_mul_quant(
+    torch::Tensor fc1, 
+    torch::Tensor fc2,
+    torch::Tensor smooth_scale
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(fc1.device());
+    return silu_mul_quant_cuda(fc1, fc2, smooth_scale);
+}
+
 std::tuple<torch::Tensor, torch::Tensor> func_silu_mul_int8(
     torch::Tensor fc1,  // int8 - shape (M, D)
     torch::Tensor scale_fc1, // float32 - shape (M, 1)
@@ -261,6 +270,14 @@ std::vector<torch::Tensor> func_dequant_transpose_requant(
     }
 }
 
+std::tuple<torch::Tensor, torch::Tensor> func_quantize_row_int8_with_smooth_cuda(
+    torch::Tensor x,  // BF16, shape (M, K)
+    torch::Tensor smooth    // FP32, shape (K,)
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    return quantize_row_int8_with_smooth_cuda(x, smooth);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_int8_matmul",
         &func_int8_matmul,
@@ -320,7 +337,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("func_silu_mul",
         &func_silu_mul,
-        "Apply SiLU to fc1 and multiply with fc2 (both int8) with proper scaling");
+        "Apply SiLU to fc1 and multiply with fc2");
+
+    m.def("func_silu_mul_quant",
+        &func_silu_mul_quant,
+        "Apply SiLU to fc1 and multiply with fc2 (bf16), return quantized int8 output with per-row scale");
 
     m.def("func_silu_mul_int8",
         &func_silu_mul_int8,
@@ -345,4 +366,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_dequant_transpose_requant",
         &func_dequant_transpose_requant,
         "Dequantize, transpose, and requantize an int8 matrix.");
+
+    m.def("func_quantize_row_int8_with_smooth_cuda",
+        &func_quantize_row_int8_with_smooth_cuda,
+        "Quantize a BF16 matrix to INT8 with per-row smooth quantization");
 }

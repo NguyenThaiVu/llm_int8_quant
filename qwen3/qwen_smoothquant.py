@@ -1,8 +1,9 @@
 """
 This script demonstrates how to convert a Qwen3 model to SmoothQuant technique. 
 """
-import os 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  
+import os
+import time
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  
 
 from pathlib import Path
 from tqdm import tqdm
@@ -106,6 +107,12 @@ class SmoothQuant_Linear(nn.Module):
 
         self.is_quantized = True  
         
+        # Delete bf16 weight and observer to save memory
+        del self.weight
+        del self.in_observer
+        self.weight = None
+        self.in_observer = None
+        
         
 class SmoothQuant_RMSNorm(nn.Module):
     def __init__(self, emb_dim, eps=1e-6):
@@ -122,15 +129,18 @@ class SmoothQuant_RMSNorm(nn.Module):
         if self.is_quantized == False:
             y = F.rms_norm(x, normalized_shape=self.normalized_shape,\
                                 weight=self.weight, eps=self.eps)
+            return y.to(x.dtype)
         else:
             if self.is_smooth_scale == False:
-                dummy_smooth_scale = torch.ones(self.emb_dim,\
-                                    dtype=torch.float32, device=x.device)
-                y = gemm_cutlass.func_rmsnorm_bf16_to_int8(x, self.weight, dummy_smooth_scale, self.eps)
+                dummy_scale = torch.ones(self.emb_dim, dtype=torch.float32, device=x.device)
+                y_int8, scale_y = gemm_cutlass.func_rmsnorm_bf16_to_int8(x, self.weight,\
+                                                dummy_scale, self.eps)
             else:
-                y = gemm_cutlass.func_rmsnorm_bf16_to_int8(x, self.weight, self.smooth_scale, self.eps)
-        return y
-        
+                y_int8, scale_y = gemm_cutlass.func_rmsnorm_bf16_to_int8(x, self.weight,\
+                                                self.smooth_scale, self.eps)
+            return y_int8, scale_y
+    
+    
     def finish_calibration(self):
         self.is_quantized = True
         
@@ -145,12 +155,41 @@ class SmoothQuant_RMSNorm(nn.Module):
         self.smooth_scale.data.copy_(smooth_scale)
 
 
+class SmoothQuant_Silu_Mul(nn.Module):
+    def __init__(self, embed_dim):
+        super(SmoothQuant_Silu_Mul, self).__init__()
+        self.embed_dim = embed_dim
+        self.is_quantized = False
+        self.smooth_scale = nn.Parameter(torch.ones(embed_dim, dtype=torch.float32))
+        self.is_smooth_scale = False
+
+    def forward(self, x1, x2):
+        if self.is_quantized == False:
+            y = F.silu(x1) * x2
+            return y
+        else:
+            if self.is_smooth_scale == False:
+                dummy_smooth_scale = torch.ones(self.embed_dim, dtype=torch.float32, device=x1.device)
+                y_i8, scale_y = gemm_cutlass.func_silu_mul_quant(x1, x2, dummy_smooth_scale)
+            else:
+                y_i8, scale_y = gemm_cutlass.func_silu_mul_quant(x1, x2, self.smooth_scale)
+            return y_i8, scale_y
+    
+    def finish_calibration(self):
+        self.is_quantized = True
+        
+    def enable_smooth_scale(self, smooth_scale):
+        self.is_smooth_scale = True
+        self.smooth_scale.data.copy_(smooth_scale)
+            
+
 class SmoothQuant_FeedForward(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.fc1 = SmoothQuant_Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"])
         self.fc2 = SmoothQuant_Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"])
         self.fc3 = SmoothQuant_Linear(cfg["hidden_dim"], cfg["emb_dim"], dtype=cfg["dtype"])
+        self.silu_mul_layer = SmoothQuant_Silu_Mul(cfg["hidden_dim"])
         
         self.is_quantized = False
 
@@ -162,25 +201,16 @@ class SmoothQuant_FeedForward(nn.Module):
             x = self.fc3(x)
             return x
         else:
-            # Smooth input activation
-            # smooth_scale = self.fc1.smooth_alpha
-            # x = x / smooth_scale.unsqueeze(0)
-            # x_int8, scale_x = quantize_row_int8_symmetric_nd(x)
             x_i8 = x
             scale_x = scale_x
             assert x_i8.dtype == torch.int8, "Expect int8 input in quantization"
             
             x_fc1 = self.fc1(x_i8, scale_x)
             x_fc2 = self.fc2(x_i8, scale_x)
+            
+            x_i8, scale_x = self.silu_mul_layer(x_fc1, x_fc2)
 
-            x = nn.functional.silu(x_fc1) * x_fc2
-            
-            # Smooth for FC3
-            smooth_scale_fc3 = self.fc3.smooth_alpha
-            x = x / smooth_scale_fc3.unsqueeze(0)
-            x_int8, scale_x = quantize_row_int8_symmetric_nd(x)
-            
-            x = self.fc3(x_int8, scale_x)
+            x = self.fc3(x_i8, scale_x)
             return x
     
     def finish_calibration(self):
@@ -191,6 +221,11 @@ class SmoothQuant_FeedForward(nn.Module):
         self.fc2.finish_calibration(alpha=fc1_smooth_alpha) 
         
         self.fc3.finish_calibration()
+        fc3_smooth_alpha = self.fc3.smooth_alpha
+        
+        self.silu_mul_layer.finish_calibration()
+        self.silu_mul_layer.enable_smooth_scale(fc3_smooth_alpha)
+        
         self.is_quantized = True
         
         
@@ -296,15 +331,17 @@ class SmoothQuant_GroupedQueryAttention(nn.Module):
             attn_scores = attn_scores.masked_fill(mask, -torch.inf)
             attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
 
-            # 6. Output
+            # 6. Context computation
             context = attn_weights @ values  # Shape: (num_heads, num_tokens, head_dim)
             context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
             
             # Smooth quantization for output activation of attention
-            smooth_value_attn = self.out_proj.smooth_alpha
-            context = context / smooth_value_attn.unsqueeze(0)
-            context_int8, scale_context = quantize_row_int8_symmetric_nd(context)
-            out = self.out_proj(context_int8, scale_context)
+            # smooth_value_attn = self.out_proj.smooth_alpha
+            # context = context / smooth_value_attn.unsqueeze(0)
+            # context_int8, scale_context = quantize_row_int8_symmetric_nd(context)
+            context_i8, scale_context = gemm_cutlass.func_quantize_row_int8_with_smooth_cuda(context, self.out_proj.smooth_alpha)
+            
+            out = self.out_proj(context_i8, scale_context)
             return out
     
     def finish_calibration(self):
@@ -530,7 +567,7 @@ if __name__ == "__main__":
     # # =================================================
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=10_000)
+                                                    split="train", n=1_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             
@@ -563,18 +600,34 @@ if __name__ == "__main__":
     # ================================================================
     # 3. Measure latency
     # ================================================================
-    print(f"\n[INFO] Measuring latency ...")
+    model.eval()
+
     samples = tokenizer.encode(samples)
-
-    chunk_tokens = samples[0: PPL_CONTEXT_TOKENS]
-
+    chunk_tokens = samples[0:PPL_CONTEXT_TOKENS]
     input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
+
     print(f"[INFO] Input tokens: {input_ids.shape}")
 
-    # Warm-up runs
+    # Warm-up
     with torch.no_grad():
         out_ids = model(input_ids)
+    torch.cuda.synchronize()
+
     print(f"[INFO] Output tokens: {out_ids.shape}")
+
+    # Clear previous peak stats after warm-up
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.synchronize()
+
+    # Actual measured run
+    with torch.no_grad():
+        out_ids = model(input_ids)
+    torch.cuda.synchronize()
+
+    def calc_gpu_gb(x):
+        return f"{x / 1024 / 1024 / 1024:.2f} GB"
+    print(f"GPU memory used: {calc_gpu_gb(torch.cuda.max_memory_allocated())}")
+    
     
     with torch.profiler.profile(
         activities=[

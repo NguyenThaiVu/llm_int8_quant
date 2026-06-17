@@ -52,10 +52,6 @@ def quantize_row_int8_symmetric_nd(
     q_mat_2d.round_()
     q_mat_2d.clamp_(qmin, qmax)
     q_mat_2d = q_mat_2d.to(torch.int8)
-    
-    # q_mat_2d = torch.clamp(
-    #     torch.round(mat_2d / scales.unsqueeze(1)),
-    #     qmin, qmax).to(torch.int8)
 
     # Reshape back
     q_mat = q_mat_2d.reshape(orig_shape)
@@ -63,33 +59,6 @@ def quantize_row_int8_symmetric_nd(
 
     return q_mat, scales.to(scale_dtype)
 
-
-# @torch.inference_mode()
-# def quantize_row_int8_symmetric_nd(
-#     mat: torch.Tensor,
-#     scale_dtype=torch.float32,
-# ):
-#     assert mat.dim() >= 2, "mat must be at least 2D"
-
-#     qmin, qmax = -128, 127
-#     orig_shape = mat.shape
-#     last_dim = orig_shape[-1]
-#     num_vecs = mat.numel() // last_dim
-
-#     mat_2d = mat.reshape(num_vecs, last_dim)
-
-#     max_vals = mat_2d.abs().amax(dim=1, keepdim=True).clamp_(min=1e-8)
-#     scales = max_vals / qmax   # shape: (num_vecs, 1)
-
-#     # One explicit working buffer instead of a long expression chain
-#     tmp = mat_2d / scales
-#     tmp.round_()
-#     tmp.clamp_(qmin, qmax)
-
-#     q_mat = tmp.to(torch.int8).reshape(orig_shape)
-#     scales = scales.squeeze(1).reshape(orig_shape[:-1]).to(scale_dtype)
-
-#     return q_mat, scales
 
 
 def measure_time(func, *args, repeat=100):

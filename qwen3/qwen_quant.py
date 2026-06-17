@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # select GPU "0", "1", "2",...
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # select GPU "0", "1", "2",...
 from tqdm import tqdm
 import json
 
@@ -154,8 +154,8 @@ if __name__ == "__main__":
     # ================================================================
     # 3. Text generation
     # ================================================================
-    MAX_NEW_TOKENS = 1024
-    PPL_CONTEXT_TOKENS = 1024
+    MAX_NEW_TOKENS = 2048
+    PPL_CONTEXT_TOKENS = 2048
     EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
@@ -181,7 +181,7 @@ if __name__ == "__main__":
     # ================================================================
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=10_000)
+                                                    split="train", n=1_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             
@@ -216,13 +216,42 @@ if __name__ == "__main__":
 
         response = get_clean_generated_text(generated_text, tokenizer)
         print(f"{idx}. Generated response: {response} \n")
+        
+    # ================================================================
+    # 3. Measure latency
+    # ================================================================
+    model.eval()
+
+    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+    samples = tokenizer.encode(samples)
+    chunk_tokens = samples[0:PPL_CONTEXT_TOKENS]
+    input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
+    print(f"[INFO] Input tokens: {input_ids.shape}")
+
+    # Warm-up
+    with torch.no_grad():
+        out_ids = model(input_ids)
+    torch.cuda.synchronize()
+
+    print(f"[INFO] Output tokens: {out_ids.shape}")
+
+    # Clear previous peak stats after warm-up
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.synchronize()
+
+    # Actual measured run
+    with torch.no_grad():
+        out_ids = model(input_ids)
+    torch.cuda.synchronize()
+
+    def calc_gpu_gb(x):
+        return f"{x / 1024 / 1024 / 1024:.2f} GB"
+    print(f"GPU memory used: {calc_gpu_gb(torch.cuda.max_memory_allocated())}\n")
 
     # ================================================================
     # 5. PPL evaluation
     # ================================================================
     print(f"[INFO] ...Start Evaluation...")
-
-    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
 
     ppl = compute_ppl_single_text(model,
                                 tokenizer,

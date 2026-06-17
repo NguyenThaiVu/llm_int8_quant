@@ -1,4 +1,7 @@
 import os 
+import time
+from tqdm import tqdm
+
 import torch
 torch.manual_seed(123)
 import torch.nn as nn
@@ -31,6 +34,7 @@ elif os.path.exists(MODEL_HUD_FOLDER_2):
 else:
     raise ValueError("Model hub folder not found. Please check the paths.")
 LOCAL_DIR = os.path.join(MODEL_HUB, MODEL_FOLDER)
+print(f"[INFO] Path to model directory: {LOCAL_DIR}")
 
 
 # ===============================================
@@ -54,7 +58,7 @@ class Custom_GroupedQueryAttention(nn.Module):
 
         self.head_dim = head_dim
         self.d_out = num_heads * head_dim
-        self.inv_softmax_scale = 1 / (head_dim ** 0.5) # softmax scale: 1/sqrt(d_k)
+        self.inv_softmax_scale = 1 / (head_dim ** 0.5) 
 
         self.W_query = Custom_Linear(d_in, self.d_out).to(dtype)
         self.W_key = Custom_Linear(d_in, num_kv_groups * head_dim).to(dtype)
@@ -64,7 +68,7 @@ class Custom_GroupedQueryAttention(nn.Module):
         self.query_rope = Custom_RoPE(num_heads, max_seq_len=MAX_SEQ_LEN, head_dim=head_dim).to(dtype)
         self.key_rope = Custom_RoPE(num_kv_groups, max_seq_len=MAX_SEQ_LEN, head_dim=head_dim).to(dtype)
         
-        self.softmax_layer = Custom_Softmax(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)    
+        self.softmax_layer = Custom_Softmax(num_heads=num_heads).to(dtype)    
         self.qk_score_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)
         self.context_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN,\
             is_return_float=True).to(dtype)
@@ -117,12 +121,13 @@ class Custom_GroupedQueryAttention(nn.Module):
             
             # Reshape for multi-head 
             queries_int8 = queries_int8.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
+            queries_scale = queries_scale.unsqueeze(0).expand(self.num_heads, -1)
             
             keys_int8 = keys_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
-            
+            keys_scale = keys_scale.unsqueeze(0).expand(self.num_kv_groups, -1)
+
             values_int8 = values_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
             values_scale = values_scale.unsqueeze(0).expand(self.num_kv_groups, -1)
-            
             
             # Apply RoPE to quantized Q and K
             queries_int8, queries_scale = self.query_rope(queries_int8, queries_scale,\
@@ -164,8 +169,11 @@ class Custom_GroupedQueryAttention(nn.Module):
     
     def finish_calibration(self):
         self.W_query.finish_calibration()
-        self.W_key.finish_calibration()
-        self.W_value.finish_calibration()
+        # Key and Value use the same smooth alpha as Query
+        smooth_query = self.W_query.smooth_alpha
+        self.W_key.finish_calibration(alpha=smooth_query) 
+        self.W_value.finish_calibration(alpha=smooth_query) 
+        
         self.query_rope.finish_calibration()
         self.key_rope.finish_calibration()
         self.softmax_layer.finish_calibration()
@@ -195,7 +203,8 @@ class TransformerBlock(nn.Module):
         cos, sin = compute_rope_params(
             head_dim=cfg["emb_dim"] // cfg["n_heads"],
             theta_base=cfg["rope_base"],
-            context_length=cfg["context_length"],
+            # context_length=cfg["context_length"],
+            context_length=MAX_SEQ_LEN,
             freq_config=cfg["rope_freq"]
         )
         self.register_buffer("cos", cos.to(cfg["dtype"]))
@@ -213,18 +222,17 @@ class TransformerBlock(nn.Module):
     def forward(self, x):
         # Shortcut connection for attention block
         shortcut = x
+        seq_len, _ = x.shape
         
         if self.is_quantized == False:
             x = self.norm1(x)
             
-            mask = torch.triu(torch.ones(x.shape[0], x.shape[0],\
-                                device=x.device, dtype=torch.bool), diagonal=1)
+            mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1)
             x = self.att(x, 1.0, mask, self.cos, 1.0, self.sin, 1.0)  
         else:
             x, scale_x = self.norm1(x)
             
-            mask = torch.tril(torch.ones((x.shape[0], x.shape[0]),\
-                            dtype=torch.uint8, device=x.device))
+            mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.uint8, device=x.device))
             x = self.att(x, scale_x, mask,\
                         self.cos_int8, self.cos_scale,\
                         self.sin_int8, self.sin_scale)  
@@ -233,15 +241,12 @@ class TransformerBlock(nn.Module):
 
         # Shortcut connection for feed-forward block
         shortcut = x
-        
         if self.is_quantized == False:
             x = self.norm2(x)
             x, _ = self.ff(x, 1.0)
-        
         else:
             x, scale_x = self.norm2(x)
             x, _ = self.ff(x, scale_x)
-        
         x = x + shortcut  
 
         return x
@@ -249,6 +254,8 @@ class TransformerBlock(nn.Module):
     def finish_calibration(self):
         self.att.finish_calibration()
         self.norm1.finish_calibration()
+        smooth_scale = self.att.W_query.smooth_alpha
+        self.norm1.enable_smooth_scale(smooth_scale)
         
         self.ff.finish_calibration()
         
@@ -257,6 +264,10 @@ class TransformerBlock(nn.Module):
         self.norm2.enable_smooth_scale(smooth_scale)
         
         self.is_quantized = True
+        
+        # Delete the RoPE buffers to save memory after calibration
+        del self.cos
+        del self.sin
 
 
 class Llama3Model(nn.Module):
@@ -290,6 +301,37 @@ class Llama3Model(nn.Module):
         for block in self.trf_blocks:
             block.finish_calibration()
             
+
+def tensor_memory_all_attrs(model):
+    seen = set()
+    total = 0
+    by_dtype = {}
+
+    for module_name, module in model.named_modules():
+        for attr_name, value in module.__dict__.items():
+            if torch.is_tensor(value):
+                ptr = value.data_ptr()
+                if ptr in seen:
+                    continue
+                seen.add(ptr)
+
+                bytes_ = value.numel() * value.element_size()
+                total += bytes_
+                by_dtype[str(value.dtype)] = by_dtype.get(str(value.dtype), 0) + bytes_
+
+                print(
+                    f"{module_name}.{attr_name}: "
+                    f"shape={tuple(value.shape)}, "
+                    f"dtype={value.dtype}, "
+                    f"memory={bytes_ / 1024**2:.2f} MB, "
+                    f"device={value.device}"
+                )
+
+    print("\nTotal tensor attributes:", total / 1024**3, "GB")
+    print("By dtype:")
+    for dtype, bytes_ in sorted(by_dtype.items(), key=lambda x: -x[1]):
+        print(dtype, bytes_ / 1024**3, "GB")    
+
             
 if __name__ == "__main__":
 
@@ -344,14 +386,14 @@ if __name__ == "__main__":
     del combined_weights  # free up memory
 
     # ===============================================
-    # 4. Generate Text
+    # 4. Generate Text 
     # ===============================================
-    MAX_GENERATED_TOKENS = 1024
-    PPL_CONTEXT_TOKENS = 1024
+    MAX_GENERATED_TOKENS = 2048
+    PPL_CONTEXT_TOKENS = 2048
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-    EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
+    EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
-    list_prompts = ["What is Dragon Ball story?"]
+    list_prompts = ["What is the capital of VietNam?"]
 
     for prompt in list_prompts:
         token_ids = generate(
@@ -364,27 +406,17 @@ if __name__ == "__main__":
         output_text = token_ids_to_text(token_ids, tokenizer)
         print("\nResponse:\n", clean_text(output_text))
         
-
-    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
-
-    ppl = compute_ppl_single_text(model,
-                                tokenizer, 
-                                samples,
-                                context_size=PPL_CONTEXT_TOKENS,
-                                stride=PPL_STRIDE)
-    print("PPL:", ppl)   
-        
     # ===============================================
-    # 5. Quantization
+    # 5. Calibration for quantization
     # ===============================================
 
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=100_000)
+                                                    split="train", n=1)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             
-    for i in range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE):
+    for i in tqdm(range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE)):
         chunk_tokens = calibrate_tokens[i:i + PPL_CONTEXT_TOKENS]
 
         input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
@@ -394,29 +426,100 @@ if __name__ == "__main__":
             
     model.finish_calibration()
     print(f"[INFO] Finished calibration.")
-
-
-    # ========================================================================
-    # Quantization mode
-    print("\n===== Generated text after quantization: =====\n")
-    list_prompts = ["What is Dragon Ball story?"]
-
-    for prompt in list_prompts:
-        token_ids = generate(
-            model=model,
-            idx=text_to_token_ids(prompt, tokenizer).to(device),
-            max_new_tokens=MAX_GENERATED_TOKENS,
-            context_size=LLAMA32_CONFIG["context_length"],
-            top_k=1)
-
-        output_text = token_ids_to_text(token_ids, tokenizer)
-        print("\nResponse:\n", clean_text(output_text)) 
+    model.eval()
         
+    # ===============================================
+    # Measure Memory usage
+    # ===============================================
+    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+    samples = tokenizer.encode(samples)
+    chunk_tokens = samples[0:PPL_CONTEXT_TOKENS]
+    input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
+    print(f"[INFO] Input tokens: {input_ids.shape}")
 
-    ppl = compute_ppl_single_text(model,
-                                tokenizer, 
-                                samples,
-                                context_size=PPL_CONTEXT_TOKENS,
-                                stride=PPL_STRIDE)
-    print("PPL:", ppl)   
-        
+    # WARM-UP
+    with torch.no_grad():
+        _ = model(input_ids)
+    torch.cuda.synchronize()
+
+    time.sleep(1)  
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.synchronize()
+
+    # Actual measured run
+    with torch.no_grad():
+        out_ids = model(input_ids)
+    torch.cuda.synchronize()
+    # print(f"[INFO] Output tokens: {out_ids.shape}")
+
+    def calc_gpu_gb(x):
+        return f"{x / 1024 / 1024 / 1024:.2f} GB"
+    print(f"GPU memory used: {calc_gpu_gb(torch.cuda.max_memory_allocated())}\n")
+    
+    print("allocated:", torch.cuda.memory_allocated() / 1024**3, "GB")
+    print("max allocated:", torch.cuda.max_memory_allocated() / 1024**3, "GB")
+    print("reserved:", torch.cuda.memory_reserved() / 1024**3, "GB")
+    print("max reserved:", torch.cuda.max_memory_reserved() / 1024**3, "GB")
+    print("\n\n\n")
+    
+    tensor_memory_all_attrs(model)
+    
+    
+
+    # # ===============================================
+    # # Measure Latency
+    # # ===============================================
+    # # Warm-up 
+    # for _ in range(5):
+    #     with torch.no_grad():
+    #         _ = model(input_ids)
+    # torch.cuda.synchronize()    
+    
+    # # Measured iterations
+    # n_iter = 10
+    # start_event = torch.cuda.Event(enable_timing=True)
+    # end_event = torch.cuda.Event(enable_timing=True)    
+    # start_event.record()
+    # for _ in range(n_iter):
+    #     with torch.no_grad():
+    #         _ = model(input_ids)
+    # end_event.record()
+    # torch.cuda.synchronize()
+    # avg_latency_ms = start_event.elapsed_time(end_event) / n_iter
+    # print(f"Latency per inference: {avg_latency_ms:.2f} ms")
+    
+    # # ========================================================================
+    # # Quantization text generation
+    # # ========================================================================
+    # print("\n===== Generated text after quantization: =====\n")
+    # list_prompts = ["What is the capital of VietNam?"]
+
+    # for prompt in list_prompts:
+    #     token_ids = generate(
+    #         model=model,
+    #         idx=text_to_token_ids(prompt, tokenizer).to(device),
+    #         max_new_tokens=MAX_GENERATED_TOKENS,
+    #         # context_size=LLAMA32_CONFIG["context_length"],
+    #         context_size=MAX_SEQ_LEN,
+    #         top_k=1)
+
+    #     output_text = token_ids_to_text(token_ids, tokenizer)
+    #     print("\nResponse:\n", clean_text(output_text)) 
+    
+    # # ===============================================
+    # # PPL evaluation after quantization
+    # # ===============================================
+    # samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+
+    # ppl = compute_ppl_single_text(model,
+    #                             tokenizer, 
+    #                             samples,
+    #                             context_size=PPL_CONTEXT_TOKENS,
+    #                             stride=PPL_STRIDE)
+    # print("PPL (after quantization):", ppl)   
+    
+    # print("\nModel information:")
+    # print(f" - Model: LLaMA-3.2-{LLAMA_SIZE_STR}-Instruct")
+    # print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    # print(f"Dataset evaluation: {EVALUATION_DATASET}")

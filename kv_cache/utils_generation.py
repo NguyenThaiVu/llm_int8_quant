@@ -82,4 +82,4 @@ def generate_text_autoregressive(model, token_ids, max_new_tokens, eos_token_id=
             logits = model(next_token, cache=cache)
             
     total_cache_size = cache.get_total_cache_size()
-    print(f"\n[INFO] Total KV cache size: {total_cache_size / 1024 / 1024 / 1024:.2f} GB")
+    print(f"\n[INFO] Total KV cache size: {total_cache_size / 1024 / 1024:.2f} MB")

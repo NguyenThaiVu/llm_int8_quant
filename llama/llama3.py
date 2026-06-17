@@ -16,7 +16,7 @@ from utils_generation import *
 from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text
 
 
-LLAMA_SIZE_STR = "3B" # "1B" or "3B"
+LLAMA_SIZE_STR = "1B" # "1B" or "3B"
 IS_INSTRUCT = True # True or False
 
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
@@ -103,7 +103,7 @@ print(f"[INFO] Weights loaded successfully.\n")
 MAX_GENERATED_TOKENS = 2048
 PPL_CONTEXT_TOKENS = 2048
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
+EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
 
 list_prompts = ["What is Dragon Ball story?"]
 
@@ -136,17 +136,46 @@ print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
 print(f"Context size: {PPL_CONTEXT_TOKENS}")
 
 # ===============================================
-# 6. Measure Latency 
+# Measure Memory usage
 # ===============================================
+samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+samples = tokenizer.encode(samples)
+chunk_tokens = samples[0:PPL_CONTEXT_TOKENS]
+input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
+print(f"[INFO] Input tokens: {input_ids.shape}")
+
+
+time.sleep(1)  
+torch.cuda.empty_cache()
+torch.cuda.reset_peak_memory_stats()
+torch.cuda.synchronize()
+
+# Actual measured run
+with torch.no_grad():
+    out_ids = model(input_ids)
+torch.cuda.synchronize()
+print(f"[INFO] Output tokens: {out_ids.shape}")
+
+def calc_gpu_gb(x):
+    return f"{x / 1024 / 1024 / 1024:.2f} GB"
+print(f"GPU memory used: {calc_gpu_gb(torch.cuda.max_memory_allocated())}\n")
+
+# ===============================================
+# Measure Latency
+# ===============================================
+# Warm-up 
+for _ in range(5):
+    with torch.no_grad():
+        _ = model(input_ids)
+torch.cuda.synchronize()    
+
+# Measured iterations
+n_iter = 10
 start_time = time.time()
-for _ in range(10):
-    token_ids = generate(
-        model=model,
-        idx=text_to_token_ids(prompt, tokenizer).to(device),
-        max_new_tokens=MAX_GENERATED_TOKENS,
-        context_size=LLAMA32_CONFIG["context_length"],
-        top_k=1,
-    )
+for _ in range(n_iter):
+    with torch.no_grad():
+        _ = model(input_ids)
+torch.cuda.synchronize()
 end_time = time.time()
-avg_latency = (end_time - start_time) / 10
-print(f"\n[INFO] Average latency (before quantization): {avg_latency:.4f} seconds per generation (BATCH = 1).")
+avg_latency = (end_time - start_time) / n_iter
+print(f"Average latency per run: {avg_latency:.4f} seconds")
