@@ -22,7 +22,7 @@ from utils_evaluation import load_wikitext_single_text
 from utils_generation import generate_text_autoregressive, benchmark_llm_decode
 
 
-CHOOSE_MODEL = "14B" # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "8B" # Options: "4B", "8B", "14B"
 
 # Select which model to use via the following flag; only one can be True
 USE_BASE_MODEL = True
@@ -210,8 +210,8 @@ tokenizer = Qwen3Tokenizer(
 # ========================================================
 # 4. Text generation with KV cache
 # ========================================================
-INPUT_PROMPT_LENGTH = 1024
-MAX_NEW_TOKENS = 256
+INPUT_PROMPT_LENGTH = 4096
+MAX_NEW_TOKENS = 16
 print("[INFO] INPUT PROMPT LENGTH:", INPUT_PROMPT_LENGTH)
 print("[INFO] MAX NEW TOKENS:", MAX_NEW_TOKENS)
 

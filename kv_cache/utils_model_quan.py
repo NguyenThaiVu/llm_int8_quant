@@ -345,6 +345,8 @@ class Custom_Matmul(nn.Module):
                 raise ValueError(f"Unsupported input dimensions: {A.dim()}")
             return C, 1.0
         else:
+            print(f"[DEBUG] Custom_Matmul forward: A shape={A.shape}, B shape={B.shape}")
+            
             if A.dim() == 2:
                 if self.is_return_float:
                     C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)

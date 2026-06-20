@@ -73,17 +73,23 @@ def measure_time(func, *args, repeat=100):
     Returns:
     float: Average execution time in milliseconds.
     """
+    # Set to evaluation mode if it's a nn.Module
+    if isinstance(func, nn.Module):
+        func.eval()
+    
     # warm-up
-    for _ in range(5):
-        func(*args)
+    with torch.no_grad():
+        for _ in range(5):
+            func(*args)
 
     torch.cuda.synchronize()
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
     start_event.record()
-    for _ in range(repeat):
-        func(*args)
+    with torch.no_grad():
+        for _ in range(repeat):
+            func(*args)
     end_event.record()
 
     torch.cuda.synchronize()

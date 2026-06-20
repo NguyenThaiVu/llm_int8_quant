@@ -285,26 +285,37 @@ __global__ void int8_gemv_out_i8_batched_kernel(
     const float* __restrict__ y_scale,
     int8_t* __restrict__ y_i8,
     int R,
+    int B,
+    int M,
     int N,
     int K,
     int x_scale_numel,
+    int w_scale_numel,
     int y_scale_numel,
+    bool weight_is_batched,
     float alpha
 ) {
     int n = blockIdx.x;      // output channel
-    int row = blockIdx.y;    // batch row
+    int row = blockIdx.y;    // flattened [B, M] row
 
     if (row >= R || n >= N) {
         return;
     }
 
+    int b = row / M;
+
     int K4 = K >> 2;
 
-    const int8_t* x_row =
-        x + static_cast<int64_t>(row) * K;
+    const int8_t* x_row = x + static_cast<int64_t>(row) * K;
 
-    const int8_t* w_row =
-        weight + static_cast<int64_t>(n) * K;
+    const int8_t* w_row;
+    if (weight_is_batched) {
+        // weight shape: [B, N, K]
+        w_row = weight + (static_cast<int64_t>(b) * N + n) * K;
+    } else {
+        // weight shape: [N, K]
+        w_row = weight + static_cast<int64_t>(n) * K;
+    }
 
     const int32_t* __restrict__ x4 =
         reinterpret_cast<const int32_t*>(x_row);
@@ -327,18 +338,26 @@ __global__ void int8_gemv_out_i8_batched_kernel(
         float sx = (x_scale_numel == 1) ? x_scale[0] : x_scale[row];
         float sy = (y_scale_numel == 1) ? y_scale[0] : y_scale[row];
 
-        float deq_scale = sx * w_scale[n] * alpha;
+        float sw;
+        if (w_scale_numel == N) {
+            // shared scale: [N]
+            sw = w_scale[n];
+        } else {
+            // batched scale: [B, N]
+            sw = w_scale[static_cast<int64_t>(b) * N + n];
+        }
+
+        float deq_scale = sx * sw * alpha;
         float y = static_cast<float>(acc) * deq_scale;
 
-        float inv_y_scale = 1.0f / sy;
-        float q = nearbyintf(y * inv_y_scale);
-
+        float q = nearbyintf(y / sy);
         q = fminf(127.0f, fmaxf(-128.0f, q));
 
         y_i8[static_cast<int64_t>(row) * N + n] =
             static_cast<int8_t>(q);
     }
 }
+
 
 torch::Tensor int8_gemv_out_i8(
     torch::Tensor x,
@@ -366,11 +385,11 @@ torch::Tensor int8_gemv_out_i8(
     TORCH_CHECK(y_scale.scalar_type() == torch::kFloat32,
                 "y_scale must be float32");
 
-    TORCH_CHECK(weight.dim() == 2,
-                "weight must have shape [N, K]");
-
     TORCH_CHECK(x.dim() == 1 || x.dim() == 2 || x.dim() == 3,
                 "x must have shape [K], [B, K], or [B, M, K]");
+
+    TORCH_CHECK(weight.dim() == 2 || weight.dim() == 3,
+                "weight must have shape [N, K] or [B, N, K]");
 
     x = x.contiguous();
     weight = weight.contiguous();
@@ -380,31 +399,61 @@ torch::Tensor int8_gemv_out_i8(
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
 
-    int64_t N = weight.size(0);
-    int64_t K = weight.size(1);
-
-    int64_t R = 1;
-
-    bool x_is_1d = (x.dim() == 1);
-    bool x_is_2d = (x.dim() == 2);
-    bool x_is_3d = (x.dim() == 3);
+    bool weight_is_batched = weight.dim() == 3;
 
     int64_t B = 1;
     int64_t M = 1;
+    int64_t R = 1;
+    int64_t N = 0;
+    int64_t K = 0;
+
+    bool x_is_1d = x.dim() == 1;
+    bool x_is_2d = x.dim() == 2;
+    bool x_is_3d = x.dim() == 3;
+
+    if (weight_is_batched) {
+        B = weight.size(0);
+        N = weight.size(1);
+        K = weight.size(2);
+    } else {
+        N = weight.size(0);
+        K = weight.size(1);
+    }
 
     if (x_is_1d) {
+        TORCH_CHECK(!weight_is_batched,
+                    "x shape [K] cannot be used with batched weight [B, N, K]");
+
         TORCH_CHECK(x.size(0) == K,
-                    "x shape [K] must match weight shape [N, K]");
+                    "x shape [K] must match weight K");
+
+        B = 1;
+        M = 1;
         R = 1;
     } else if (x_is_2d) {
         TORCH_CHECK(x.size(1) == K,
-                    "x shape [B, K] must match weight shape [N, K]");
-        B = x.size(0);
+                    "x shape [B, K] must match weight K");
+
+        if (weight_is_batched) {
+            TORCH_CHECK(x.size(0) == B,
+                        "x batch size must match weight batch size");
+        } else {
+            B = x.size(0);
+        }
+
+        M = 1;
         R = B;
     } else {
         TORCH_CHECK(x.size(2) == K,
-                    "x shape [B, M, K] must match weight shape [N, K]");
-        B = x.size(0);
+                    "x shape [B, M, K] must match weight K");
+
+        if (weight_is_batched) {
+            TORCH_CHECK(x.size(0) == B,
+                        "x batch size must match weight batch size");
+        } else {
+            B = x.size(0);
+        }
+
         M = x.size(1);
         R = B * M;
     }
@@ -412,20 +461,44 @@ torch::Tensor int8_gemv_out_i8(
     TORCH_CHECK(K % 4 == 0,
                 "K must be divisible by 4 for dp4a");
 
-    TORCH_CHECK(w_scale.dim() == 1 && w_scale.size(0) == N,
-                "w_scale must have shape [N]");
-
     TORCH_CHECK(x_scale.numel() == 1 || x_scale.numel() == R,
                 "x_scale must contain either 1 element or R elements");
 
     TORCH_CHECK(y_scale.numel() == 1 || y_scale.numel() == R,
                 "y_scale must contain either 1 element or R elements");
 
+    if (weight_is_batched) {
+        TORCH_CHECK(
+            w_scale.numel() == N || w_scale.numel() == B * N,
+            "for batched weight [B, N, K], w_scale must have shape [N] or [B, N]"
+        );
+    } else {
+        TORCH_CHECK(
+            w_scale.numel() == N,
+            "for weight [N, K], w_scale must have shape [N]"
+        );
+    }
+
     TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr<int8_t>()) % 4 == 0,
                 "x pointer must be 4-byte aligned");
 
     TORCH_CHECK(reinterpret_cast<uintptr_t>(weight.data_ptr<int8_t>()) % 4 == 0,
                 "weight pointer must be 4-byte aligned");
+
+    TORCH_CHECK(R <= std::numeric_limits<int>::max(),
+                "R is too large for this kernel");
+
+    TORCH_CHECK(B <= std::numeric_limits<int>::max(),
+                "B is too large for this kernel");
+
+    TORCH_CHECK(M <= std::numeric_limits<int>::max(),
+                "M is too large for this kernel");
+
+    TORCH_CHECK(N <= std::numeric_limits<int>::max(),
+                "N is too large for this kernel");
+
+    TORCH_CHECK(K <= std::numeric_limits<int>::max(),
+                "K is too large for this kernel");
 
     auto options_int8 = torch::TensorOptions()
                             .dtype(torch::kChar)
@@ -445,6 +518,7 @@ torch::Tensor int8_gemv_out_i8(
     int threads = 256;
 
     dim3 block(static_cast<unsigned int>(threads));
+
     dim3 grid(
         static_cast<unsigned int>(N),
         static_cast<unsigned int>(R)
@@ -460,10 +534,14 @@ torch::Tensor int8_gemv_out_i8(
         y_scale_ptr,
         y_i8_ptr,
         static_cast<int>(R),
+        static_cast<int>(B),
+        static_cast<int>(M),
         static_cast<int>(N),
         static_cast<int>(K),
         static_cast<int>(x_scale.numel()),
+        static_cast<int>(w_scale.numel()),
         static_cast<int>(y_scale.numel()),
+        weight_is_batched,
         static_cast<float>(alpha)
     );
 
