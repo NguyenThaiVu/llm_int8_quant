@@ -1,4 +1,5 @@
 import os 
+import numpy as np
 import torch
 
 class KVCache:
@@ -83,3 +84,101 @@ def generate_text_autoregressive(model, token_ids, max_new_tokens, eos_token_id=
             
     total_cache_size = cache.get_total_cache_size()
     print(f"\n[INFO] Total KV cache size: {total_cache_size / 1024 / 1024:.2f} MB")
+    
+    
+@torch.inference_mode()
+def benchmark_llm_decode(
+    model,
+    token_ids,
+    max_new_tokens,
+    eos_token_id=None,
+    context_size=None,
+    warmup_decode_tokens=5,
+):
+    model.eval()
+
+    if context_size is not None:
+        token_ids = token_ids[:, -context_size:]
+
+    cache = KVCache(n_layers=model.cfg["n_layers"])
+    model.reset_kv_cache()
+
+    # ============================================================
+    # Prefill / TTFT
+    # ============================================================
+    torch.cuda.synchronize()
+
+    prefill_start = torch.cuda.Event(enable_timing=True)
+    prefill_end = torch.cuda.Event(enable_timing=True)
+
+    prefill_start.record()
+    logits = model(token_ids, cache=cache)
+    prefill_end.record()
+
+    torch.cuda.synchronize()
+    prefill_ms = prefill_start.elapsed_time(prefill_end)
+
+    decode_times_ms = []
+    generated = []
+
+    # First token from prefill logits
+    next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+    generated.append(next_token)
+
+    if eos_token_id is not None and torch.all(next_token == eos_token_id):
+        return {
+            "prefill_ms": prefill_ms,
+            "decode_times_ms": [],
+            "generated_tokens": torch.cat(generated, dim=1),
+        }
+
+    # ============================================================
+    # Decode loop
+    # ============================================================
+    for step in range(1, max_new_tokens):
+        torch.cuda.synchronize()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        start.record()
+
+        logits = model(next_token, cache=cache)
+
+        end.record()
+        torch.cuda.synchronize()
+
+        decode_ms = start.elapsed_time(end)
+
+        if step > warmup_decode_tokens:
+            decode_times_ms.append(decode_ms)
+
+        next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+        generated.append(next_token)
+
+        if eos_token_id is not None and torch.all(next_token == eos_token_id):
+            break
+
+    generated_tokens = torch.cat(generated, dim=1)
+
+    if len(decode_times_ms) > 0:
+        decode_arr = np.array(decode_times_ms)
+        decode_mean_ms = decode_arr.mean()
+        decode_tokens_per_sec = 1000.0 / decode_mean_ms
+        total_time = prefill_ms + sum(decode_times_ms)
+    else:
+        decode_mean_ms = None
+        decode_median_ms = None
+        decode_p90_ms = None
+        decode_p99_ms = None
+        decode_tokens_per_sec = None
+        total_time = prefill_ms
+
+    return {
+        "prefill_ms": prefill_ms,
+        "decode_mean_ms": decode_mean_ms,
+        "decode_tokens_per_sec": decode_tokens_per_sec,
+        "decode_times_ms": decode_times_ms,
+        "generated_tokens": generated_tokens,
+        "total_time": total_time,
+    }

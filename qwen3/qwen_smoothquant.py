@@ -336,9 +336,6 @@ class SmoothQuant_GroupedQueryAttention(nn.Module):
             context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
             
             # Smooth quantization for output activation of attention
-            # smooth_value_attn = self.out_proj.smooth_alpha
-            # context = context / smooth_value_attn.unsqueeze(0)
-            # context_int8, scale_context = quantize_row_int8_symmetric_nd(context)
             context_i8, scale_context = gemm_cutlass.func_quantize_row_int8_with_smooth_cuda(context, self.out_proj.smooth_alpha)
             
             out = self.out_proj(context_i8, scale_context)

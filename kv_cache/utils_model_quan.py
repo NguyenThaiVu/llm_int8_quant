@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import gemm_cutlass
 from utils_quant import quantize_row_int8_symmetric_nd
 
-MAX_SEQ_LEN = 576 # 576 or 1040 or 2112
+MAX_SEQ_LEN = 1040 # 576 or 1040 or 2112
 BATCH_SIZE = 1
 
 class Custom_Linear(nn.Module):
@@ -38,6 +38,7 @@ class Custom_Linear(nn.Module):
             return out, 1.0
         else:
             assert x.dtype == torch.int8, "Expect int8 input in quantization"
+            print(f"[DEBUG] Custom_Linear forward: x shape={x.shape}, weight_q shape={self.weight_q.shape}")
             
             if x.dim() == 2:
                 seq_len = x.shape[0]
@@ -57,8 +58,13 @@ class Custom_Linear(nn.Module):
                 return out, 1.0
             
             # Return int8 output 
-            out_q = gemm_cutlass.func_w8a8o8_matmul(x, self.weight_q,\
-                row_scale, col_scale)
+            # Check GEMM or GEMV
+            if seq_len == 1:
+                out_q = gemm_cutlass.func_int8_gemv_out_int8(\
+                    x, self.weight_q, scale_x, self.scale_w, scale_y_value, 1.0)
+            else:
+                out_q = gemm_cutlass.func_w8a8o8_matmul(x, self.weight_q,\
+                    row_scale, col_scale)
             
             return out_q, scale_y_value
         

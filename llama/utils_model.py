@@ -5,8 +5,7 @@ layers (e.g. RMSNorm, MultiHeadAttention, MLP) and the main LLaMA model.
 import os 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import gemm_cutlass 
+import torch.nn.functional as F 
 
 class FeedForward(nn.Module):
     def __init__(self, cfg):
@@ -219,3 +218,34 @@ class Llama3Model(nn.Module):
         x = self.final_norm(x)
         logits = self.out_head(x.to(self.cfg["dtype"]))
         return logits
+    
+    
+def print_tensor_memory_all_attrs(model):
+    seen = set()
+    total = 0
+    by_dtype = {}
+
+    for module_name, module in model.named_modules():
+        for attr_name, value in module.__dict__.items():
+            if torch.is_tensor(value):
+                ptr = value.data_ptr()
+                if ptr in seen:
+                    continue
+                seen.add(ptr)
+
+                bytes_ = value.numel() * value.element_size()
+                total += bytes_
+                by_dtype[str(value.dtype)] = by_dtype.get(str(value.dtype), 0) + bytes_
+
+                print(
+                    f"{module_name}.{attr_name}: "
+                    f"shape={tuple(value.shape)}, "
+                    f"dtype={value.dtype}, "
+                    f"memory={bytes_ / 1024**2:.2f} MB, "
+                    f"device={value.device}"
+                )
+
+    print("\nTotal tensor attributes:", total / 1024**3, "GB")
+    print("By dtype:")
+    for dtype, bytes_ in sorted(by_dtype.items(), key=lambda x: -x[1]):
+        print(dtype, bytes_ / 1024**3, "GB")

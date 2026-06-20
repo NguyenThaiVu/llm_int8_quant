@@ -28,6 +28,7 @@
 #include "gemm_layernorm.cu"
 #include "gemm_activation.cu"
 #include "gemm_matrix_utils.cu"
+#include "gemv.cu"
 
 using namespace torch::indexing;
 
@@ -35,6 +36,29 @@ using namespace torch::indexing;
 // ================================================================
 // PyBind entry point
 // ================================================================
+
+torch::Tensor func_int8_gemv(
+    torch::Tensor input,   // INT8 - shape (1, K)
+    torch::Tensor weight,  // INT8 - shape (N, K)
+    torch::Tensor x_scale, // FP32 - shape (1, 1)
+    torch::Tensor w_scale, // FP32 - shape (N, 1)
+    float alpha            // FP32
+) {
+  const at::cuda::OptionalCUDAGuard device_guard(input.device());
+  return int8_gemv_bf16(input, weight, x_scale, w_scale, alpha);
+}
+
+torch::Tensor func_int8_gemv_out_int8(
+    torch::Tensor input,   // INT8 - shape (1, K) or (B, M, K)
+    torch::Tensor weight,  // INT8 - shape (N, K)
+    torch::Tensor x_scale, // FP32 - shape (1, 1) or (B, M, 1)
+    torch::Tensor w_scale, // FP32 - shape (N, 1)
+    torch::Tensor y_scale, // FP32 - shape (1, 1) or (B, M, 1)
+    float alpha            // FP32
+) {
+  const at::cuda::OptionalCUDAGuard device_guard(input.device());
+  return int8_gemv_out_i8(input, weight, x_scale, w_scale, y_scale, alpha);
+}
 
 torch::Tensor func_int8_matmul(
     torch::Tensor input,   // INT8 - shape (M, K)
@@ -279,6 +303,14 @@ std::tuple<torch::Tensor, torch::Tensor> func_quantize_row_int8_with_smooth_cuda
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("func_int8_gemv",
+        &func_int8_gemv,
+        "Int8 GEMV using CUDA- DP4A (INT8 input/weight, BFloat16 output)");
+
+    m.def("func_int8_gemv_out_int8",
+        &func_int8_gemv_out_int8,
+        "Int8 GEMV with output quantization using CUDA- DP4A (INT8 input/weight, BFloat16 output, INT8 output)");
+
     m.def("func_int8_matmul",
         &func_int8_matmul,
         "Int8 MatMul using CUTLASS (INT8 input/weight, BFloat16 output)");

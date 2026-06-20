@@ -12,6 +12,7 @@ class FeedForward(nn.Module):
         self.fc3 = nn.Linear(cfg["hidden_dim"], cfg["emb_dim"], dtype=cfg["dtype"], bias=False)
 
     def forward(self, x):
+        print(f"\n[DEBUG] FeedForward input shape: {x.shape}, FC1 weight: {self.fc1.weight.shape}")
         x_fc1 = self.fc1(x)
         x_fc2 = self.fc2(x)
         x = nn.functional.silu(x_fc1) * x_fc2

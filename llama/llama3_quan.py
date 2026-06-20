@@ -19,7 +19,7 @@ from utils_model_quan import *
 from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text
 
 
-LLAMA_SIZE_STR = "1B" # "1B" or "3B"
+LLAMA_SIZE_STR = "3B" # "1B" or "3B"
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
 
 MODEL_FOLDER = f"Llama-3.2-{LLAMA_SIZE_STR}-Instruct"
@@ -301,37 +301,6 @@ class Llama3Model(nn.Module):
         for block in self.trf_blocks:
             block.finish_calibration()
             
-
-def tensor_memory_all_attrs(model):
-    seen = set()
-    total = 0
-    by_dtype = {}
-
-    for module_name, module in model.named_modules():
-        for attr_name, value in module.__dict__.items():
-            if torch.is_tensor(value):
-                ptr = value.data_ptr()
-                if ptr in seen:
-                    continue
-                seen.add(ptr)
-
-                bytes_ = value.numel() * value.element_size()
-                total += bytes_
-                by_dtype[str(value.dtype)] = by_dtype.get(str(value.dtype), 0) + bytes_
-
-                print(
-                    f"{module_name}.{attr_name}: "
-                    f"shape={tuple(value.shape)}, "
-                    f"dtype={value.dtype}, "
-                    f"memory={bytes_ / 1024**2:.2f} MB, "
-                    f"device={value.device}"
-                )
-
-    print("\nTotal tensor attributes:", total / 1024**3, "GB")
-    print("By dtype:")
-    for dtype, bytes_ in sorted(by_dtype.items(), key=lambda x: -x[1]):
-        print(dtype, bytes_ / 1024**3, "GB")    
-
             
 if __name__ == "__main__":
 
@@ -395,16 +364,16 @@ if __name__ == "__main__":
 
     list_prompts = ["What is the capital of VietNam?"]
 
-    for prompt in list_prompts:
-        token_ids = generate(
-            model=model,
-            idx=text_to_token_ids(prompt, tokenizer).to(device),
-            max_new_tokens=MAX_GENERATED_TOKENS,
-            context_size=LLAMA32_CONFIG["context_length"],
-            top_k=1)
+    # for prompt in list_prompts:
+    #     token_ids = generate(
+    #         model=model,
+    #         idx=text_to_token_ids(prompt, tokenizer).to(device),
+    #         max_new_tokens=MAX_GENERATED_TOKENS,
+    #         context_size=LLAMA32_CONFIG["context_length"],
+    #         top_k=1)
 
-        output_text = token_ids_to_text(token_ids, tokenizer)
-        print("\nResponse:\n", clean_text(output_text))
+    #     output_text = token_ids_to_text(token_ids, tokenizer)
+    #     print("\nResponse:\n", clean_text(output_text))
         
     # ===============================================
     # 5. Calibration for quantization
@@ -426,6 +395,7 @@ if __name__ == "__main__":
             
     model.finish_calibration()
     print(f"[INFO] Finished calibration.")
+    model.to(device)
     model.eval()
         
     # ===============================================
@@ -451,75 +421,63 @@ if __name__ == "__main__":
     with torch.no_grad():
         out_ids = model(input_ids)
     torch.cuda.synchronize()
-    # print(f"[INFO] Output tokens: {out_ids.shape}")
+    print(f"[INFO] Output tokens: {out_ids.shape}")
 
     def calc_gpu_gb(x):
         return f"{x / 1024 / 1024 / 1024:.2f} GB"
     print(f"GPU memory used: {calc_gpu_gb(torch.cuda.max_memory_allocated())}\n")
     
-    print("allocated:", torch.cuda.memory_allocated() / 1024**3, "GB")
-    print("max allocated:", torch.cuda.max_memory_allocated() / 1024**3, "GB")
-    print("reserved:", torch.cuda.memory_reserved() / 1024**3, "GB")
-    print("max reserved:", torch.cuda.max_memory_reserved() / 1024**3, "GB")
-    print("\n\n\n")
+    # ===============================================
+    # Measure Latency
+    # ===============================================
+    # Warm-up 
+    for _ in range(5):
+        with torch.no_grad():
+            _ = model(input_ids)
+    torch.cuda.synchronize()    
     
-    tensor_memory_all_attrs(model)
+    # Measured iterations
+    n_iter = 10
+    time_start = time.time()
+    for _ in range(n_iter):
+        with torch.no_grad():
+            _ = model(input_ids)
+    torch.cuda.synchronize()
+    end_time = time.time()
+    avg_time = (end_time - time_start) / n_iter
+    print(f"Latency per inference: {avg_time * 1000:.2f} ms")
     
-    
+    # ========================================================================
+    # Quantization text generation
+    # ========================================================================
+    print("\n===== Generated text after quantization: =====\n")
+    list_prompts = ["What is the capital of VietNam?"]
 
-    # # ===============================================
-    # # Measure Latency
-    # # ===============================================
-    # # Warm-up 
-    # for _ in range(5):
-    #     with torch.no_grad():
-    #         _ = model(input_ids)
-    # torch.cuda.synchronize()    
-    
-    # # Measured iterations
-    # n_iter = 10
-    # start_event = torch.cuda.Event(enable_timing=True)
-    # end_event = torch.cuda.Event(enable_timing=True)    
-    # start_event.record()
-    # for _ in range(n_iter):
-    #     with torch.no_grad():
-    #         _ = model(input_ids)
-    # end_event.record()
-    # torch.cuda.synchronize()
-    # avg_latency_ms = start_event.elapsed_time(end_event) / n_iter
-    # print(f"Latency per inference: {avg_latency_ms:.2f} ms")
-    
-    # # ========================================================================
-    # # Quantization text generation
-    # # ========================================================================
-    # print("\n===== Generated text after quantization: =====\n")
-    # list_prompts = ["What is the capital of VietNam?"]
+    for prompt in list_prompts:
+        token_ids = generate(
+            model=model,
+            idx=text_to_token_ids(prompt, tokenizer).to(device),
+            max_new_tokens=MAX_GENERATED_TOKENS,
+            # context_size=LLAMA32_CONFIG["context_length"],
+            context_size=MAX_SEQ_LEN,
+            top_k=1)
 
-    # for prompt in list_prompts:
-    #     token_ids = generate(
-    #         model=model,
-    #         idx=text_to_token_ids(prompt, tokenizer).to(device),
-    #         max_new_tokens=MAX_GENERATED_TOKENS,
-    #         # context_size=LLAMA32_CONFIG["context_length"],
-    #         context_size=MAX_SEQ_LEN,
-    #         top_k=1)
-
-    #     output_text = token_ids_to_text(token_ids, tokenizer)
-    #     print("\nResponse:\n", clean_text(output_text)) 
+        output_text = token_ids_to_text(token_ids, tokenizer)
+        print("\nResponse:\n", clean_text(output_text)) 
     
-    # # ===============================================
-    # # PPL evaluation after quantization
-    # # ===============================================
-    # samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+    # ===============================================
+    # PPL evaluation after quantization
+    # ===============================================
+    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
 
-    # ppl = compute_ppl_single_text(model,
-    #                             tokenizer, 
-    #                             samples,
-    #                             context_size=PPL_CONTEXT_TOKENS,
-    #                             stride=PPL_STRIDE)
-    # print("PPL (after quantization):", ppl)   
+    ppl = compute_ppl_single_text(model,
+                                tokenizer, 
+                                samples,
+                                context_size=PPL_CONTEXT_TOKENS,
+                                stride=PPL_STRIDE)
+    print("PPL (after quantization):", ppl)   
     
-    # print("\nModel information:")
-    # print(f" - Model: LLaMA-3.2-{LLAMA_SIZE_STR}-Instruct")
-    # print(f"Context size: {PPL_CONTEXT_TOKENS}")
-    # print(f"Dataset evaluation: {EVALUATION_DATASET}")
+    print("\nModel information:")
+    print(f" - Model: LLaMA-3.2-{LLAMA_SIZE_STR}-Instruct")
+    print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    print(f"Dataset evaluation: {EVALUATION_DATASET}")

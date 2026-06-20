@@ -3,11 +3,9 @@ This script demonstrates how to convert a Qwen3 model to quantization model
 using LLM.int8() technique. 
 """
 import os 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from pathlib import Path
-from datasets import load_dataset
-import re
 import torch
 torch.manual_seed(123)
 import torch.nn as nn
@@ -31,7 +29,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
 
 if __name__ == "__main__":
     
@@ -121,11 +119,12 @@ if __name__ == "__main__":
     # ================================================================
     MAX_NEW_TOKENS = 2048
     PPL_CONTEXT_TOKENS = 2048
-    EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
+    EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
-    list_prompt = ["What is the capital of VietNam?",\
-                    "What is the Dragon Ball story?"]
+    # list_prompt = ["What is the capital of VietNam?",\
+    #                 "What is the Dragon Ball story?"]
+    list_prompt = ["What is the capital of VietNam?"]
 
     for idx, prompt in enumerate(list_prompt):
         input_token_ids = tokenizer.encode(prompt)
@@ -170,7 +169,14 @@ if __name__ == "__main__":
         return module
     
     model = model.cpu() # Move model to CPU for quantization
+    print(f"[INFO] Converting model to LLM.int8() format...")
     int8_model = convert_linear_to_llm_int8(model, threshold=6.0)
+    print(f"[INFO] Model converted to LLM.int8() format successfully.")
+    
+    # Delete the original model to free up memory
+    del model
+    torch.cuda.empty_cache()
+    
     int8_model = int8_model.to(0) # Quantization happens here
     print(f"\n[INFO] Model converted to LLM.int8() format successfully.\n")
     print(f"Sample Weight after quantization: {int8_model.trf_blocks[0].att.W_query.weight.data[:5, :5]}")

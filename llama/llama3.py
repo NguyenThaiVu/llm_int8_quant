@@ -14,9 +14,10 @@ from tokenizer import Tokenizer
 from utils_weight import load_weights_into_llama    
 from utils_generation import *
 from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text
+from utils_model import print_tensor_memory_all_attrs
 
 
-LLAMA_SIZE_STR = "1B" # "1B" or "3B"
+LLAMA_SIZE_STR = "3B" # "1B" or "3B"
 IS_INSTRUCT = True # True or False
 
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
@@ -103,37 +104,37 @@ print(f"[INFO] Weights loaded successfully.\n")
 MAX_GENERATED_TOKENS = 2048
 PPL_CONTEXT_TOKENS = 2048
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
+EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
 list_prompts = ["What is Dragon Ball story?"]
 
-for prompt in list_prompts:
-    token_ids = generate(
-        model=model,
-        idx=text_to_token_ids(prompt, tokenizer).to(device),
-        max_new_tokens=MAX_GENERATED_TOKENS,
-        context_size=LLAMA32_CONFIG["context_length"],
-        top_k=1,
-    )
+# for prompt in list_prompts:
+#     token_ids = generate(
+#         model=model,
+#         idx=text_to_token_ids(prompt, tokenizer).to(device),
+#         max_new_tokens=MAX_GENERATED_TOKENS,
+#         context_size=LLAMA32_CONFIG["context_length"],
+#         top_k=1,
+#     )
 
-    output_text = token_ids_to_text(token_ids, tokenizer)
-    print("\nResponse:\n", clean_text(output_text))
+#     output_text = token_ids_to_text(token_ids, tokenizer)
+#     print("\nResponse:\n", clean_text(output_text))
     
-# ================================================
-# 5. Evaluation
-# ===============================================
+# # ================================================
+# # 5. Evaluation
+# # ===============================================
 
-samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+# samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
 
-ppl = compute_ppl_single_text(model,
-                            tokenizer, 
-                            samples,
-                            context_size=PPL_CONTEXT_TOKENS,
-                            stride=PPL_STRIDE)
-print(f"\nPPL: {ppl} \n")
-print("Model information:")
-print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
-print(f"Context size: {PPL_CONTEXT_TOKENS}")
+# ppl = compute_ppl_single_text(model,
+#                             tokenizer, 
+#                             samples,
+#                             context_size=PPL_CONTEXT_TOKENS,
+#                             stride=PPL_STRIDE)
+# print(f"\nPPL: {ppl} \n")
+# print("Model information:")
+# print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
+# print(f"Context size: {PPL_CONTEXT_TOKENS}")
 
 # ===============================================
 # Measure Memory usage
@@ -159,6 +160,14 @@ print(f"[INFO] Output tokens: {out_ids.shape}")
 def calc_gpu_gb(x):
     return f"{x / 1024 / 1024 / 1024:.2f} GB"
 print(f"GPU memory used: {calc_gpu_gb(torch.cuda.max_memory_allocated())}\n")
+
+total_model_size = sum(p.numel() * p.element_size() for p in model.parameters())
+print(f"Total model size: {calc_gpu_gb(total_model_size)}\n")
+
+embed_size = model.tok_emb.weight.numel() * model.tok_emb.weight.element_size()
+logit_layer_size = model.out_head.weight.numel() * model.out_head.weight.element_size()
+print(f"Embedding layer size: {calc_gpu_gb(embed_size)}")
+print(f"Logit layer size: {calc_gpu_gb(logit_layer_size)}\n")
 
 # ===============================================
 # Measure Latency

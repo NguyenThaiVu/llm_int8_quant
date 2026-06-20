@@ -19,10 +19,10 @@ from utils_model import compute_rope_params, RMSNorm
 from utils_model_quan import TransformerBlock
 from utils_quant import *
 from utils_evaluation import load_wikitext_single_text
-from utils_generation import generate_text_autoregressive
+from utils_generation import generate_text_autoregressive, benchmark_llm_decode
 
 
-CHOOSE_MODEL = "8B" # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "14B" # Options: "4B", "8B", "14B"
 
 # Select which model to use via the following flag; only one can be True
 USE_BASE_MODEL = True
@@ -210,8 +210,10 @@ tokenizer = Qwen3Tokenizer(
 # ========================================================
 # 4. Text generation with KV cache
 # ========================================================
-INPUT_PROMPT_LENGTH = 1
-MAX_NEW_TOKENS = 2
+INPUT_PROMPT_LENGTH = 1024
+MAX_NEW_TOKENS = 256
+print("[INFO] INPUT PROMPT LENGTH:", INPUT_PROMPT_LENGTH)
+print("[INFO] MAX NEW TOKENS:", MAX_NEW_TOKENS)
 
 prompt = "What is the Dragon Ball story?"
 if INPUT_PROMPT_LENGTH is None:
@@ -221,6 +223,13 @@ else:
     prompt = prompt * 300
     input_token_ids = tokenizer.encode(prompt)[-INPUT_PROMPT_LENGTH:]
     input_token_tensor = torch.tensor(input_token_ids, device=device).unsqueeze(0)
+
+# Duplicate the input tokens to create a batch (if needed)
+from utils_model_quan import BATCH_SIZE
+if BATCH_SIZE > 1:
+    input_token_tensor = input_token_tensor.expand(BATCH_SIZE, -1)
+    print(f"[INFO] Expanded input_token_tensor to batch size {BATCH_SIZE}. New shape: {input_token_tensor.shape} \n")
+
 print(f"[INFO] Shape of input_token_tensor: {input_token_tensor.shape} \n")
 
 
@@ -231,31 +240,20 @@ END_OFF_TOKEN_ID = None # Option: tokenizer.eos_token_id or None
 torch.cuda.reset_peak_memory_stats()
 torch.cuda.synchronize()
 time.sleep(1)  
-start_time = time.perf_counter()
 generated_tokens = 0
-with torch.inference_mode():
-    for token in generate_text_autoregressive(
-        model=model,
-        token_ids=input_token_tensor,
-        max_new_tokens=MAX_NEW_TOKENS,
-        eos_token_id=END_OFF_TOKEN_ID
-    ):
-        generated_tokens += 1
-        token_id = token.squeeze(0).tolist()
-        print(tokenizer.decode(token_id), end="", flush=True)
-elapsed = time.perf_counter() - start_time
-torch.cuda.synchronize()  
-print(f"Elapsed time: {elapsed:.2f} seconds")
 
-tokens_per_sec = generated_tokens / elapsed if elapsed > 0 else 0.0
-print(f"\n\nGeneration speed: {tokens_per_sec:.2f} tokens/sec")
+result = benchmark_llm_decode(
+    model=model,
+    token_ids=input_token_tensor,
+    max_new_tokens=MAX_NEW_TOKENS,
+    eos_token_id=END_OFF_TOKEN_ID,          # disable EOS 
+    warmup_decode_tokens=5,
+)
 
-def calc_gpu_gb(x):
-    return f"{x / 1024 / 1024 / 1024:.2f} GB"
-print(f"GPU memory used: {calc_gpu_gb(torch.cuda.max_memory_allocated())}")
-print(f"Input length (tokens): {input_token_tensor.shape[1]}")
-print(f"Number of generated tokens: {generated_tokens}\n")
-    
+print(f"Prefill / TTFT: {result['prefill_ms']:.4f} ms")
+print(f"Decode mean: {result['decode_mean_ms']:.4f} ms/token")
+print(f"Decode throughput: {result['decode_tokens_per_sec']:.2f} tokens/sec")
+print(f"Total time: {result['total_time']:.4f} ms\n")
     
 # ========================================================
 # 4. Calibration for quantization
@@ -291,25 +289,16 @@ model.to(device)
 torch.cuda.reset_peak_memory_stats()
 torch.cuda.synchronize()
 time.sleep(1)
-start_time = time.perf_counter()
-generated_tokens = 0
 
-with torch.inference_mode():
-    for token in generate_text_autoregressive(
-        model=model,
-        token_ids=input_token_tensor,
-        max_new_tokens=MAX_NEW_TOKENS,
-        eos_token_id=END_OFF_TOKEN_ID
-    ):
-        generated_tokens += 1
-        token_id = token.squeeze(0).tolist()
-        print(tokenizer.decode(token_id), end="", flush=True)
-elapsed = time.perf_counter() - start_time
-print(f"Elapsed time: {elapsed:.2f} seconds")
+result = benchmark_llm_decode(
+    model=model,
+    token_ids=input_token_tensor,
+    max_new_tokens=MAX_NEW_TOKENS,
+    eos_token_id=END_OFF_TOKEN_ID,          # disable EOS 
+    warmup_decode_tokens=5,
+)
 
-tokens_per_sec = generated_tokens / elapsed if elapsed > 0 else 0.0
-print(f"\n\nGeneration speed: {tokens_per_sec:.2f} tokens/sec")
-print(f"GPU memory used: {calc_gpu_gb(torch.cuda.max_memory_allocated())}")
-
-print(f"Input length (tokens): {input_token_tensor.shape[1]}")
-print(f"Number of generated tokens: {generated_tokens}\n")
+print(f"Prefill / TTFT: {result['prefill_ms']:.4f} ms")
+print(f"Decode mean: {result['decode_mean_ms']:.4f} ms/token")
+print(f"Decode throughput: {result['decode_tokens_per_sec']:.2f} tokens/sec")
+print(f"Total time: {result['total_time']:.4f} ms\n")

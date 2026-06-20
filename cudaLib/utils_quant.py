@@ -23,21 +23,16 @@ def quantize_tensor(x, dtype=torch.int8, scale_dtype=torch.float32):
     return x_q, scale.to(scale_dtype)
 
 
+@torch.inference_mode()
 def quantize_row_int8_symmetric_nd(
     mat: torch.Tensor,
     scale_dtype=torch.float32
 ):
     """
     Symmetric int8 quantization per row along the last dimension.
-
-    If percentile is None, uses strict max(|x|) per row.
-    If percentile is a float in (0,1], uses that percentile of |x| per row
-    (e.g. 0.999 for 99.9%) for clipping.
     """
 
     assert mat.dim() >= 2, "mat must be at least 2D"
-
-    # mat = mat.to(scale_dtype)
     
     qmin, qmax = -128, 127
 
@@ -54,9 +49,10 @@ def quantize_row_int8_symmetric_nd(
     scales = (max_vals / qmax).squeeze(1)
 
     # Quantize
-    q_mat_2d = torch.clamp(
-        torch.round(mat_2d / scales.unsqueeze(1)),
-        qmin, qmax).to(torch.int8)
+    q_mat_2d = mat_2d / scales.unsqueeze(1)
+    q_mat_2d.round_()
+    q_mat_2d.clamp_(qmin, qmax)
+    q_mat_2d = q_mat_2d.to(torch.int8)
 
     # Reshape back
     q_mat = q_mat_2d.reshape(orig_shape)

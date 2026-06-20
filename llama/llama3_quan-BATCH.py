@@ -363,28 +363,28 @@ if __name__ == "__main__":
     EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
     prompt = "What is Dragon Ball story?"
-    list_prompts = []
-    for _ in range(BATCH_SIZE):
-        list_prompts.append(prompt)
+    # list_prompts = []
+    # for _ in range(BATCH_SIZE):
+    #     list_prompts.append(prompt)
     
-    batch_input_ids = torch.stack([
-        text_to_token_ids(prompt, tokenizer, batch_dim=True).squeeze(0)
-        for prompt in list_prompts
-    ], dim=0).to(device)
+    # batch_input_ids = torch.stack([
+    #     text_to_token_ids(prompt, tokenizer, batch_dim=True).squeeze(0)
+    #     for prompt in list_prompts
+    # ], dim=0).to(device)
 
-    token_ids_batch = generate_batch(
-        model=model,
-        idx=batch_input_ids,
-        max_new_tokens=MAX_GENERATED_TOKENS,
-        context_size=PPL_CONTEXT_TOKENS,
-        temperature=0.0,
-        top_k=1,
-        eos_id=None
-    )
+    # token_ids_batch = generate_batch(
+    #     model=model,
+    #     idx=batch_input_ids,
+    #     max_new_tokens=MAX_GENERATED_TOKENS,
+    #     context_size=PPL_CONTEXT_TOKENS,
+    #     temperature=0.0,
+    #     top_k=1,
+    #     eos_id=None
+    # )
 
-    for i in range(token_ids_batch.shape[0]):
-        output_text = token_ids_to_text(token_ids_batch[i].unsqueeze(0), tokenizer, batch_dim=True)
-        print(f"\nResponse {i}:\n", clean_text(output_text))
+    # for i in range(token_ids_batch.shape[0]):
+    #     output_text = token_ids_to_text(token_ids_batch[i].unsqueeze(0), tokenizer, batch_dim=True)
+    #     print(f"\nResponse {i}:\n", clean_text(output_text))
     
         
     # ===============================================
@@ -411,23 +411,6 @@ if __name__ == "__main__":
         device=device
     )  # [B, T]
     print(f"Shape of input_ids: {input_ids.shape}")
-
-    
-    # for i in range(0, len(calibration_chunks), CALIBRATION_BATCH_SIZE):
-    #     batch_chunks = calibration_chunks[i:i + CALIBRATION_BATCH_SIZE]
-
-    #     if len(batch_chunks) < CALIBRATION_BATCH_SIZE:
-    #         break
-
-    #     input_ids = torch.tensor(
-    #         batch_chunks,
-    #         dtype=torch.long,
-    #         device=device
-    #     )  # [B, T]
-
-    #     with torch.no_grad():
-    #         _ = model(input_ids)
-            
     
     # Measure Latency before quantization
     for _ in range(5):
@@ -451,7 +434,6 @@ if __name__ == "__main__":
     model.finish_calibration()
     print(f"[INFO] Finished calibration.")
     model.eval()
-
 
     # ===============================================
     # Measure Latency after quantization
