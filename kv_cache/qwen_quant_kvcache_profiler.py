@@ -210,7 +210,7 @@ tokenizer = Qwen3Tokenizer(
 # ========================================================
 # 4. Text generation with KV cache
 # ========================================================
-INPUT_PROMPT_LENGTH = 4096
+INPUT_PROMPT_LENGTH = 2048
 MAX_NEW_TOKENS = 16
 print("[INFO] INPUT PROMPT LENGTH:", INPUT_PROMPT_LENGTH)
 print("[INFO] MAX NEW TOKENS:", MAX_NEW_TOKENS)
