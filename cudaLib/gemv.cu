@@ -8,49 +8,19 @@
 
 #include <cstdint>
 
+#include "gemm_utils.cu"
+
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_INT8(x) TORCH_CHECK(x.scalar_type() == torch::kChar, #x " must be torch.int8")
+#define CHECK_BF16(x) TORCH_CHECK(x.scalar_type() == torch::kBFloat16, #x " must be torch.bfloat16")
+#define CHECK_FP32(x) TORCH_CHECK(x.scalar_type() == torch::kFloat32, #x " must be torch.float32")
 
-// ============================================================
-// Warp reduction
-// ============================================================
-__inline__ __device__ int32_t warp_reduce_sum_int32(int32_t val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
-    }
-    return val;
-}
+const int WARP_SIZE = 32;
+const int THREADS = 256;
+const int WARPS_PER_BLOCK = THREADS / WARP_SIZE;
 
-// ============================================================
-// Block reduction
-// For blockDim.x <= 1024
-// ============================================================
-__inline__ __device__ int32_t block_reduce_sum_int32(int32_t val) {
-    static __shared__ int32_t shared[32];
 
-    int lane = threadIdx.x & 31;
-    int warp_id = threadIdx.x >> 5;
-
-    val = warp_reduce_sum_int32(val);
-
-    if (lane == 0) {
-        shared[warp_id] = val;
-    }
-
-    __syncthreads();
-
-    int num_warps = (blockDim.x + 31) >> 5;
-
-    val = 0;
-    if (warp_id == 0) {
-        val = (lane < num_warps) ? shared[lane] : 0;
-        val = warp_reduce_sum_int32(val);
-    }
-
-    return val;
-}
 
 // ============================================================
 // Helper: allocate output
@@ -67,17 +37,17 @@ torch::Tensor make_output(torch::Tensor x, int64_t N) {
     }
 }
 
-// ============================================================
-// Helper: common checks
-// ============================================================
+
+/*
+This function check the inputs for the GEMV operation.
+*/
 void check_gemv_inputs(torch::Tensor x, torch::Tensor weight) {
     CHECK_CUDA(x);
     CHECK_CUDA(weight);
     CHECK_INT8(x);
     CHECK_INT8(weight);
 
-    TORCH_CHECK(x.dim() == 1 || x.dim() == 2, "x must have shape [K] or [1, K]");
-
+    TORCH_CHECK(x.dim() == 1 || x.dim() == 2, "x must have shape [K] or [1, K]"); 
     TORCH_CHECK(weight.dim() == 2, "weight must have shape [N, K]");
 
     int64_t K;
@@ -92,9 +62,6 @@ void check_gemv_inputs(torch::Tensor x, torch::Tensor weight) {
     TORCH_CHECK(weight.size(1) == K,
                 "weight must have shape [N, K], where K matches x");
 
-    TORCH_CHECK(K > 0, "K must be > 0");
-    TORCH_CHECK(weight.size(0) > 0, "N must be > 0");
-
     TORCH_CHECK(K % 4 == 0,
                 "K must be divisible by 4 for dp4a");
 
@@ -107,56 +74,17 @@ void check_gemv_inputs(torch::Tensor x, torch::Tensor weight) {
 
 
 // ============================================================
-// Warp max reduction
-// ============================================================
-__inline__ __device__ float warp_reduce_max_float(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        float other = __shfl_down_sync(0xffffffff, val, offset);
-        val = fmaxf(val, other);
-    }
-    return val;
-}
-
-// ============================================================
-// Block max reduction
-// ============================================================
-__inline__ __device__ float block_reduce_max_float(float val) {
-    static __shared__ float shared[32];
-
-    int lane = threadIdx.x & 31;
-    int warp_id = threadIdx.x >> 5;
-
-    val = warp_reduce_max_float(val);
-
-    if (lane == 0) {
-        shared[warp_id] = val;
-    }
-
-    __syncthreads();
-
-    int num_warps = (blockDim.x + 31) >> 5;
-
-    val = 0.0f;
-    if (warp_id == 0) {
-        val = (lane < num_warps) ? shared[lane] : 0.0f;
-        val = warp_reduce_max_float(val);
-    }
-
-    return val;
-}
-
-
-// ============================================================
-// Batched GEMV with BF16 output
-//
+// GEMV with BF16 output
 // One WARP computes one output element y[row, n].
 //
 // x       : int8  [R, K] logically
-// weight  : int8  [N, K] or [B, N, K], row-major
+// weight  : int8  [N, K] or [B, N, K],
 // x_scale : float [1] or [R]
 // w_scale : float [N] or [B, N]
 // y_bf16  : bf16  [R, N]
+//
+// Input x has shape [R, K] logically, meaning that if real input has
+// 3D input shape [B, M, K], then R = B * M.
 //
 // Math:
 //   acc[row, n] = sum_k int8(x[row, k]) * int8(weight[b, n, k])
@@ -169,7 +97,7 @@ __inline__ __device__ float block_reduce_max_float(float val) {
 //   y_bf16[row, n] = bf16(y_float)
 // ============================================================
 template<int WARPS_PER_BLOCK>
-__global__ void int8_gemv_out_bf16_batched_warp_kernel(
+__global__ void int8_gemv_out_bf16_warp_kernel(
     const int8_t* __restrict__ x,
     const int8_t* __restrict__ weight,
     const float* __restrict__ x_scale,
@@ -185,81 +113,67 @@ __global__ void int8_gemv_out_bf16_batched_warp_kernel(
     bool weight_is_batched,
     float alpha
 ) {
-    constexpr int WARP_SIZE = 32;
-
     int tid = threadIdx.x;
     int warp_id = tid / WARP_SIZE;
-    int lane = tid % WARP_SIZE;
+    int lane = tid % WARP_SIZE;  // thread index within the warp
 
     // Each warp computes one output channel n.
     int n = blockIdx.x * WARPS_PER_BLOCK + warp_id;
 
     // Flattened [B, M] row.
     int row = blockIdx.y;
-
     if (row >= R || n >= N) {
         return;
     }
+    const int8_t* x_row = x + static_cast<int64_t>(row) * K;
 
     int b = row / M;
 
     int K4 = K >> 2;
 
-    const int8_t* x_row =
-        x + static_cast<int64_t>(row) * K;
-
     const int8_t* w_row;
-
-    if (weight_is_batched) {
-        // weight shape: [B, N, K]
+    if (weight_is_batched) { // weight shape: [B, N, K]
         w_row = weight + (static_cast<int64_t>(b) * N + n) * K;
-    } else {
-        // weight shape: [N, K]
+    } else {  // weight shape: [N, K]
         w_row = weight + static_cast<int64_t>(n) * K;
     }
 
-    const int32_t* __restrict__ x4 =
-        reinterpret_cast<const int32_t*>(x_row);
-
-    const int32_t* __restrict__ w4 =
-        reinterpret_cast<const int32_t*>(w_row);
+    // Compute the dot product using dp4a
+    const int32_t* __restrict__ x4 = reinterpret_cast<const int32_t*>(x_row);
+    const int32_t* __restrict__ w4 = reinterpret_cast<const int32_t*>(w_row);
 
     int32_t acc = 0;
-
     for (int i = lane; i < K4; i += WARP_SIZE) {
         int32_t x_pack = x4[i];
         int32_t w_pack = w4[i];
-
         acc = __dp4a(x_pack, w_pack, acc);
     }
 
     acc = warp_reduce_sum_int32(acc);
 
+    /*
+    Because each warp computes one output element,
+    we only need one thread (first thread of warp or lane = 0) to write output.
+    */
     if (lane == 0) {
-        float sx = (x_scale_numel == 1)
-                     ? x_scale[0]
-                     : x_scale[row];
+        float sx = (x_scale_numel == 1) ? x_scale[0] : x_scale[row];
 
         float sw;
-
-        if (w_scale_numel == N) {
-            // shared scale: [N]
+        if (w_scale_numel == N) {  // shared scale: [N]
             sw = w_scale[n];
-        } else {
-            // batched scale: [B, N]
+        } else {  // batched scale: [B, N]
             sw = w_scale[static_cast<int64_t>(b) * N + n];
         }
 
+        // Compute and write output as BF16
         float y = static_cast<float>(acc) * sx * sw * alpha;
-
-        y_bf16[static_cast<int64_t>(row) * N + n] =
-            __float2bfloat16(y);
+        y_bf16[static_cast<int64_t>(row) * N + n] = __float2bfloat16(y);
     }
 }
 
 torch::Tensor int8_gemv_out_bf16_warp(
-    torch::Tensor x,
-    torch::Tensor weight,
+    torch::Tensor x, // shape [K] or [B, K] or [B, M, K]
+    torch::Tensor weight, // shape [N, K] or [B, N, K]
     torch::Tensor x_scale,
     torch::Tensor w_scale,
     double alpha
@@ -268,15 +182,10 @@ torch::Tensor int8_gemv_out_bf16_warp(
     CHECK_CUDA(weight);
     CHECK_CUDA(x_scale);
     CHECK_CUDA(w_scale);
-
     CHECK_INT8(x);
     CHECK_INT8(weight);
-
-    TORCH_CHECK(x_scale.scalar_type() == torch::kFloat32,
-                "x_scale must be float32");
-
-    TORCH_CHECK(w_scale.scalar_type() == torch::kFloat32,
-                "w_scale must be float32");
+    CHECK_FP32(x_scale);
+    CHECK_FP32(w_scale);
 
     TORCH_CHECK(x.dim() == 1 || x.dim() == 2 || x.dim() == 3,
                 "x must have shape [K], [B, K], or [B, M, K]");
@@ -291,8 +200,6 @@ torch::Tensor int8_gemv_out_bf16_warp(
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
 
-    bool weight_is_batched = weight.dim() == 3;
-
     int64_t B = 1;
     int64_t M = 1;
     int64_t R = 1;
@@ -303,6 +210,7 @@ torch::Tensor int8_gemv_out_bf16_warp(
     bool x_is_2d = x.dim() == 2;
     bool x_is_3d = x.dim() == 3;
 
+    bool weight_is_batched = weight.dim() == 3;
     if (weight_is_batched) {
         B = weight.size(0);
         N = weight.size(1);
@@ -316,19 +224,15 @@ torch::Tensor int8_gemv_out_bf16_warp(
         TORCH_CHECK(!weight_is_batched,
                     "x shape [K] cannot be used with batched weight [B, N, K]");
 
-        TORCH_CHECK(x.size(0) == K,
-                    "x shape [K] must match weight K");
-
+        TORCH_CHECK(x.size(0) == K, "x shape [K] must match weight K");
         B = 1;
         M = 1;
         R = 1;
     } else if (x_is_2d) {
-        TORCH_CHECK(x.size(1) == K,
-                    "x shape [B, K] must match weight K");
+        TORCH_CHECK(x.size(1) == K, "x shape [B, K] must match weight K");
 
         if (weight_is_batched) {
-            TORCH_CHECK(x.size(0) == B,
-                        "x batch size must match weight batch size");
+            TORCH_CHECK(x.size(0) == B, "x batch size must match weight batch size");
         } else {
             B = x.size(0);
         }
@@ -336,12 +240,10 @@ torch::Tensor int8_gemv_out_bf16_warp(
         M = 1;
         R = B;
     } else {
-        TORCH_CHECK(x.size(2) == K,
-                    "x shape [B, M, K] must match weight K");
+        TORCH_CHECK(x.size(2) == K, "x shape [B, M, K] must match weight K");
 
         if (weight_is_batched) {
-            TORCH_CHECK(x.size(0) == B,
-                        "x batch size must match weight batch size");
+            TORCH_CHECK(x.size(0) == B, "x batch size must match weight batch size");
         } else {
             B = x.size(0);
         }
@@ -350,8 +252,7 @@ torch::Tensor int8_gemv_out_bf16_warp(
         R = B * M;
     }
 
-    TORCH_CHECK(K % 4 == 0,
-                "K must be divisible by 4 for dp4a");
+    TORCH_CHECK(K % 4 == 0, "K must be divisible by 4 for dp4a");
 
     TORCH_CHECK(x_scale.numel() == 1 || x_scale.numel() == R,
                 "x_scale must contain either 1 element or R elements");
@@ -406,12 +307,7 @@ torch::Tensor int8_gemv_out_bf16_warp(
             y_bf16_flat.data_ptr<at::BFloat16>()
         );
 
-    constexpr int WARPS_PER_BLOCK = 8;
-    constexpr int WARP_SIZE = 32;
-
-    int threads = WARPS_PER_BLOCK * WARP_SIZE;
-
-    dim3 block(static_cast<unsigned int>(threads));
+    dim3 block(static_cast<unsigned int>(THREADS));
 
     dim3 grid(
         static_cast<unsigned int>((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK),
@@ -420,7 +316,7 @@ torch::Tensor int8_gemv_out_bf16_warp(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    int8_gemv_out_bf16_batched_warp_kernel<WARPS_PER_BLOCK>
+    int8_gemv_out_bf16_warp_kernel<WARPS_PER_BLOCK>
         <<<grid, block, 0, stream>>>(
             x_ptr,
             w_ptr,
@@ -764,7 +660,6 @@ torch::Tensor int8_gemv_out_bf16_4d_warp(
         );
 
     constexpr int WARPS_PER_BLOCK = 8;
-    constexpr int WARP_SIZE = 32;
 
     int threads = WARPS_PER_BLOCK * WARP_SIZE;
 
@@ -1685,4 +1580,237 @@ torch::Tensor int8_gemv_out_i8_4d_warp(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return y_i8_flat.view({G, B, M, N});
+}
+
+
+// ============================================================
+// GEMV with BF16 input, BF16 weight, BF16 output
+// One WARP computes one output element y[row, n].
+//
+// x       : bf16 [R, K] logically
+// weight  : bf16 [N, K] or [B, N, K]
+// y_bf16  : bf16 [R, N]
+//
+// Input x has shape [R, K] logically, meaning:
+//   if real input is [B, M, K], then R = B * M.
+//
+// Math:
+//   acc[row, n] = sum_k float(x[row, k]) * float(weight[b, n, k])
+//
+//   y_float = acc[row, n] * alpha
+//
+//   y_bf16[row, n] = bf16(y_float)
+// ============================================================
+template<int WARPS_PER_BLOCK>
+__global__ void bf16_gemv_out_bf16_warp_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ y_bf16,
+    int R,
+    int B,
+    int M,
+    int N,
+    int K,
+    bool weight_is_batched,
+    float alpha
+) {
+    int tid = threadIdx.x;
+    int warp_id = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+
+    // Each warp computes one output channel n.
+    int n = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+
+    // Flattened row from [B, M].
+    int row = blockIdx.y;
+
+    if (row >= R || n >= N) {
+        return;
+    }
+
+    // x[row, :]
+    const __nv_bfloat16* x_row =
+        x + static_cast<int64_t>(row) * K;
+
+    // Recover original batch index from flattened row.
+    int b = row / M;
+
+    // weight[n, :] or weight[b, n, :]
+    const __nv_bfloat16* w_row;
+
+    if (weight_is_batched) {
+        // weight shape: [B, N, K]
+        w_row = weight + (static_cast<int64_t>(b) * N + n) * K;
+    } else {
+        // weight shape: [N, K]
+        w_row = weight + static_cast<int64_t>(n) * K;
+    }
+
+    // Each lane computes a partial dot product.
+    float acc = 0.0f;
+
+    for (int k = lane; k < K; k += WARP_SIZE) {
+        float xv = __bfloat162float(x_row[k]);
+        float wv = __bfloat162float(w_row[k]);
+
+        acc += xv * wv;
+    }
+
+    // Reduce partial sums inside the warp.
+    acc = warp_reduce_sum(acc);
+
+    // Only lane 0 writes the final output.
+    if (lane == 0) {
+        float y = acc * alpha;
+
+        y_bf16[static_cast<int64_t>(row) * N + n] =
+            __float2bfloat16(y);
+    }
+}
+
+torch::Tensor bf16_gemv_out_bf16_warp(
+    torch::Tensor x,       // shape [K] or [B, K] or [B, M, K]
+    torch::Tensor weight,  // shape [N, K] or [B, N, K]
+    double alpha
+) {
+    CHECK_CUDA(x);
+    CHECK_CUDA(weight);
+
+    CHECK_BF16(x);
+    CHECK_BF16(weight);
+
+    TORCH_CHECK(x.dim() == 1 || x.dim() == 2 || x.dim() == 3,
+                "x must have shape [K], [B, K], or [B, M, K]");
+
+    TORCH_CHECK(weight.dim() == 2 || weight.dim() == 3,
+                "weight must have shape [N, K] or [B, N, K]");
+
+    x = x.contiguous();
+    weight = weight.contiguous();
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+
+    int64_t B = 1;
+    int64_t M = 1;
+    int64_t R = 1;
+    int64_t N = 0;
+    int64_t K = 0;
+
+    bool x_is_1d = x.dim() == 1;
+    bool x_is_2d = x.dim() == 2;
+    bool x_is_3d = x.dim() == 3;
+
+    bool weight_is_batched = weight.dim() == 3;
+
+    if (weight_is_batched) {
+        B = weight.size(0);
+        N = weight.size(1);
+        K = weight.size(2);
+    } else {
+        N = weight.size(0);
+        K = weight.size(1);
+    }
+
+    if (x_is_1d) {
+        TORCH_CHECK(!weight_is_batched,
+                    "x shape [K] cannot be used with batched weight [B, N, K]");
+
+        TORCH_CHECK(x.size(0) == K,
+                    "x shape [K] must match weight K");
+
+        B = 1;
+        M = 1;
+        R = 1;
+    } else if (x_is_2d) {
+        TORCH_CHECK(x.size(1) == K,
+                    "x shape [B, K] must match weight K");
+
+        if (weight_is_batched) {
+            TORCH_CHECK(x.size(0) == B,
+                        "x batch size must match weight batch size");
+        } else {
+            B = x.size(0);
+        }
+
+        M = 1;
+        R = B;
+    } else {
+        TORCH_CHECK(x.size(2) == K,
+                    "x shape [B, M, K] must match weight K");
+
+        if (weight_is_batched) {
+            TORCH_CHECK(x.size(0) == B,
+                        "x batch size must match weight batch size");
+        } else {
+            B = x.size(0);
+        }
+
+        M = x.size(1);
+        R = B * M;
+    }
+
+    TORCH_CHECK(R <= std::numeric_limits<int>::max(),
+                "R is too large for this kernel");
+    TORCH_CHECK(B <= std::numeric_limits<int>::max(),
+                "B is too large for this kernel");
+    TORCH_CHECK(M <= std::numeric_limits<int>::max(),
+                "M is too large for this kernel");
+    TORCH_CHECK(N <= std::numeric_limits<int>::max(),
+                "N is too large for this kernel");
+    TORCH_CHECK(K <= std::numeric_limits<int>::max(),
+                "K is too large for this kernel");
+
+    auto options_bf16 = torch::TensorOptions()
+                            .dtype(torch::kBFloat16)
+                            .device(x.device());
+
+    torch::Tensor y_bf16_flat = torch::empty({R, N}, options_bf16);
+
+    const __nv_bfloat16* x_ptr =
+        reinterpret_cast<const __nv_bfloat16*>(
+            x.data_ptr<at::BFloat16>()
+        );
+
+    const __nv_bfloat16* w_ptr =
+        reinterpret_cast<const __nv_bfloat16*>(
+            weight.data_ptr<at::BFloat16>()
+        );
+
+    __nv_bfloat16* y_ptr =
+        reinterpret_cast<__nv_bfloat16*>(
+            y_bf16_flat.data_ptr<at::BFloat16>()
+        );
+
+    dim3 block(THREADS);
+
+    dim3 grid(
+        static_cast<unsigned int>((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK),
+        static_cast<unsigned int>(R)
+    );
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    bf16_gemv_out_bf16_warp_kernel<WARPS_PER_BLOCK>
+        <<<grid, block, 0, stream>>>(
+            x_ptr,
+            w_ptr,
+            y_ptr,
+            static_cast<int>(R),
+            static_cast<int>(B),
+            static_cast<int>(M),
+            static_cast<int>(N),
+            static_cast<int>(K),
+            weight_is_batched,
+            static_cast<float>(alpha)
+        );
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    if (x_is_1d) {
+        return y_bf16_flat.view({N});
+    } else if (x_is_2d) {
+        return y_bf16_flat.view({B, N});
+    } else {
+        return y_bf16_flat.view({B, M, N});
+    }
 }

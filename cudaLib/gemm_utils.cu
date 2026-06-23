@@ -107,3 +107,71 @@ inline __device__ float block_reduce_sum(float val) {
 
     return block_sum;
 }
+
+__inline__ __device__ int32_t warp_reduce_sum_int32(int32_t val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+__inline__ __device__ int32_t block_reduce_sum_int32(int32_t val) {
+    static __shared__ int32_t shared[32];
+
+    int lane = threadIdx.x & 31;
+    int warp_id = threadIdx.x >> 5;
+
+    val = warp_reduce_sum_int32(val);
+
+    if (lane == 0) {
+        shared[warp_id] = val;
+    }
+
+    __syncthreads();
+
+    int num_warps = (blockDim.x + 31) >> 5;
+
+    val = 0;
+    if (warp_id == 0) {
+        val = (lane < num_warps) ? shared[lane] : 0;
+        val = warp_reduce_sum_int32(val);
+    }
+
+    return val;
+}
+
+
+__inline__ __device__ float warp_reduce_max_float(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other = __shfl_down_sync(0xffffffff, val, offset);
+        val = fmaxf(val, other);
+    }
+    return val;
+}
+
+__inline__ __device__ float block_reduce_max_float(float val) {
+    static __shared__ float shared[32];
+
+    int lane = threadIdx.x & 31;
+    int warp_id = threadIdx.x >> 5;
+
+    val = warp_reduce_max_float(val);
+
+    if (lane == 0) {
+        shared[warp_id] = val;
+    }
+
+    __syncthreads();
+
+    int num_warps = (blockDim.x + 31) >> 5;
+
+    val = 0.0f;
+    if (warp_id == 0) {
+        val = (lane < num_warps) ? shared[lane] : 0.0f;
+        val = warp_reduce_max_float(val);
+    }
+
+    return val;
+}

@@ -37,6 +37,15 @@ using namespace torch::indexing;
 // PyBind entry point
 // ================================================================
 
+torch::Tensor func_bf16_gemv(
+    torch::Tensor input,   // BF16 - shape (1, K) or (B, M, K)
+    torch::Tensor weight,  // BF16 - shape (N, K)
+    float alpha            // FP32
+) {
+  const at::cuda::OptionalCUDAGuard device_guard(input.device());
+  return bf16_gemv_out_bf16_warp(input, weight, alpha);
+}
+
 torch::Tensor func_int8_gemv(
     torch::Tensor input,   
     torch::Tensor weight,  
@@ -328,6 +337,10 @@ std::tuple<torch::Tensor, torch::Tensor> func_quantize_row_int8_with_smooth_cuda
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("func_bf16_gemv",
+        &func_bf16_gemv,
+        "BF16 GEMV using CUDA- DP4A (BF16 input/weight, BF16 output)");
+
     m.def("func_int8_gemv",
         &func_int8_gemv,
         "Int8 GEMV using CUDA- DP4A (INT8 input/weight, BFloat16 output)");

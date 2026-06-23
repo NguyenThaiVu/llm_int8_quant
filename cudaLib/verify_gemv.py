@@ -20,7 +20,7 @@ if __name__ == "__main__":
 
     batch_size = 32
     seq_len = 1
-    in_dims = 1024 # 128, 4096
+    in_dims = 2048 # 128, 4096
     out_dims = 128 # 1024, 4096, 12288
     # list_in_dims = [128, 4096, 4096]
     # list_out_dims = [2048, 4096, 12288]
@@ -30,16 +30,20 @@ if __name__ == "__main__":
     # for in_dims, out_dims in zip(list_in_dims, list_out_dims):
     # print(f"\n\nTesting GEMV with input dim {in_dims} and output dim {out_dims}")
     
-    X = torch.randn((batch_size, seq_len, in_dims), dtype=dtype, device="cuda")
+    X = torch.randn((1, 4096), dtype=dtype, device="cuda")
 
-    # init W with kaiming for better quantization results
-    W = torch.empty((batch_size, out_dims, in_dims), dtype=dtype).cuda()
+    # init W with kaiming uniform initialization
+    W = torch.empty((8192, 4096), dtype=dtype).cuda()
     torch.nn.init.kaiming_uniform_(W, a=math.sqrt(5))
     
     print(f"Input shape: {X.shape}")
-    print(f"Weight shape: {W.shape}\n")
+    print(f"Weight shape: {W.shape}")
     for _ in range(3):
         Y_torch = torch.matmul(X, W.transpose(-2, -1))
+    print(f"Output shape: {Y_torch.shape}")
+    
+    total_data_size = (X.numel() + W.numel() + Y_torch.numel()) * X.element_size()
+    print(f"Total data size: {total_data_size / 1024 / 1024:.2f} MB \n")
     
     # =========================================================================
     # 1. Measure torch latency
@@ -73,6 +77,36 @@ if __name__ == "__main__":
     print(f"Latency per inference (cutlass int8 gemm): {avg_time * 1000:.4f} ms")
     cutlass_flops_per_sec = compute_flops_per_sec_gemv(seq_len, in_dims, out_dims, avg_time)
     print(f"Throughput (cutlass int8 gemm): {cutlass_flops_per_sec / 1e9:.2f} GFLOPS \n")
+    
+    # =========================================================================
+    # 3. Measure GEMV BF16 latency
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    for _ in range(n_iter):
+        with torch.no_grad():
+            _ = gemm_cutlass.func_bf16_gemv(X, W, 1.0)
+    end_event.record()
+    torch.cuda.synchronize()
+    avg_time = start_event.elapsed_time(end_event) / n_iter / 1000
+    print(f"Latency per inference (GEMV BF16 output): {avg_time * 1000:.4f} ms")
+    cutlass_flops_per_sec = compute_flops_per_sec_gemv(seq_len, in_dims, out_dims, avg_time)
+    print(f"Throughput (GEMV BF16 output): {cutlass_flops_per_sec / 1e9:.2f} GFLOPS \n")
+    
+    # =========================================================================
+    # 3. Measure GEMV BF16 latency (WARP version)
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    for _ in range(n_iter):
+        with torch.no_grad():
+            _ = gemm_cutlass.func_int8_gemv(X_i8, W_i8, scale_x, scale_w, 1.0)
+    end_event.record()
+    torch.cuda.synchronize()
+    avg_time = start_event.elapsed_time(end_event) / n_iter / 1000
+    print(f"Latency per inference (GEMV BF16 output): {avg_time * 1000:.4f} ms")
+    cutlass_flops_per_sec = compute_flops_per_sec_gemv(seq_len, in_dims, out_dims, avg_time)
+    print(f"Throughput (GEMV BF16 output): {cutlass_flops_per_sec / 1e9:.2f} GFLOPS \n")
 
     
     # =========================================================================
