@@ -23,8 +23,8 @@ if __name__ == "__main__":
     gamma = torch.randn((embed_dim,), dtype=d_type, device='cuda')
     
     # BF16 RMSNorm
-    y_bf16 = gemm_cutlass.func_rmsnorm(x, gamma, 1e-6)
-    bf16_rmsnorm_time = measure_time(gemm_cutlass.func_rmsnorm, x, gamma, 1e-6)
+    y_bf16 = gemm_cutlass.func_rmsnorm_bf16(x, gamma, 1e-6)
+    bf16_rmsnorm_time = measure_time(gemm_cutlass.func_rmsnorm_bf16, x, gamma, 1e-6)
     print(f"BF16 RMSNorm time: {bf16_rmsnorm_time:.2f} ms")
     
     # INT8 RMSNorm

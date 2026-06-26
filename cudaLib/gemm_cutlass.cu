@@ -43,10 +43,10 @@ torch::Tensor func_bf16_gemv(
     float alpha            // FP32
 ) {
   const at::cuda::OptionalCUDAGuard device_guard(input.device());
-  return bf16_gemv_out_bf16_warp(input, weight, alpha);
+  return bf16_gemv_out_bf16(input, weight, alpha);
 }
 
-torch::Tensor func_int8_gemv(
+torch::Tensor func_i8_gemv_out_bf16(
     torch::Tensor input,   
     torch::Tensor weight,  
     torch::Tensor x_scale, 
@@ -56,27 +56,15 @@ torch::Tensor func_int8_gemv(
     // Get shape 
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
     if (input.dim() <= 3) {
-        return int8_gemv_out_bf16_warp(input, weight, x_scale, w_scale, alpha);
+        return i8_gemv_out_bf16(input, weight, x_scale, w_scale, alpha);
     } else if (input.dim() == 4) {
-        return int8_gemv_out_bf16_4d_warp(input, weight, x_scale, w_scale, alpha);
+        return i8_gemv_out_bf16_4d(input, weight, x_scale, w_scale, alpha);
     } else {
         throw std::invalid_argument("Input tensor must be 2D or 3D or 4D");
     }
 }
 
-torch::Tensor func_int8_gemv_out_int8(
-    torch::Tensor input,   // INT8 - shape (1, K) or (B, M, K)
-    torch::Tensor weight,  // INT8 - shape (N, K)
-    torch::Tensor x_scale, // FP32 - shape (1, 1) or (B, M, 1)
-    torch::Tensor w_scale, // FP32 - shape (N, 1)
-    torch::Tensor y_scale, // FP32 - shape (1, 1) or (B, M, 1)
-    float alpha            // FP32
-) {
-  const at::cuda::OptionalCUDAGuard device_guard(input.device());
-  return int8_gemv_out_i8(input, weight, x_scale, w_scale, y_scale, alpha);
-}
-
-torch::Tensor func_int8_gemv_out_int8_warp(
+torch::Tensor func_i8_gemv_out_i8(
     torch::Tensor input,   // INT8 - shape (1, K) or (B, M, K)
     torch::Tensor weight,  // INT8 - shape (N, K)
     torch::Tensor x_scale, // FP32 - shape (1, 1) or (B, M, 1)
@@ -86,9 +74,9 @@ torch::Tensor func_int8_gemv_out_int8_warp(
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
     if (input.dim() <= 3) {
-        return int8_gemv_out_i8_warp(input, weight, x_scale, w_scale, y_scale, alpha);
+        return int8_gemv_out_i8(input, weight, x_scale, w_scale, y_scale, alpha);
     } else if (input.dim() == 4) {
-        return int8_gemv_out_i8_4d_warp(input, weight, x_scale, w_scale, y_scale, alpha);
+        return int8_gemv_out_i8_4d(input, weight, x_scale, w_scale, y_scale, alpha);
     } else {
         throw std::invalid_argument("Input tensor must be 2D or 3D or 4D");
     }
@@ -341,17 +329,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &func_bf16_gemv,
         "BF16 GEMV using CUDA- DP4A (BF16 input/weight, BF16 output)");
 
-    m.def("func_int8_gemv",
-        &func_int8_gemv,
-        "Int8 GEMV using CUDA- DP4A (INT8 input/weight, BFloat16 output)");
+    m.def("func_i8_gemv_out_bf16",
+        &func_i8_gemv_out_bf16,
+        "Int8 GEMV using DP4A (INT8 input/weight, BFloat16 output)");
 
-    m.def("func_int8_gemv_out_int8",
-        &func_int8_gemv_out_int8,
-        "Int8 GEMV with output quantization using CUDA- DP4A (INT8 input/weight, BFloat16 output, INT8 output)");
-
-    m.def("func_int8_gemv_out_int8_warp",
-        &func_int8_gemv_out_int8_warp,
-        "Int8 GEMV with output quantization using CUDA- DP4A (INT8 input/weight, BFloat16 output, INT8 output), EXPLICITLY using warp-level reduction");
+    m.def("func_i8_gemv_out_i8",
+        &func_i8_gemv_out_i8,
+        "Int8 GEMV with output quantization using DP4A (INT8 input/weight, INT8 output)");
 
     m.def("func_int8_matmul",
         &func_int8_matmul,

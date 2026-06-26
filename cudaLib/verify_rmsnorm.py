@@ -34,8 +34,8 @@ class Custom_RMSNorm(torch.nn.Module):
 if __name__ == "__main__":
     
     # =========================== 2D Input ====================================
-    seq_len = 1
-    embed_dim = 8192
+    seq_len = 32
+    embed_dim = 128
     print(f"\nTesting RMSNorm with 2D input, seq_len={seq_len}, embed_dim={embed_dim}")
     
     # list_seq_len = [1024, 2048, 3072]
