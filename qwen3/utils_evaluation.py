@@ -119,3 +119,142 @@ def compute_ppl_single_text(model, tokenizer, text, context_size, device="cuda",
         total_tok += trg_len
 
     return math.exp(total_nll / total_tok)
+
+
+import torch
+import torch.nn.functional as F
+from datasets import load_dataset
+
+
+def arc_prompt(example):
+    lines = [f"Question: {example['question']}"]
+
+    for label, text in zip(
+        example["choices"]["label"],
+        example["choices"]["text"],
+    ):
+        lines.append(f"{label}. {text}")
+
+    lines.append("Answer:")
+    return "\n".join(lines)
+
+
+@torch.inference_mode()
+def score_choice(model, tokenizer, prompt, choice, device):
+    prompt_ids = tokenizer.encode(prompt)
+    full_ids = tokenizer.encode(prompt + " " + choice)
+
+    answer_start = len(prompt_ids)
+
+    input_ids = torch.tensor(
+        full_ids,
+        dtype=torch.long,
+        device=device,
+    )
+
+    # logits shape: [sequence_length, vocab_size]
+    logits = model(input_ids)
+
+    # logits[t] predicts input_ids[t + 1]
+    log_probs = F.log_softmax(
+        logits[:-1].float(),
+        dim=-1,
+    )
+
+    # Targets have shape [sequence_length - 1]
+    targets = input_ids[1:]
+
+    # Select the log-probability assigned to each true next token.
+    token_log_probs = log_probs.gather(
+        dim=-1,
+        index=targets.unsqueeze(-1),
+    ).squeeze(-1)
+
+    # The first answer token is predicted at position answer_start - 1.
+    answer_log_probs = token_log_probs[answer_start - 1:]
+
+    total_score = answer_log_probs.sum().item()
+    normalized_score = answer_log_probs.mean().item()
+
+    return total_score, normalized_score
+
+
+@torch.inference_mode()
+def evaluate_arc(
+    model,
+    tokenizer,
+    device,
+    subset="ARC-Easy",
+    split="test",
+    max_samples=None,
+):
+    if subset not in {"ARC-Easy", "ARC-Challenge"}:
+        raise ValueError(
+            "subset must be 'ARC-Easy' or 'ARC-Challenge'"
+        )
+
+    dataset = load_dataset(
+        "allenai/ai2_arc",
+        subset,
+        split=split,
+    )
+
+    if max_samples is not None:
+        dataset = dataset.select(
+            range(min(max_samples, len(dataset)))
+        )
+
+    model.eval()
+
+    correct = 0
+    correct_norm = 0
+
+    for i, example in enumerate(dataset):
+        prompt = arc_prompt(example)
+
+        labels = list(example["choices"]["label"])
+        choices = list(example["choices"]["text"])
+        answer_key = str(example["answerKey"])
+
+        scores = [
+            score_choice(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                choice=choice,
+                device=device,
+            )
+            for choice in choices
+        ]
+
+        raw_scores = [score[0] for score in scores]
+        norm_scores = [score[1] for score in scores]
+
+        raw_index = max(
+            range(len(raw_scores)),
+            key=raw_scores.__getitem__,
+        )
+        norm_index = max(
+            range(len(norm_scores)),
+            key=norm_scores.__getitem__,
+        )
+
+        predicted = str(labels[raw_index])
+        predicted_norm = str(labels[norm_index])
+
+        correct += int(predicted == answer_key)
+        correct_norm += int(predicted_norm == answer_key)
+
+        if (i + 1) % 100 == 0:
+            print(
+                f"{subset}: {i + 1}/{len(dataset)} | "
+                f"acc={correct / (i + 1):.4f} | "
+                f"acc_norm={correct_norm / (i + 1):.4f}"
+            )
+
+    return {
+        "task": subset,
+        "acc": correct / len(dataset),
+        "acc_norm": correct_norm / len(dataset),
+        "num_samples": len(dataset),
+    }

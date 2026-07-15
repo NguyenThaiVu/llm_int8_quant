@@ -1,9 +1,4 @@
 import os
-
-# Use second GPU
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  
-
-
 from pathlib import Path
 import zipfile
 import math
@@ -22,14 +17,14 @@ from utils_tokenizer import Qwen3Tokenizer
 from config import get_model_config, load_weights_into_qwen
 from utils_model import *
 from utils_generation import *
-from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text
+from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text, evaluate_arc
     
 # Select which model to use via the following flag; only one can be True
 USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B", or "32B"
+CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B", or "32B"
 
 if __name__ == "__main__":
     
@@ -154,20 +149,42 @@ if __name__ == "__main__":
         print(f"{idx}. Generated response: {response} \n")
         
     
-    # ================================================================
-    # 4. Perplexity evaluation on Wikitext-2
-    # ================================================================
-    print(f"[INFO] Start Evaluation... \n")
+    # # ================================================================
+    # # 4. Perplexity evaluation on Wikitext-103
+    # # ================================================================
+    # print(f"[INFO] Start Evaluation... \n")
 
-    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+    # samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
 
-    ppl = compute_ppl_single_text(model,
-                                tokenizer, 
-                                samples,
-                                context_size=PPL_CONTEXT_TOKENS,
-                                stride=PPL_STRIDE)
-    print(f"\nPPL (BF16): {ppl} \n")
-    print(f"Model Information: ")
+    # ppl = compute_ppl_single_text(model,
+    #                             tokenizer, 
+    #                             samples,
+    #                             context_size=PPL_CONTEXT_TOKENS,
+    #                             stride=PPL_STRIDE)
+    # print(f"\nPPL (BF16): {ppl} \n")
+    # print(f"Model Information: ")
+    # print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    # print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    # print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")
+    
+    # ================================================================
+    # 5. ARC-Easy evaluation
+    # ================================================================
+    NUM_ARC_SAMPLES = None  # Use None for the complete test set
+    DATASET_ARC = "ARC-Challenge"  # Options: "ARC-Easy", "ARC-Challenge"
+    
+    print(f"[INFO] Start {DATASET_ARC} Evaluation... \n")
+    
+    arc_result = evaluate_arc(
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        subset=DATASET_ARC,
+        max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
+    )
+
+    print(f"\n{DATASET_ARC} results")
     print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    print(f"Context size: {PPL_CONTEXT_TOKENS}")
-    print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")
+    print(f"Number of questions: {arc_result['num_samples']}")
+    print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
+    print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}%")

@@ -120,10 +120,10 @@ if __name__ == "__main__":
 
     # ======================= GEMV BF16 vs INT8 with 2D input ==========================
     seq_len = 1
-    list_in_dims = [1024, 2048, 4096, 4096, 8192]
-    list_out_dims = [1024, 2048, 4096, 8192, 8192]
-    # list_in_dims = [4096]
-    # list_out_dims = [8192]
+    # list_in_dims = [1024, 2048, 4096, 4096, 8192]
+    # list_out_dims = [1024, 2048, 4096, 8192, 8192]
+    list_in_dims = [4096]
+    list_out_dims = [8192]
     dtype = torch.bfloat16
     
     list_total_data_move = []
@@ -137,18 +137,17 @@ if __name__ == "__main__":
     
         X = torch.randn((seq_len, in_dims), dtype=dtype, device="cuda")
         W = init_weights((out_dims, in_dims), dtype)
-        W_trans = W.transpose(-2, -1)
         print(f"Testing GEMV with input: {X.shape}, weight: {W.shape}")
         
-        for _ in range(5):
-            Y_torch = torch.matmul(X, W_trans)
+        for _ in range(3):
+            Y_torch = torch.matmul(X, W.transpose(-2, -1))
         
         total_data_move = compute_total_data_movement(X, W, Y_torch, unit='MB')
         print(f"Total data movement (BF16 input/output): {total_data_move:.2f} MB\n")
         
         # =========================================================================
         #  1. Measure torch latency (baseline)
-        avg_time = measure_time(torch.matmul, X, W_trans)
+        avg_time = measure_time(torch.matmul, X, W.transpose(-2, -1), repeat=10)
         print(f"Latency per inference (torch.matmul): {avg_time:.4f} ms")
         torch_flops_per_sec = compute_flops_per_sec_gemv(seq_len, in_dims, out_dims, avg_time)
         print(f"Throughput (torch.matmul): {torch_flops_per_sec / 1e9:.2f} GFLOPS\n")
@@ -160,10 +159,10 @@ if __name__ == "__main__":
         
         # =========================================================================
         # 2. Measure GEMV BF16 latency
-        avg_time = measure_time(gemm_cutlass.func_bf16_gemv, X, W, 1.0)
+        avg_time = measure_time(gemm_cutlass.func_bf16_gemv, X, W, 1.0, repeat=10)
         print(f"Latency per inference (GEMV BF16 output): {avg_time:.4f} ms")
         cutlass_flops_per_sec = compute_flops_per_sec_gemv(seq_len, in_dims, out_dims, avg_time)
-        print(f"Throughput (GEMV BF16 output): {cutlass_flops_per_sec / 1e9:.2f} GFLOPS")
+        print(f"Throughput (GEMV BF16 output): {cutlass_flops_per_sec / 1e9:.2f} GFLOPS \n")
         ai_bf16 = gemv_arithmetic_intensity(X, W, Y_torch)
         print(f"Arithmetic Intensity (GEMV BF16): {ai_bf16:.4f} (FLOP/Byte)\n")
 
@@ -173,25 +172,25 @@ if __name__ == "__main__":
         # =========================================================================
         # 2. Measure GEMV INT8 with BF16 output latency
         avg_time = measure_time(gemm_cutlass.func_i8_gemv_out_bf16,\
-                                X_i8, W_i8, scale_x, scale_w, 1.0)
+                                X_i8, W_i8, scale_x, scale_w, 1.0, repeat=10)
         print(f"Latency per inference (int8 gemv + bf16 output): {avg_time:.4f} ms")
         int8_gemv_flops_per_sec = compute_flops_per_sec_gemv(seq_len, in_dims, out_dims, avg_time)
-        print(f"Throughput (i8 gemv + bf16 output): {int8_gemv_flops_per_sec / 1e9:.2f} GFLOPS ")
+        print(f"Throughput (int8 gemv + bf16 output): {int8_gemv_flops_per_sec / 1e9:.2f} GFLOPS \n")
         total_data_move = compute_total_data_movement(X_i8, W_i8, Y_torch, unit='MB')
-        print(f"Total data movement (i8 input + BF16 output): {total_data_move:.2f} MB")
+        print(f"Total data movement (INT8 input + BF16 output): {total_data_move:.2f} MB\n")
         ai_i8_bf16 = gemv_arithmetic_intensity(X_i8, W_i8, Y_torch)
-        print(f"Arithmetic Intensity (GEMV i8 + BF16 output): {ai_i8_bf16:.4f} (FLOP/Byte)\n")
+        print(f"Arithmetic Intensity (GEMV INT8 + BF16 output): {ai_i8_bf16:.4f} (FLOP/Byte)\n")
         
         # =========================================================================
         # 3. Measure gemv + quantization latency
         avg_time = measure_time(gemm_cutlass.func_i8_gemv_out_i8,\
-                            X_i8, W_i8, scale_x, scale_w, scale_y, 1.0)
+                            X_i8, W_i8, scale_x, scale_w, scale_y, 1.0, repeat=10)
         print(f"Latency per inference (int8 gemv + quantization): {avg_time:.4f} ms")
         int8_gemv_flops_per_sec = compute_flops_per_sec_gemv(seq_len, in_dims, out_dims, avg_time)
         print(f"Throughput (int8 gemv + quantization): {int8_gemv_flops_per_sec / 1e9:.2f} GFLOPS")
         Y_i8 = gemm_cutlass.func_i8_gemv_out_i8(X_i8, W_i8, scale_x, scale_w, scale_y, 1.0)
         total_data_move = compute_total_data_movement(X_i8, W_i8, Y_i8, unit='MB')
-        print(f"Total data movement (i8 input + i8 output): {total_data_move:.2f} MB")
+        print(f"Total data movement (INT8 input + INT8 output): {total_data_move:.2f} MB\n")
         ai_i8 = gemv_arithmetic_intensity(X_i8, W_i8, Y_i8)
-        print(f"Arithmetic Intensity (GEMV i8 + i8 output): {ai_i8:.4f} (FLOP/Byte)\n")
+        print(f"Arithmetic Intensity (GEMV INT8 + INT8 output): {ai_i8:.4f} (FLOP/Byte)\n")
     

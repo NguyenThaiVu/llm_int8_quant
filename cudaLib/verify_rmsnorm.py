@@ -34,8 +34,8 @@ class Custom_RMSNorm(torch.nn.Module):
 if __name__ == "__main__":
     
     # =========================== 2D Input ====================================
-    seq_len = 32
-    embed_dim = 128
+    seq_len = 2048
+    embed_dim = 8192
     print(f"\nTesting RMSNorm with 2D input, seq_len={seq_len}, embed_dim={embed_dim}")
     
     # list_seq_len = [1024, 2048, 3072]
@@ -64,13 +64,37 @@ if __name__ == "__main__":
     int8_rmsnorm_time = measure_time(rmsnorm_layer, x_int8, scale_x)
     print(f"INT8 RMSNorm time: {int8_rmsnorm_time:.2f} ms\n")
 
-    y_dequant = y_int8.to(torch.float32) * scale_y.unsqueeze(-1)
-    y_dequant = y_dequant.to(d_type)
+    # y_dequant = y_int8.to(torch.float32) * scale_y.unsqueeze(-1)
+    # y_dequant = y_dequant.to(d_type)
     
     # compare
-    print("Max absolute difference:", (y_dequant - y_torch).abs().max().item())
-    print("Mean absolute difference:", (y_dequant - y_torch).abs().mean().item(), "\n")        
+    # print("Max absolute difference:", (y_dequant - y_torch).abs().max().item())
+    # print("Mean absolute difference:", (y_dequant - y_torch).abs().mean().item(), "\n")        
     # print(f"Sample output (torch): {y_torch[:5, :5]}")
     # print(f"Sample output (dequantized): {y_dequant[:5, :5]}\n")
+    
+    # ============================== 3D Input ====================================
+    batch_size = 16
+    seq_len = 128
+    embed_dim = 8192
+    print(f"\nTesting RMSNorm with 3D input, batch_size={batch_size}, seq_len={seq_len}, embed_dim={embed_dim}")
+    X = torch.randn((batch_size, seq_len, embed_dim), dtype=d_type, device='cuda')
+    gamma = torch.randn((embed_dim,), dtype=d_type, device='cuda')
+    rmsnorm_layer = Custom_RMSNorm(embed_dim).cuda()
+    rmsnorm_layer.weight.data.copy_(gamma)
+    
+    # Baseline with PyTorch
+    Y_torch = rmsnorm_layer(X, 1.0)
+    torch_rmsnorm_time = measure_time(rmsnorm_layer, X, 1.0)
+    print(f"PyTorch RMSNorm time: {torch_rmsnorm_time:.2f} ms") 
+    
+    # quantization
+    rmsnorm_layer.finish_calibration()
+    X_int8, scale_X = quantize_row_int8_symmetric_nd(X) 
+    
+    Y_int8, scale_Y = rmsnorm_layer(X_int8, scale_X)
+    int8_rmsnorm_time = measure_time(rmsnorm_layer, X_int8, scale_X)
+    print(f"INT8 RMSNorm time: {int8_rmsnorm_time:.2f} ms\n")
+    
     
     

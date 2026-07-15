@@ -5,8 +5,8 @@ import torch.nn.functional as F
 import gemm_cutlass
 from utils_quant import quantize_row_int8_symmetric_nd, quantize_tensor
 
-MAX_SEQ_LEN = 2112 # 576 or 1040 or 2112
-BATCH_SIZE = 16 # 1, 2, 16, 64, 128
+MAX_SEQ_LEN = 1040 # 576 or 1040 or 2112
+BATCH_SIZE = 1 # 1, 2, 16, 64, 128
 
         
 class Custom_Softmax(nn.Module):

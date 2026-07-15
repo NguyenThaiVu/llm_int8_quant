@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # select GPU "0", "1", "2",...
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # select GPU "0", "1", "2",...
 from tqdm import tqdm
 import json
 
@@ -13,7 +13,7 @@ from utils_tokenizer import Qwen3Tokenizer
 from config import get_model_config, load_weights_into_qwen
 from utils_model import *
 from utils_generation import *
-from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text
+from utils_evaluation import evaluate_arc, load_wikitext_single_text, compute_ppl_single_text
 from utils_model_quan import TransformerBlock_Quant
     
 # Select which model to use via the following flag; only one can be True
@@ -154,8 +154,8 @@ if __name__ == "__main__":
     # ================================================================
     # 3. Text generation
     # ================================================================
-    MAX_NEW_TOKENS = 2048
-    PPL_CONTEXT_TOKENS = 2048
+    MAX_NEW_TOKENS = 1024
+    PPL_CONTEXT_TOKENS = 1024
     EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
@@ -181,7 +181,7 @@ if __name__ == "__main__":
     # ================================================================
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=1_000)
+                                                    split="train", n=200_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             
@@ -248,18 +248,40 @@ if __name__ == "__main__":
         return f"{x / 1024 / 1024 / 1024:.2f} GB"
     print(f"GPU memory used: {calc_gpu_gb(torch.cuda.max_memory_allocated())}\n")
 
-    # ================================================================
-    # 5. PPL evaluation
-    # ================================================================
-    print(f"[INFO] ...Start Evaluation...")
+    # # ================================================================
+    # # 5. PPL evaluation
+    # # ================================================================
+    # print(f"[INFO] ...Start Evaluation...")
 
-    ppl = compute_ppl_single_text(model,
-                                tokenizer,
-                                samples,
-                                context_size=PPL_CONTEXT_TOKENS,
-                                stride=PPL_STRIDE)
-    print(f"PPL: {ppl} \n")
-    print(f"Model Information: ")
+    # ppl = compute_ppl_single_text(model,
+    #                             tokenizer,
+    #                             samples,
+    #                             context_size=PPL_CONTEXT_TOKENS,
+    #                             stride=PPL_STRIDE)
+    # print(f"PPL: {ppl} \n")
+    # print(f"Model Information: ")
+    # print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    # print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    # print(f"Dataset evaluation: {EVALUATION_DATASET}")
+    
+    # ================================================================
+    # 6. ARC-Easy evaluation
+    # ================================================================
+    NUM_ARC_SAMPLES = None  # Use None for the complete test set
+    DATASET_ARC = "ARC-Challenge"  # Options: "ARC-Easy", "ARC-Challenge"
+    
+    print(f"[INFO] Start {DATASET_ARC} Evaluation... \n")
+    
+    arc_result = evaluate_arc(
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        subset=DATASET_ARC,
+        max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
+    )
+
+    print(f"\n{DATASET_ARC} results")
     print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    print(f"Context size: {PPL_CONTEXT_TOKENS}")
-    print(f"Dataset evaluation: {EVALUATION_DATASET}")
+    print(f"Number of questions: {arc_result['num_samples']}")
+    print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
+    print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}%")

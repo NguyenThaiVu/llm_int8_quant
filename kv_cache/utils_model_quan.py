@@ -42,7 +42,7 @@ class Custom_Linear(nn.Module):
             return out, 1.0
         else:
             assert x.dtype == torch.int8, "Expect int8 input in quantization"
-            print(f"[DEBUG] Custom_Linear forward: x shape={x.shape}, weight_q shape={self.weight_q.shape}")
+            # print(f"[DEBUG] Custom_Linear forward: x shape={x.shape}, weight_q shape={self.weight_q.shape}")
             
             if x.dim() == 2:
                 seq_len = x.shape[0]
@@ -57,14 +57,17 @@ class Custom_Linear(nn.Module):
             col_scale = self.scale_w
             
             if self.is_return_float:
-                out = gemm_cutlass.func_w8a8_matmul(x, self.weight_q,\
-                    row_scale, col_scale)
+                if seq_len == 1:
+                    out = gemm_cutlass.func_i8_gemv_out_bf16(x, self.weight_q,\
+                                        scale_x, self.scale_w, 1.0)
+                else:
+                    out = gemm_cutlass.func_w8a8_matmul(x, self.weight_q,\
+                        row_scale, col_scale)
                 return out, 1.0
             
-            # Return int8 output 
-            # Check GEMM or GEMV
+            # Return int8 output (GEMV or GEMM)
             if seq_len == 1:
-                out_q = gemm_cutlass.func_int8_gemv_out_int8(\
+                out_q = gemm_cutlass.func_i8_gemv_out_i8(\
                     x, self.weight_q, scale_x, self.scale_w, scale_y_value, 1.0)
             else:
                 out_q = gemm_cutlass.func_w8a8o8_matmul(x, self.weight_q,\
@@ -360,7 +363,7 @@ class Custom_Matmul(nn.Module):
             return C, 1.0
         else:
             if self.is_return_float:
-                print(f"[DEBUG] Custom_Matmul forward (return float): A shape={A.shape}, B shape={B.shape}")
+                # print(f"[DEBUG] Custom_Matmul forward (return float): A shape={A.shape}, B shape={B.shape}")
                 if A.dim() == 2:
                     seq_len = A.shape[0]
                 elif A.dim() == 3:
@@ -371,12 +374,12 @@ class Custom_Matmul(nn.Module):
                     raise ValueError(f"Unsupported input dimensions: {A.dim()}")
                 
                 if seq_len == 1:
-                    C = gemm_cutlass.func_int8_gemv(A, B, scale_A, scale_B, 1.0)
+                    C = gemm_cutlass.func_i8_gemv_out_bf16(A, B, scale_A, scale_B, 1.0)
                 else:
                     C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)
                 return C, 1.0
             else:
-                print(f"[DEBUG] Custom_Matmul forward: A shape={A.shape}, B shape={B.shape}")
+                # print(f"[DEBUG] Custom_Matmul forward: A shape={A.shape}, B shape={B.shape}")
                 if A.dim() == 2:
                     seq_len = A.shape[0]
                     scale_C = self.scale_y[:seq_len]
@@ -390,7 +393,7 @@ class Custom_Matmul(nn.Module):
                     raise ValueError(f"Unsupported input dimensions: {A.dim()}")
                     
                 if seq_len == 1:
-                    C_i8 = gemm_cutlass.func_int8_gemv_out_int8_warp(A, B,\
+                    C_i8 = gemm_cutlass.func_i8_gemv_out_i8(A, B,\
                                                 scale_A, scale_B, scale_C, 1.0)
                 else:
                     row_scale = scale_A / scale_C

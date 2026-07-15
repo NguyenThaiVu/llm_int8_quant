@@ -1,0 +1,69 @@
+#include <iostream>
+#include <cuda_runtime.h>
+
+// The Python script will replace this placeholder text
+#define THREADS_PER_BLOCK __BLOCK_SIZE_PLACEHOLDER__
+
+__global__ void benchmark_kernel(float* d_out, const float* d_in, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        // A simple math loop to simulate compute workload
+        float val = d_in[idx];
+        for (int i = 0; i < 100; ++i) {
+            val = sinf(val) * cosf(val) + 0.1f;
+        }
+        d_out[idx] = val;
+    }
+}
+
+int main() {
+    const int N = 1 << 24; // ~16 Million elements
+    size_t size = N * sizeof(float);
+
+    float *h_in = (float*)malloc(size);
+    float *h_out = (float*)malloc(size);
+
+    for (int i = 0; i < N; ++i) h_in[i] = static_cast<float>(i);
+
+    float *d_in, *d_out;
+    cudaMalloc(&d_in, size);
+    cudaMalloc(&d_out, size);
+
+    cudaMemcpy(d_in, h_in, size, cudaMemcpyHostToDevice);
+
+    int threadsPerBlock = THREADS_PER_BLOCK;
+    int blocksPerGrid = (N + threadsPerBlock - 1) / threadsPerBlock;
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    // Warm-up run
+    benchmark_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_out, d_in, N);
+    cudaDeviceSynchronize();
+
+    // Measurement iterations
+    const int iterations = 10;
+    cudaEventRecord(start);
+    for (int i = 0; i < iterations; ++i) {
+        benchmark_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_out, d_in, N);
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    
+    // Output the average time per kernel launch to stdout
+    std::cout << (milliseconds / iterations) << std::endl;
+
+    // Cleanup
+    cudaFree(d_in);
+    cudaFree(d_out);
+    free(h_in);
+    free(h_out);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    return 0;
+}

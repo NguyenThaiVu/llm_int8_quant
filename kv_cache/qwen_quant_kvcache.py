@@ -210,8 +210,8 @@ tokenizer = Qwen3Tokenizer(
 # ========================================================
 # 4. Text generation with KV cache
 # ========================================================
-INPUT_PROMPT_LENGTH = 1
-MAX_NEW_TOKENS = 2
+INPUT_PROMPT_LENGTH = 1024
+MAX_NEW_TOKENS = 1024
 
 prompt = "What is the Dragon Ball story?"
 if INPUT_PROMPT_LENGTH is None:
