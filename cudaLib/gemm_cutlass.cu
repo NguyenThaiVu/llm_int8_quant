@@ -29,6 +29,7 @@
 #include "gemm_activation.cu"
 #include "gemm_matrix_utils.cu"
 #include "gemv.cu"
+#include "gemm_sigmoid.cu"
 
 using namespace torch::indexing;
 
@@ -162,14 +163,14 @@ std::tuple<torch::Tensor, torch::Tensor> func_rmsnorm_int8(
     return rmsnorm_int8_cuda(x, scale_x, gamma, eps);
 }
 
-std::tuple<torch::Tensor, torch::Tensor> func_rmsnorm_shared_int8(
+std::tuple<torch::Tensor, torch::Tensor> func_rmsnorm_naive_int8(
     torch::Tensor x,      // INT8, shape (tokens, d_model)
     torch::Tensor scale_x,
     torch::Tensor gamma,  // FP32, shape (d_model,)
     float eps) 
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    return rmsnorm_int8_shared_cuda(x, scale_x, gamma, eps);
+    return rmsnorm_int8_naive_cuda(x, scale_x, gamma, eps);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> func_layernorm_int8(
@@ -206,21 +207,13 @@ std::tuple<torch::Tensor, torch::Tensor> func_apply_rope_int8(
     return rope_int8_host(x, scale_x, cos, scale_cos, sin, scale_sin);
 }
 
-torch::Tensor func_apply_silu_int8(
-    torch::Tensor input,      // int8
-    torch::Tensor scale_in,   // float32 scalar
-    torch::Tensor scale_out   // float32 scalar
-) {
-    const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    return silu_int8_cuda_rowwise(input, scale_in, scale_out);
-}
-
-torch::Tensor func_silu_mul(
-    torch::Tensor fc1, 
-    torch::Tensor fc2
-) {
-    const at::cuda::OptionalCUDAGuard device_guard(fc1.device());
-    return silu_mul_cuda(fc1, fc2);
+torch::Tensor func_rope_bf16(
+    torch::Tensor x,          // bf16, shape [batch_size, num_heads, seq_len, head_dim]
+    torch::Tensor cos,       // bf16, shape [seq_len, head_dim]
+    torch::Tensor sin)       // bf16, shape [seq_len, head_dim]
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    return rope_bf16_cuda(x, cos, sin);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> func_silu_mul_quant(
@@ -242,6 +235,30 @@ std::tuple<torch::Tensor, torch::Tensor> func_silu_mul_int8(
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(fc1.device());
     return silu_mul_int8_cuda(fc1, scale_fc1, fc2, scale_fc2, smooth_scale, use_warp_reduction);
+}
+
+torch::Tensor func_silu_mul_bf16(
+    torch::Tensor fc1, 
+    torch::Tensor fc2,
+    torch::Tensor smooth_scale
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(fc1.device());
+    return silu_mul_bf16_cuda(fc1, fc2, smooth_scale);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> func_silu_int8(
+    torch::Tensor x_int8,  // int8 - shape (M, D)
+    torch::Tensor scale_x // float32 - shape (M, 1)
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(x_int8.device());
+    return silu_int8_cuda(x_int8, scale_x);
+}
+
+torch::Tensor func_silu_bf16(
+    torch::Tensor x_bf16 // bf16 - shape (M, D)
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(x_bf16.device());
+    return silu_bf16_cuda(x_bf16);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> func_int8_matmul_out_int8_three_scale(
@@ -324,6 +341,23 @@ std::tuple<torch::Tensor, torch::Tensor> func_quantize_row_int8_with_smooth_cuda
     return quantize_row_int8_with_smooth_cuda(x, smooth);
 }
 
+torch::Tensor func_sigmoid_bf16(
+    torch::Tensor x_bf16 // bf16 - shape (M, D)
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(x_bf16.device());
+    return sigmoid_bf16_cuda(x_bf16);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> func_sigmoid_int8(
+    torch::Tensor x_int8,  // int8 - shape (M, D)
+    torch::Tensor scale_x // float32 - shape (M, 1)
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(x_int8.device());
+    return sigmoid_int8_cuda(x_int8, scale_x);
+}
+
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_bf16_gemv",
         &func_bf16_gemv,
@@ -361,6 +395,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &func_rmsnorm_bf16,
         "RMSNorm for 2D bf16 input and return bf16 output");
 
+    m.def("func_rmsnorm_int8",
+        &func_rmsnorm_int8,
+        "RMSNorm for int8 input with float32 gamma and input scale");
+
+    m.def("func_rmsnorm_naive_int8",
+        &func_rmsnorm_naive_int8,
+        "RMSNorm for int8 input with float32 gamma and input scale, EXPLICITLY using shared memory for reduction");
+
     m.def("func_rmsnorm_bf16_to_int8",
         &func_rmsnorm_bf16_to_int8,
         "RMSNorm for 2D bf16 input and return quantized int8 output with per-row scale");
@@ -368,14 +410,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_rmsnorm_quant",
         &func_rmsnorm_quant,
         "RMSNorm for 2D float32 input with float32 gamma, return quantized int8 output and per-row scale");
-
-    m.def("func_rmsnorm_int8",
-        &func_rmsnorm_int8,
-        "RMSNorm for int8 input with float32 gamma and input scale");
-
-    m.def("func_rmsnorm_shared_int8",
-        &func_rmsnorm_shared_int8,
-        "RMSNorm for int8 input with float32 gamma and input scale, EXPLICITLY using shared memory for reduction");
 
     m.def("func_layernorm_int8",
         &func_layernorm_int8,
@@ -389,21 +423,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &func_apply_rope_int8,
         "Apply RoPE to int8 tensor with given cos/sin tables and scales");
 
-    m.def("func_apply_silu_int8",
-        &func_apply_silu_int8,
-        "Apply SiLU activation function to int8 input tensor with given input/output scales");
-
-    m.def("func_silu_mul",
-        &func_silu_mul,
-        "Apply SiLU to fc1 and multiply with fc2");
+    m.def("func_rope_bf16",
+        &func_rope_bf16,
+        "Apply RoPE to bf16 tensor with given cos/sin tables");
 
     m.def("func_silu_mul_quant",
         &func_silu_mul_quant,
         "Apply SiLU to fc1 and multiply with fc2 (bf16), return quantized int8 output with per-row scale");
 
+    m.def("func_silu_mul_bf16",
+        &func_silu_mul_bf16,
+        "Apply SiLU to fc1 and multiply with fc2 (bf16), return bf16 output");
+
     m.def("func_silu_mul_int8",
         &func_silu_mul_int8,
         "Apply SiLU to fc1 and multiply with fc2 (both int8) with proper scaling, return int8 output with scale");
+    
+    m.def("func_silu_int8",
+        &func_silu_int8,
+        "Apply SiLU to int8 input with proper scaling, return int8 output with scale");
+
+    m.def("func_silu_bf16",
+        &func_silu_bf16,
+        "Apply SiLU to bf16 input, return bf16 output");
 
     m.def("func_int8_matmul_out_int8_three_scale",
         &func_int8_matmul_out_int8_three_scale,
@@ -428,4 +470,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_quantize_row_int8_with_smooth_cuda",
         &func_quantize_row_int8_with_smooth_cuda,
         "Quantize a BF16 matrix to INT8 with per-row smooth quantization");
+
+    m.def("func_sigmoid_bf16",
+        &func_sigmoid_bf16,
+        "Apply Sigmoid to bf16 input, return bf16 output");
+
+    m.def("func_sigmoid_int8",
+        &func_sigmoid_int8,
+        "Apply Sigmoid to int8 input with proper scaling, return int8 output with scale");
 }

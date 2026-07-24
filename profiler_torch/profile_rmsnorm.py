@@ -18,7 +18,7 @@ if __name__ == "__main__":
     seq_len = 2048
     # embed_dim = 8192
     d_type = torch.bfloat16
-    list_embed_dim = [4096, 8192, 12288, 16384]
+    list_embed_dim = [4096, 8192, 16384]
     
     for embed_dim in list_embed_dim:
         print(f"\n\nTesting RMSNorm with seq_len={seq_len}, embed_dim={embed_dim}")
@@ -34,14 +34,14 @@ if __name__ == "__main__":
         x_int8, scale_x = quantize_row_int8_symmetric_nd(x)
         
         # 2. BF16 RMSNorm - our implementation
-        y_bf16 = gemm_cutlass.func_rmsnorm(x, gamma, 1e-6)
-        time_bf16 = measure_time(gemm_cutlass.func_rmsnorm, x, gamma, 1e-6)
+        y_bf16 = gemm_cutlass.func_rmsnorm_bf16(x, gamma, 1e-6)
+        time_bf16 = measure_time(gemm_cutlass.func_rmsnorm_bf16, x, gamma, 1e-6)
         print(f"BF16 RMSNorm latency: {time_bf16:.3f} ms")
 
         # 2. INT8 RMSNorm - naive implementation
         try:
-            y_int8, scale_y = gemm_cutlass.func_rmsnorm_shared_int8(x_int8, scale_x, gamma, 1e-6)
-            time_int8 = measure_time(gemm_cutlass.func_rmsnorm_shared_int8, x_int8, scale_x, gamma, 1e-6)
+            y_int8, scale_y = gemm_cutlass.func_rmsnorm_naive_int8(x_int8, scale_x, gamma, 1e-6)
+            time_int8 = measure_time(gemm_cutlass.func_rmsnorm_naive_int8, x_int8, scale_x, gamma, 1e-6)
             print(f"INT8 RMSNorm (naive) latency: {time_int8:.3f} ms")
         except Exception as e:
             print(f"INT8 RMSNorm (naive) OOM.")

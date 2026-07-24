@@ -218,7 +218,6 @@ std::vector<torch::Tensor> dequant_transpose_requant_4d_host(
 //
 // y_i8[m, n] = round(context_smooth[m, n] / scale[m])
 // ================================================================
-template<int BLOCK_SIZE>
 __global__ void quantize_row_int8_with_smooth_kernel(
     const __nv_bfloat16* __restrict__ x,
     const float* __restrict__ smooth,
@@ -326,14 +325,14 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_row_int8_with_smooth_cuda(
             .dtype(torch::kFloat32)
     );
 
-    constexpr int BLOCK_SIZE = 256;
+    constexpr int threads = BLOCK_SIZE;
     dim3 grid(M);
-    dim3 block(BLOCK_SIZE);
+    dim3 block(threads);
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    quantize_row_int8_with_smooth_kernel<BLOCK_SIZE><<<grid, block, 0, stream>>>(
+    quantize_row_int8_with_smooth_kernel<<<grid, block, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
         smooth.data_ptr<float>(),
         y_i8.data_ptr<int8_t>(),

@@ -765,7 +765,7 @@ This function has the same computation as rmsnorm_int8_kernel,
 except that it EXPLICITLY uses shared memory to store intermediate results.
 */
 template <typename T>
-__global__ void rmsnorm_int8_shared_kernel(
+__global__ void rmsnorm_int8_naive_kernel(
     const int8_t* __restrict__ x_int8,
     const float*  __restrict__ scale_x,
     const T*      __restrict__ gamma,
@@ -894,7 +894,7 @@ __global__ void rmsnorm_int8_shared_kernel(
 }
 
 
-std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_shared_cuda(
+std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_naive_cuda(
     torch::Tensor x,      // INT8 - (..., d_model)
     torch::Tensor scale_x,  // Float32 scalar scale for INT8 input
     torch::Tensor gamma,  // (d_model)
@@ -947,9 +947,9 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_shared_cuda(
 
     AT_DISPATCH_SWITCH(
         gamma_contig.scalar_type(),
-        "rmsnorm_int8_shared_cuda",
+        "rmsnorm_int8_naive_cuda",
         AT_DISPATCH_CASE(at::ScalarType::Float, [&] {
-            rmsnorm_int8_shared_kernel<float><<<grid, block, shmem_bytes, stream>>>(
+            rmsnorm_int8_naive_kernel<float><<<grid, block, shmem_bytes, stream>>>(
                 x_contig.data_ptr<int8_t>(),
                 scale_x_contig.data_ptr<float>(),
                 gamma_contig.data_ptr<float>(),
@@ -960,7 +960,7 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_shared_cuda(
             );
         })
         AT_DISPATCH_CASE(at::ScalarType::BFloat16, [&] {
-            rmsnorm_int8_shared_kernel<at::BFloat16><<<grid, block, shmem_bytes, stream>>>(
+            rmsnorm_int8_naive_kernel<at::BFloat16><<<grid, block, shmem_bytes, stream>>>(
                 x_contig.data_ptr<int8_t>(),
                 scale_x_contig.data_ptr<float>(),
                 gamma_contig.data_ptr<at::BFloat16>(),
@@ -976,7 +976,7 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_shared_cuda(
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        printf("CUDA error after rmsnorm_int8_shared_kernel: %s\n", cudaGetErrorString(err));
+        printf("CUDA error after rmsnorm_int8_naive_kernel: %s\n", cudaGetErrorString(err));
         throw std::runtime_error("CUDA kernel launch failed");
     }
 

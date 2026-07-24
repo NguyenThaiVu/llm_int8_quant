@@ -485,7 +485,7 @@ std::tuple<torch::Tensor, torch::Tensor> softmax_int8_explicit_shared_cuda(
     auto y_int8 = torch::empty_like(x_contig);
     auto scale_y = torch::empty_like(scale_contig);
 
-    int threads = static_cast<int>(std::min<int64_t>(d_model, 512));
+    int threads = static_cast<int>(std::min<int64_t>(d_model, 256));
     threads = std::max(threads, 32);
 
     dim3 block(threads);
