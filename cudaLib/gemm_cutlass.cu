@@ -207,15 +207,6 @@ std::tuple<torch::Tensor, torch::Tensor> func_apply_rope_int8(
     return rope_int8_host(x, scale_x, cos, scale_cos, sin, scale_sin);
 }
 
-torch::Tensor func_rope_bf16(
-    torch::Tensor x,          // bf16, shape [batch_size, num_heads, seq_len, head_dim]
-    torch::Tensor cos,       // bf16, shape [seq_len, head_dim]
-    torch::Tensor sin)       // bf16, shape [seq_len, head_dim]
-{
-    const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    return rope_bf16_cuda(x, cos, sin);
-}
-
 std::tuple<torch::Tensor, torch::Tensor> func_silu_mul_quant(
     torch::Tensor fc1, 
     torch::Tensor fc2,
@@ -422,10 +413,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_apply_rope_int8",
         &func_apply_rope_int8,
         "Apply RoPE to int8 tensor with given cos/sin tables and scales");
-
-    m.def("func_rope_bf16",
-        &func_rope_bf16,
-        "Apply RoPE to bf16 tensor with given cos/sin tables");
 
     m.def("func_silu_mul_quant",
         &func_silu_mul_quant,

@@ -51,231 +51,132 @@ __device__ __forceinline__ int8_t quantize_int8_value(float value) {
 }
 
 __device__ __forceinline__ float silu_float(float x) {
-    return x / (1.0f + __expf(-x));
+    return x / (1.0f + expf(-x));
 }
 
-__global__ void naive_silu_mul_int8_vec4_kernel(
-    const int8_t* __restrict__ x1_int8,
-    const int8_t* __restrict__ x2_int8,
-    const float* __restrict__ scale_x1,
-    const float* __restrict__ scale_x2,
-    int8_t* __restrict__ out_int8,
-    float* __restrict__ out_scales,
-    const float* __restrict__ smooth_scale,
-    int rows,
-    int cols
-) {
-    const int row = blockIdx.x;
-
-    if (row >= rows) {
-        return;
-    }
-
-    const int tid = threadIdx.x;
-
-    // Number of four-element groups in each row.
-    const int vec_cols = cols >> 2;
-
-    const float s_x1 = scale_x1[row];
-    const float s_x2 = scale_x2[row];
-
-    // One FP32 intermediate value for every scalar element.
-    extern __shared__ float shared_values[];
-
-    // Vectorized views.
-    const char4* __restrict__ x1_vec =
-        reinterpret_cast<const char4*>(x1_int8);
-
-    const char4* __restrict__ x2_vec =
-        reinterpret_cast<const char4*>(x2_int8);
-
-    char4* __restrict__ out_vec =
-        reinterpret_cast<char4*>(out_int8);
-
-    const float4* __restrict__ smooth_vec =
-        reinterpret_cast<const float4*>(smooth_scale);
-
-    float4* shared_vec =
-        reinterpret_cast<float4*>(shared_values);
-
-    const int vec_row_offset =
-        row * vec_cols;
-
-    // --------------------------------------------------------
-    // Stage 1:
-    // Load four INT8 elements, dequantize them, compute four
-    // SiLU-multiply outputs, and store four FP32 intermediates.
-    // --------------------------------------------------------
-
-    for (int vec_col = tid;
-         vec_col < vec_cols;
-         vec_col += blockDim.x) {
-
-        const int vec_index =
-            vec_row_offset + vec_col;
-
-        const char4 qx1 =
-            x1_vec[vec_index];
-
-        const char4 qx2 =
-            x2_vec[vec_index];
-
-        const float4 smooth =
-            smooth_vec[vec_col];
-
-        // Dequantize four x1 values.
-        const float x1_0 =
-            static_cast<float>(qx1.x) * s_x1;
-
-        const float x1_1 =
-            static_cast<float>(qx1.y) * s_x1;
-
-        const float x1_2 =
-            static_cast<float>(qx1.z) * s_x1;
-
-        const float x1_3 =
-            static_cast<float>(qx1.w) * s_x1;
-
-        // Dequantize four x2 values.
-        const float x2_0 =
-            static_cast<float>(qx2.x) * s_x2;
-
-        const float x2_1 =
-            static_cast<float>(qx2.y) * s_x2;
-
-        const float x2_2 =
-            static_cast<float>(qx2.z) * s_x2;
-
-        const float x2_3 =
-            static_cast<float>(qx2.w) * s_x2;
-
-        // Compute four smoothed SiLU-multiply outputs.
-        const float y0 =
-            silu_float(x1_0) * x2_0 / smooth.x;
-
-        const float y1 =
-            silu_float(x1_1) * x2_1 / smooth.y;
-
-        const float y2 =
-            silu_float(x1_2) * x2_2 / smooth.z;
-
-        const float y3 =
-            silu_float(x1_3) * x2_3 / smooth.w;
-
-        shared_vec[vec_col] =
-            make_float4(y0, y1, y2, y3);
-    }
-
-    __syncthreads();
-
-    // --------------------------------------------------------
-    // Stage 2:
-    // Thread 0 scans the complete intermediate row.
-    //
-    // The scan is also vectorized as float4, although the work
-    // remains serial to preserve the intended naive baseline.
-    // --------------------------------------------------------
-
-    __shared__ float shared_inverse_output_scale;
-
-    if (tid == 0) {
-        float row_max = 0.0f;
-
-        for (int vec_col = 0;
-             vec_col < vec_cols;
-             ++vec_col) {
-
-            const float4 values =
-                shared_vec[vec_col];
-
-            row_max = fmaxf(row_max, fabsf(values.x));
-            row_max = fmaxf(row_max, fabsf(values.y));
-            row_max = fmaxf(row_max, fabsf(values.z));
-            row_max = fmaxf(row_max, fabsf(values.w));
-        }
-
-        const float output_scale =
-            (row_max > 0.0f && isfinite(row_max))
-                ? row_max * (1.0f / 127.0f)
-                : 1.0f;
-
-        out_scales[row] = output_scale;
-
-        // Broadcast the value actually needed by Stage 3.
-        shared_inverse_output_scale =
-            1.0f / output_scale;
-    }
-
-    __syncthreads();
-
-    const float inverse_output_scale =
-        shared_inverse_output_scale;
-
-    // --------------------------------------------------------
-    // Stage 3:
-    // Read four FP32 intermediates from shared memory,
-    // quantize them, and store four INT8 outputs using char4.
-    // --------------------------------------------------------
-
-    for (int vec_col = tid;
-         vec_col < vec_cols;
-         vec_col += blockDim.x) {
-
-        const float4 values =
-            shared_vec[vec_col];
-
-        const int8_t q0 =
-            quantize_int8_value(
-                values.x * inverse_output_scale
-            );
-
-        const int8_t q1 =
-            quantize_int8_value(
-                values.y * inverse_output_scale
-            );
-
-        const int8_t q2 =
-            quantize_int8_value(
-                values.z * inverse_output_scale
-            );
-
-        const int8_t q3 =
-            quantize_int8_value(
-                values.w * inverse_output_scale
-            );
-
-        const char4 quantized =
-            make_char4(
-                static_cast<char>(q0),
-                static_cast<char>(q1),
-                static_cast<char>(q2),
-                static_cast<char>(q3)
-            );
-
-        const int vec_index =
-            vec_row_offset + vec_col;
-
-        out_vec[vec_index] =
-            quantized;
-    }
-}
 
 // ============================================================
-// This kernel computes SiLU(x1) * x2 
-// This kernel uses hierachical warp-block reduction for the output scale computation.
+// This kernel computes SiLU(x1) * x2 with per-row quantization for input/output.
 //
 // Input:
 //   x1_int8  : INT8, [num_tokens, d_model]
 //   scale_x1 : FP32, [num_tokens]   (per-row quant scale for x1)
 //   x2_int8  : INT8, [num_tokens, d_model]
 //   scale_x2 : FP32, [num_tokens]   (per-row quant scale for x2)
-//   smooth_scale: FP32, [d_model] 
+//   smooth_scale: FP32, [num_tokens] (per-row smooth for quantization, optional)
 //
 // Output:
 //   y_int8   : INT8, [num_tokens, d_model]
-//   out_scales  : FP32, [num_tokens]  
+//   out_scales  : FP32, [num_tokens]   (per-row quant scale)
 // ============================================================
-__global__ void hierarchical_silu_mul_int8_kernel(
+
+__global__ void silu_mul_int8_kernel(
+    const int8_t* __restrict__ x1_int8,   // [rows, cols]
+    const int8_t* __restrict__ x2_int8,   // [rows, cols]
+    float* __restrict__ scale_x1,  // [rows]
+    float* __restrict__ scale_x2,  // [rows]
+    int8_t* __restrict__ out_int8,        // [rows, cols]
+    float* __restrict__ out_scales,       // [rows]
+    const float* __restrict__ smooth_scale, // [rows] 
+    int rows,
+    int cols
+) {
+    const int row = blockIdx.x;   // one block per row
+    if (row >= rows) return;
+
+    const int tid = threadIdx.x;
+    const int row_offset = row * cols;
+
+    const float s_x1 = scale_x1[row];
+    const float s_x2 = scale_x2[row];
+
+    extern __shared__ float sdata[];
+
+    // -------- Pass 1: compute max | y / s[j] | in this row --------
+    float local_max = 0.0f;
+
+    for (int col = tid; col < cols; col += blockDim.x) {
+        const int idx = row_offset + col;
+
+        // dequantize inputs
+        const float x1 = static_cast<float>(x1_int8[idx]) * s_x1;
+        const float x2 = static_cast<float>(x2_int8[idx]) * s_x2;
+
+        // exact float computation remains unchanged
+        const float silu = x1 / (1.0f + expf(-x1));
+        const float y = silu * x2;
+
+        // apply SmoothQuant-style output smoothing only before quantization
+        const float s = smooth_scale[col];
+        const float y_smooth = y / s;
+
+        const float a = fabsf(y_smooth);
+        if (a > local_max) local_max = a;
+    }
+
+    sdata[tid] = local_max;
+    __syncthreads();
+
+    // block reduction for row max
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (sdata[tid + stride] > sdata[tid]) {
+                sdata[tid] = sdata[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+
+    const float row_max = sdata[0];
+
+    __shared__ float shared_scale_out;
+    if (tid == 0) {
+        float scale_out = (row_max > 0.0f) ? (row_max / 127.0f) : 1.0f;
+        shared_scale_out = scale_out;
+        out_scales[row] = scale_out;
+    }
+    __syncthreads();
+
+    const float scale_out = shared_scale_out;
+    const float inv_scale_out = 1.0f / scale_out;
+
+    // -------- Pass 2: recompute y, smooth, quantize --------
+    for (int col = tid; col < cols; col += blockDim.x) {
+        const int idx = row_offset + col;
+
+        const float x1 = static_cast<float>(x1_int8[idx]) * s_x1;
+        const float x2 = static_cast<float>(x2_int8[idx]) * s_x2;
+
+        const float silu = x1 / (1.0f + expf(-x1));
+        const float y = silu * x2;
+
+        const float s = smooth_scale[col];
+        const float y_smooth = y / s;
+        
+        int q = __float2int_rn(y_smooth * inv_scale_out);
+
+        q = max(-127, min(127, q));
+
+        out_int8[idx] = static_cast<int8_t>(q);
+    }
+}
+
+// ============================================================
+// This kernel computes SiLU(x1) * x2 with per-row quantization for input/output.
+// This kernel uses hierarchical reduction for the max computation.
+//
+// Input:
+//   x1_int8  : INT8, [num_tokens, d_model]
+//   scale_x1 : FP32, [num_tokens]   (per-row quant scale for x1)
+//   x2_int8  : INT8, [num_tokens, d_model]
+//   scale_x2 : FP32, [num_tokens]   (per-row quant scale for x2)
+//   smooth_scale: FP32, [num_tokens] (per-row smooth for quantization, optional)
+//
+// Output:
+//   y_int8   : INT8, [num_tokens, d_model]
+//   out_scales  : FP32, [num_tokens]   (per-row quant scale)
+// ============================================================
+__global__ void silu_mul_int8_kernel_hierarchical_reduction(
     const int8_t* __restrict__ x1_int8,
     const int8_t* __restrict__ x2_int8,
     const float* __restrict__ scale_x1,
@@ -304,7 +205,7 @@ __global__ void hierarchical_silu_mul_int8_kernel(
         const float x1 = static_cast<float>(x1_int8[idx]) * s_x1;
         const float x2 = static_cast<float>(x2_int8[idx]) * s_x2;
 
-        const float silu = x1 / (1.0f + __expf(-x1));
+        const float silu = x1 / (1.0f + expf(-x1));
         const float y = silu * x2;
 
         const float s = smooth_scale[col];
@@ -317,10 +218,14 @@ __global__ void hierarchical_silu_mul_int8_kernel(
     const float row_max = block_reduce_max(local_max);
 
     __shared__ float shared_scale_out;
+
     if (tid == 0) {
-        float scale_out = (row_max > 0.0f) ? row_max / 127.0f : 1.0f;
-        out_scales[row] = scale_out;
+        float scale_out = (row_max > 0.0f && isfinite(row_max))
+                              ? row_max / 127.0f
+                              : 1.0f;
+
         shared_scale_out = scale_out;
+        out_scales[row] = scale_out;
     }
     __syncthreads();
 
@@ -330,18 +235,17 @@ __global__ void hierarchical_silu_mul_int8_kernel(
     for (int col = tid; col < cols; col += blockDim.x) {
         const int idx = row_offset + col;
 
-        // Compute SiLU(x1) * x2 and apply smoothing
         const float x1 = static_cast<float>(x1_int8[idx]) * s_x1;
         const float x2 = static_cast<float>(x2_int8[idx]) * s_x2;
 
-        const float silu = x1 / (1.0f + __expf(-x1));
+        const float silu = x1 / (1.0f + expf(-x1));
         const float y = silu * x2;
 
         const float s = smooth_scale[col];
         const float y_smooth = y / s;
 
-        // Quantize to INT8
         float qf = y_smooth * inv_scale_out;
+        if (!isfinite(qf)) qf = 0.0f;
 
         int q = __float2int_rn(qf);
         q = max(-127, min(127, q));
@@ -350,355 +254,175 @@ __global__ void hierarchical_silu_mul_int8_kernel(
     }
 }
 
-__device__ __forceinline__ float silu_fast(float x) {
-    return x * __fdividef( 1.0f, 1.0f + __expf(-x));
-}
-
-
-// ============================================================
-// Optimized hierarchical INT8 SiLU-multiply kernel
-//
-// Computes:
-//   y = SiLU(x1) * x2 * inv_smooth_scale
-//
-// Optimizations:
-//   - char4 vectorized INT8 loads
-//   - float4 inverse-smoothing loads
-//   - char4 vectorized INT8 stores
-//   - no per-element smoothing division
-//   - hierarchical reduction with two block barriers
-//
-// Requirements:
-//   - cols % 4 == 0
-//   - blockDim.x is a multiple of 32
-// ============================================================
-
-__global__ void hierarchical_silu_mul_int8_vec4_kernel(
-    const int8_t* __restrict__ x1_int8,
-    const int8_t* __restrict__ x2_int8,
-    const float* __restrict__ scale_x1,
-    const float* __restrict__ scale_x2,
-    const float* __restrict__ inv_smooth_scale,
-    int8_t* __restrict__ out_int8,
-    float* __restrict__ out_scales,
-    int rows,
-    int cols
-) {
-    const int row = blockIdx.x;
-
-    if (row >= rows) {
-        return;
-    }
-
-    const int tid = threadIdx.x;
-    const int vec_cols = cols >> 2;
-    const int vec_row_offset = row * vec_cols;
-
-    const float s_x1 = scale_x1[row];
-    const float s_x2 = scale_x2[row];
-
-    const char4* __restrict__ x1_vec =
-        reinterpret_cast<const char4*>(x1_int8);
-
-    const char4* __restrict__ x2_vec =
-        reinterpret_cast<const char4*>(x2_int8);
-
-    const float4* __restrict__ inv_smooth_vec =
-        reinterpret_cast<const float4*>(inv_smooth_scale);
-
-    char4* __restrict__ out_vec =
-        reinterpret_cast<char4*>(out_int8);
-
-    // --------------------------------------------------------
-    // Pass 1: compute row maximum.
-    // --------------------------------------------------------
-
-    float local_max = 0.0f;
-
-    for (int vec_col = tid;
-         vec_col < vec_cols;
-         vec_col += blockDim.x) {
-
-        const int vec_index =
-            vec_row_offset + vec_col;
-
-        const char4 qx1 = x1_vec[vec_index];
-        const char4 qx2 = x2_vec[vec_index];
-
-        const float4 inv_smooth =
-            inv_smooth_vec[vec_col];
-
-        const float x1_0 = static_cast<float>(qx1.x) * s_x1;
-        const float x1_1 = static_cast<float>(qx1.y) * s_x1;
-        const float x1_2 = static_cast<float>(qx1.z) * s_x1;
-        const float x1_3 = static_cast<float>(qx1.w) * s_x1;
-
-        const float x2_0 = static_cast<float>(qx2.x) * s_x2;
-        const float x2_1 = static_cast<float>(qx2.y) * s_x2;
-        const float x2_2 = static_cast<float>(qx2.z) * s_x2;
-        const float x2_3 = static_cast<float>(qx2.w) * s_x2;
-
-        const float y0 =
-            silu_fast(x1_0) * x2_0 * inv_smooth.x;
-
-        const float y1 =
-            silu_fast(x1_1) * x2_1 * inv_smooth.y;
-
-        const float y2 =
-            silu_fast(x1_2) * x2_2 * inv_smooth.z;
-
-        const float y3 =
-            silu_fast(x1_3) * x2_3 * inv_smooth.w;
-
-        local_max = fmaxf(local_max, fabsf(y0));
-        local_max = fmaxf(local_max, fabsf(y1));
-        local_max = fmaxf(local_max, fabsf(y2));
-        local_max = fmaxf(local_max, fabsf(y3));
-    }
-
-    const float row_max = block_reduce_max(local_max);
-
-    // Store the reciprocal directly because that is what every
-    // thread uses during quantization.
-    __shared__ float shared_inv_output_scale;
-
-    if (tid == 0) {
-        const float output_scale =
-            row_max > 0.0f
-                ? row_max * (1.0f / 127.0f)
-                : 1.0f;
-
-        out_scales[row] = output_scale;
-
-        shared_inv_output_scale =
-            1.0f / output_scale;
-    }
-
-    __syncthreads();
-
-    const float inv_output_scale =
-        shared_inv_output_scale;
-
-    // --------------------------------------------------------
-    // Pass 2: recompute and quantize four outputs at a time.
-    // --------------------------------------------------------
-
-    for (int vec_col = tid;
-         vec_col < vec_cols;
-         vec_col += blockDim.x) {
-
-        const int vec_index =
-            vec_row_offset + vec_col;
-
-        const char4 qx1 = x1_vec[vec_index];
-        const char4 qx2 = x2_vec[vec_index];
-
-        const float4 inv_smooth =
-            inv_smooth_vec[vec_col];
-
-        const float x1_0 = static_cast<float>(qx1.x) * s_x1;
-        const float x1_1 = static_cast<float>(qx1.y) * s_x1;
-        const float x1_2 = static_cast<float>(qx1.z) * s_x1;
-        const float x1_3 = static_cast<float>(qx1.w) * s_x1;
-
-        const float x2_0 = static_cast<float>(qx2.x) * s_x2;
-        const float x2_1 = static_cast<float>(qx2.y) * s_x2;
-        const float x2_2 = static_cast<float>(qx2.z) * s_x2;
-        const float x2_3 = static_cast<float>(qx2.w) * s_x2;
-
-        const float y0 =
-            silu_fast(x1_0) * x2_0 *
-            inv_smooth.x * inv_output_scale;
-
-        const float y1 =
-            silu_fast(x1_1) * x2_1 *
-            inv_smooth.y * inv_output_scale;
-
-        const float y2 =
-            silu_fast(x1_2) * x2_2 *
-            inv_smooth.z * inv_output_scale;
-
-        const float y3 =
-            silu_fast(x1_3) * x2_3 *
-            inv_smooth.w * inv_output_scale;
-
-        const char4 quantized = make_char4(
-            static_cast<char>(quantize_int8(y0)),
-            static_cast<char>(quantize_int8(y1)),
-            static_cast<char>(quantize_int8(y2)),
-            static_cast<char>(quantize_int8(y3))
-        );
-
-        out_vec[vec_index] = quantized;
-    }
-}
-
-void check_silu_mul_int8_inputs(
-    const torch::Tensor& x1_i8,
-    const torch::Tensor& scale_x1,
-    const torch::Tensor& x2_i8,
-    const torch::Tensor& scale_x2,
-    const torch::Tensor& smooth_scale
-) {
-    // ------------------------------------------------------------
-    // Device checks
-    // ------------------------------------------------------------
-    TORCH_CHECK(
-        x1_i8.is_cuda() && x2_i8.is_cuda() &&
-        scale_x1.is_cuda() && scale_x2.is_cuda() && smooth_scale.is_cuda(),
-        "All tensors must be CUDA tensors"
-    );
-
-    TORCH_CHECK(
-        x1_i8.device() == x2_i8.device() &&
-        x1_i8.device() == scale_x1.device() &&
-        x1_i8.device() == scale_x2.device() &&
-        x1_i8.device() == smooth_scale.device(),
-        "All tensors must be on the same CUDA device"
-    );
-
-    // ------------------------------------------------------------
-    // Data type checks
-    // ------------------------------------------------------------
-    TORCH_CHECK(
-        x1_i8.scalar_type() == torch::kInt8 && x2_i8.scalar_type() == torch::kInt8,
-        "x1_i8 and x2_i8 must have dtype torch.int8"
-    );
-
-    TORCH_CHECK(
-        scale_x1.scalar_type() == torch::kFloat32 &&
-        scale_x2.scalar_type() == torch::kFloat32 &&
-        smooth_scale.scalar_type() == torch::kFloat32,
-        "scale_x1, scale_x2, and smooth_scale must have dtype torch.float32"
-    );
-
-    // ------------------------------------------------------------
-    // Shape checks
-    // ------------------------------------------------------------
-
-    TORCH_CHECK(
-        x1_i8.dim() == 2 || x1_i8.dim() == 3, "Inputs must have shape [T, D] or [B, T, D]"
-    );
-
-    TORCH_CHECK(
-        x1_i8.sizes() == x2_i8.sizes(), "x1_i8 and x2_i8 must have identical shapes"
-    );
-
-    TORCH_CHECK(
-        x1_i8.numel() > 0,
-        "Input tensors must not be empty"
-    );
-
-    const int64_t cols = x1_i8.size(-1);
-    const int64_t rows = x1_i8.numel() / cols;
-
-    // For [T, D], scale shape is [T].
-    // For [B, T, D], scale shape is [B, T].
-    TORCH_CHECK(
-        scale_x1.dim() == x1_i8.dim() - 1 &&
-        scale_x2.dim() == x1_i8.dim() - 1,
-        "Input scales must have one fewer dimension than the inputs"
-    );
-
-    TORCH_CHECK(
-        scale_x1.sizes() == scale_x2.sizes(),
-        "scale_x1 and scale_x2 must have identical shapes"
-    );
-
-    TORCH_CHECK(
-        scale_x1.numel() == rows && scale_x2.numel() == rows,
-        "Input scales must contain one value per logical row. Expected ",
-        rows, " values"
-    );
-
-
-    TORCH_CHECK(
-        smooth_scale.dim() == 1 &&
-        smooth_scale.numel() == cols,
-        "smooth_scale must have shape [D], where D = ",
-        cols
-    );
-}
-
 std::tuple<torch::Tensor, torch::Tensor> silu_mul_int8_cuda(
-    torch::Tensor x1_int8,
+    torch::Tensor x1_int8, 
     torch::Tensor scale_x1,
-    torch::Tensor x2_int8,
+    torch::Tensor x2_int8, 
     torch::Tensor scale_x2,
-    torch::Tensor smooth_scale,
+    torch::Tensor smooth_scale, 
     bool use_warp_reduction
 ) {
-    check_silu_mul_int8_inputs(
-        x1_int8,
-        scale_x1,
-        x2_int8,
-        scale_x2,
-        smooth_scale
+    TORCH_CHECK(x1_int8.is_cuda() && x2_int8.is_cuda(), 
+                "Input int8 tensors must be CUDA");
+    TORCH_CHECK(scale_x1.is_cuda() && scale_x2.is_cuda(), 
+                "Scale tensors must be CUDA");
+    TORCH_CHECK(smooth_scale.is_cuda(), 
+                "Smooth scale tensor must be CUDA");
+
+    TORCH_CHECK(x1_int8.dtype() == torch::kChar && 
+                x2_int8.dtype() == torch::kChar, 
+                "Input tensors must be int8");
+
+    TORCH_CHECK(scale_x1.dtype() == torch::kFloat32 && 
+                scale_x2.dtype() == torch::kFloat32, 
+                "Scale tensors must be float32");
+
+    TORCH_CHECK(smooth_scale.dtype() == torch::kFloat32, 
+                "Smooth scale tensor must be float32");
+
+    TORCH_CHECK(x1_int8.sizes() == x2_int8.sizes(), 
+                "Input tensor sizes must match");
+
+    TORCH_CHECK(x1_int8.dim() == 2 || x1_int8.dim() == 3,
+                "x1_int8 must be 2D [T, D] or 3D [B, T, D]");
+    TORCH_CHECK(x2_int8.dim() == x1_int8.dim(),
+                "x2_int8 must have same number of dims as x1_int8");
+
+    TORCH_CHECK(smooth_scale.dim() == 1, 
+                "smooth_scale must be 1D");
+
+    const bool is_batched = x1_int8.dim() == 3;
+
+    int64_t B = 1;
+    int64_t T;
+    int64_t D;
+    int64_t rows;
+    int64_t cols;
+
+    std::vector<int64_t> out_shape;
+    std::vector<int64_t> scale_out_shape;
+
+    torch::Tensor x1_2d;
+    torch::Tensor x2_2d;
+    torch::Tensor scale_x1_1d;
+    torch::Tensor scale_x2_1d;
+
+    if (!is_batched) {
+        // ------------------------------------------------------------
+        // 2D case:
+        // x1_int8:  [T, D]
+        // scale_x1: [T]
+        // ------------------------------------------------------------
+        T = x1_int8.size(0);
+        D = x1_int8.size(1);
+
+        TORCH_CHECK(scale_x1.dim() == 1 && scale_x2.dim() == 1,
+                    "For 2D input, scale_x1 and scale_x2 must be 1D [T]");
+
+        TORCH_CHECK(scale_x1.size(0) == T &&
+                    scale_x2.size(0) == T,
+                    "For 2D input, scale size must match T");
+
+        x1_2d = x1_int8.contiguous();
+        x2_2d = x2_int8.contiguous();
+
+        scale_x1_1d = scale_x1.contiguous();
+        scale_x2_1d = scale_x2.contiguous();
+
+        rows = T;
+        cols = D;
+
+        out_shape = {T, D};
+        scale_out_shape = {T};
+    } else {
+        // ------------------------------------------------------------
+        // 3D case:
+        // x1_int8:  [B, T, D]
+        // scale_x1: [B, T]
+        // ------------------------------------------------------------
+        B = x1_int8.size(0);
+        T = x1_int8.size(1);
+        D = x1_int8.size(2);
+
+        TORCH_CHECK(scale_x1.dim() == 2 && scale_x2.dim() == 2,
+                    "For 3D input, scale_x1 and scale_x2 must be 2D [B, T]");
+
+        TORCH_CHECK(scale_x1.size(0) == B &&
+                    scale_x1.size(1) == T,
+                    "scale_x1 must have shape [B, T]");
+
+        TORCH_CHECK(scale_x2.size(0) == B &&
+                    scale_x2.size(1) == T,
+                    "scale_x2 must have shape [B, T]");
+
+        x1_2d = x1_int8.contiguous().reshape({B * T, D});
+        x2_2d = x2_int8.contiguous().reshape({B * T, D});
+
+        scale_x1_1d = scale_x1.contiguous().reshape({B * T});
+        scale_x2_1d = scale_x2.contiguous().reshape({B * T});
+
+        rows = B * T;
+        cols = D;
+
+        out_shape = {B, T, D};
+        scale_out_shape = {B, T};
+    }
+
+    TORCH_CHECK(smooth_scale.size(0) == D,
+                "smooth_scale size must match last dimension D");
+
+    auto smooth_scale_contig = smooth_scale.contiguous();
+
+    auto out_int8_2d = torch::empty(
+        {rows, cols},
+        x1_int8.options()
     );
 
-    const c10::cuda::CUDAGuard device_guard(x1_int8.device());
+    auto out_scales_1d = torch::empty(
+        {rows},
+        torch::dtype(torch::kFloat32).device(x1_int8.device())
+    );
 
-    // Make each tensor contiguous. No explicit reshape is required:
-    // [T, D] and [B, T, D] can both be interpreted as [rows, D].
-    x1_int8 = x1_int8.contiguous();
-    x2_int8 = x2_int8.contiguous();
-    scale_x1 = scale_x1.contiguous();
-    scale_x2 = scale_x2.contiguous();
-    smooth_scale = smooth_scale.contiguous();
+    int threads = 256;
+    dim3 block(threads);
+    dim3 grid(rows);
 
-    const int cols = static_cast<int>(x1_int8.size(-1));
-    const int rows = static_cast<int>(x1_int8.numel() / cols);
+    auto stream = at::cuda::getCurrentCUDAStream();
 
-    // Construct output tensors. 
-    auto out_int8 = torch::empty_like(x1_int8);
-    auto out_scales = torch::empty_like(scale_x1);
+    if (use_warp_reduction == false) {
+        size_t shared_mem_size = threads * sizeof(float);
 
-    const int threads = BLOCK_SIZE;
-    const dim3 block(threads);
-    const dim3 grid(rows);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(x1_int8.get_device()).stream();
-
-    if (use_warp_reduction) {
-        // hierarchical_silu_mul_int8_kernel<<<grid, block, 0, stream>>>(
-        //     x1_int8.data_ptr<int8_t>(),
-        //     x2_int8.data_ptr<int8_t>(),
-        //     scale_x1.data_ptr<float>(),
-        //     scale_x2.data_ptr<float>(),
-        //     out_int8.data_ptr<int8_t>(),
-        //     out_scales.data_ptr<float>(),
-        //     smooth_scale.data_ptr<float>(),
-        //     rows,
-        //     cols
-        // );
-        hierarchical_silu_mul_int8_vec4_kernel<<<grid, block, 0, stream>>>(
-            x1_int8.data_ptr<int8_t>(),
-            x2_int8.data_ptr<int8_t>(),
-            scale_x1.data_ptr<float>(),
-            scale_x2.data_ptr<float>(),
-            smooth_scale.data_ptr<float>(),
-            out_int8.data_ptr<int8_t>(),
-            out_scales.data_ptr<float>(),
-            rows,
-            cols
+        silu_mul_int8_kernel<<<grid, block, shared_mem_size, stream>>>(
+            x1_2d.data_ptr<int8_t>(),
+            x2_2d.data_ptr<int8_t>(),
+            scale_x1_1d.data_ptr<float>(),
+            scale_x2_1d.data_ptr<float>(),
+            out_int8_2d.data_ptr<int8_t>(),
+            out_scales_1d.data_ptr<float>(),
+            smooth_scale_contig.data_ptr<float>(),
+            static_cast<int>(rows),
+            static_cast<int>(cols)
         );
     } else {
-        const size_t shared_memory_bytes = static_cast<size_t>(cols) * sizeof(float);
-
-        naive_silu_mul_int8_vec4_kernel<<<grid, block, shared_memory_bytes, stream>>>(
-            x1_int8.data_ptr<int8_t>(),
-            x2_int8.data_ptr<int8_t>(),
-            scale_x1.data_ptr<float>(),
-            scale_x2.data_ptr<float>(),
-            out_int8.data_ptr<int8_t>(),
-            out_scales.data_ptr<float>(),
-            smooth_scale.data_ptr<float>(),
-            rows,
-            cols
+        silu_mul_int8_kernel_hierarchical_reduction<<<grid, block, 0, stream>>>(
+            x1_2d.data_ptr<int8_t>(),
+            x2_2d.data_ptr<int8_t>(),
+            scale_x1_1d.data_ptr<float>(),
+            scale_x2_1d.data_ptr<float>(),
+            out_int8_2d.data_ptr<int8_t>(),
+            out_scales_1d.data_ptr<float>(),
+            smooth_scale_contig.data_ptr<float>(),
+            static_cast<int>(rows),
+            static_cast<int>(cols)
         );
     }
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {out_int8, out_scales};
+
+    auto out_int8 = out_int8_2d.reshape(out_shape);
+    auto out_scales = out_scales_1d.reshape(scale_out_shape);
+
+    return std::make_tuple(out_int8, out_scales);
 }
 
 
@@ -984,17 +708,13 @@ __global__ void silu_mul_bf16_vec4_kernel(
         // Compute four SiLU-multiply outputs in FP32.
         // ----------------------------------------------------
 
-        const float silu_0 =
-            x1_01.x / (1.0f + __expf(-x1_01.x));
+        const float silu_0 = x1_01.x / (1.0f + expf(-x1_01.x));
 
-        const float silu_1 =
-            x1_01.y / (1.0f + __expf(-x1_01.y));
+        const float silu_1 = x1_01.y / (1.0f + expf(-x1_01.y));
 
-        const float silu_2 =
-            x1_23.x / (1.0f + __expf(-x1_23.x));
+        const float silu_2 = x1_23.x / (1.0f + expf(-x1_23.x));
 
-        const float silu_3 =
-            x1_23.y / (1.0f + __expf(-x1_23.y));
+        const float silu_3 = x1_23.y / (1.0f + expf(-x1_23.y));
 
         const float out_0 =
             silu_0 * x2_01.x / smooth.x;
@@ -1193,10 +913,10 @@ __global__ void hierarchical_silu_int8_vec4_kernel(
         const float x2 = static_cast<float>(qx.z) * input_scale;
         const float x3 = static_cast<float>(qx.w) * input_scale;
 
-        const float y0 = silu_fast(x0);
-        const float y1 = silu_fast(x1);
-        const float y2 = silu_fast(x2);
-        const float y3 = silu_fast(x3);
+        const float y0 = silu_float(x0);
+        const float y1 = silu_float(x1);
+        const float y2 = silu_float(x2);
+        const float y3 = silu_float(x3);
 
         local_max = fmaxf(local_max, fabsf(y0));
         local_max = fmaxf(local_max, fabsf(y1));
@@ -1239,10 +959,10 @@ __global__ void hierarchical_silu_int8_vec4_kernel(
         const float x2 = static_cast<float>(qx.z) * input_scale;
         const float x3 =static_cast<float>(qx.w) * input_scale;
 
-        const float y0 = silu_fast(x0) * inv_output_scale;
-        const float y1 = silu_fast(x1) * inv_output_scale;
-        const float y2 = silu_fast(x2) * inv_output_scale;
-        const float y3 = silu_fast(x3) * inv_output_scale;
+        const float y0 = silu_float(x0) * inv_output_scale;
+        const float y1 = silu_float(x1) * inv_output_scale;
+        const float y2 = silu_float(x2) * inv_output_scale;
+        const float y3 = silu_float(x3) * inv_output_scale;
 
         const char4 qout = make_char4(
             static_cast<char>(quantize_int8(y0)),
@@ -1374,8 +1094,8 @@ __global__ void silu_bf16_vec2_kernel(
         // Convert both BF16 values to FP32.
         const float2 x_float = __bfloat1622float2(x_pair);
 
-        const float y0 = silu_fast(x_float.x);
-        const float y1 = silu_fast(x_float.y);
+        const float y0 = silu_float(x_float.x);
+        const float y1 = silu_float(x_float.y);
 
         // Convert the two FP32 results back to BF16.
         const __nv_bfloat162 y_pair =

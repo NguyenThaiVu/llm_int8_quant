@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import gemm_cutlass
 from utils_quant import quantize_row_int8_symmetric_nd, quantize_tensor
 
-MAX_SEQ_LEN = 1040 # 576 or 1040 or 2112
+MAX_SEQ_LEN = 2112 # 576 or 1040 or 2112
 BATCH_SIZE = 1 # 1, 2, 16, 64, 128
 
         
@@ -502,8 +502,7 @@ class Custom_FeedForward(nn.Module):
     def __init__(self, cfg):
         super().__init__()
 
-        self.fc1 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"],\
-                                        max_seq_len=MAX_SEQ_LEN)
+        self.fc1 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"], max_seq_len=MAX_SEQ_LEN)
         self.fc2 = Custom_Linear(cfg["emb_dim"], cfg["hidden_dim"],\
                                         max_seq_len=MAX_SEQ_LEN)
         self.fc3 = Custom_Linear(cfg["hidden_dim"], cfg["emb_dim"],\

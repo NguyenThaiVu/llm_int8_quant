@@ -244,17 +244,113 @@ def evaluate_arc(
 
         correct += int(predicted == answer_key)
         correct_norm += int(predicted_norm == answer_key)
-
-        if (i + 1) % 100 == 0:
-            print(
-                f"{subset}: {i + 1}/{len(dataset)} | "
-                f"acc={correct / (i + 1):.4f} | "
-                f"acc_norm={correct_norm / (i + 1):.4f}"
-            )
-
+        
     return {
         "task": subset,
         "acc": correct / len(dataset),
         "acc_norm": correct_norm / len(dataset),
         "num_samples": len(dataset),
+    }
+    
+    
+# =============================================================================
+# PIQA evaluation
+# =============================================================================
+def piqa_prompt(example):
+    return f"Question: {example['goal']}\nAnswer:"
+
+@torch.inference_mode()
+def evaluate_piqa(
+    model,
+    tokenizer,
+    device,
+    split="validation",
+    max_samples=None,
+):
+    """
+    Evaluate a causal language model on PIQA.
+
+    PIQA fields:
+        goal:  physical-reasoning question
+        sol1:  first candidate solution
+        sol2:  second candidate solution
+        label: 0 if sol1 is correct, 1 if sol2 is correct
+
+    Returns:
+        acc:
+            Accuracy using total candidate log-likelihood.
+
+        acc_norm:
+            Accuracy using average log-likelihood per candidate token.
+    """
+
+    # This is the dataset path currently used by lm-evaluation-harness.
+    dataset = load_dataset(
+        "baber/piqa",
+        split=split,
+    )
+
+    if max_samples is not None:
+        dataset = dataset.select(
+            range(min(max_samples, len(dataset)))
+        )
+
+    model.eval()
+
+    correct = 0
+    correct_norm = 0
+
+    for i, example in enumerate(dataset):
+        prompt = piqa_prompt(example)
+
+        choices = [
+            example["sol1"],
+            example["sol2"],
+        ]
+
+        answer_index = int(example["label"])
+
+        scores = [
+            score_choice(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                choice=choice,
+                device=device,
+            )
+            for choice in choices
+        ]
+
+        raw_scores = [
+            total_score
+            for total_score, normalized_score in scores
+        ]
+
+        norm_scores = [
+            normalized_score
+            for total_score, normalized_score in scores
+        ]
+
+        predicted_index = max(
+            range(len(raw_scores)),
+            key=raw_scores.__getitem__,
+        )
+
+        predicted_norm_index = max(
+            range(len(norm_scores)),
+            key=norm_scores.__getitem__,
+        )
+
+        correct += int(predicted_index == answer_index)
+        correct_norm += int(
+            predicted_norm_index == answer_index
+        )
+
+    num_samples = len(dataset)
+
+    return {
+        "task": "PIQA",
+        "acc": correct / num_samples,
+        "acc_norm": correct_norm / num_samples,
+        "num_samples": num_samples,
     }
