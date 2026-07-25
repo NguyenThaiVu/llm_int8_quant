@@ -39,17 +39,6 @@ inline int heuristic_block_size(int cols) {
 //   - input/output pointers must be suitably aligned
 // ============================================================
 
-__device__ __forceinline__ int8_t quantize_int8_value(float value) {
-    if (!isfinite(value)) {
-        value = 0.0f;
-    }
-
-    int q = __float2int_rn(value);
-    q = max(-127, min(127, q));
-
-    return static_cast<int8_t>(q);
-}
-
 __device__ __forceinline__ float silu_float(float x) {
     return x / (1.0f + expf(-x));
 }
@@ -163,7 +152,7 @@ __global__ void silu_mul_int8_kernel(
 
 // ============================================================
 // This kernel computes SiLU(x1) * x2 with per-row quantization for input/output.
-// This kernel uses hierarchical reduction for the max computation.
+// This kernel uses warp-level reduction for the max computation.
 //
 // Input:
 //   x1_int8  : INT8, [num_tokens, d_model]
@@ -176,7 +165,7 @@ __global__ void silu_mul_int8_kernel(
 //   y_int8   : INT8, [num_tokens, d_model]
 //   out_scales  : FP32, [num_tokens]   (per-row quant scale)
 // ============================================================
-__global__ void silu_mul_int8_kernel_hierarchical_reduction(
+__global__ void silu_mul_int8_kernel_warp_reduction(
     const int8_t* __restrict__ x1_int8,
     const int8_t* __restrict__ x2_int8,
     const float* __restrict__ scale_x1,
@@ -383,7 +372,16 @@ std::tuple<torch::Tensor, torch::Tensor> silu_mul_int8_cuda(
         torch::dtype(torch::kFloat32).device(x1_int8.device())
     );
 
-    int threads = 256;
+    int threads = static_cast<int>(std::min<int64_t>(cols, 512));
+
+    if (threads & (threads - 1)) {
+        int p = 1;
+        while ((p << 1) <= threads) p <<= 1;
+        threads = p;
+    }
+
+    threads = std::max(threads, 32);
+
     dim3 block(threads);
     dim3 grid(rows);
 
@@ -404,7 +402,7 @@ std::tuple<torch::Tensor, torch::Tensor> silu_mul_int8_cuda(
             static_cast<int>(cols)
         );
     } else {
-        silu_mul_int8_kernel_hierarchical_reduction<<<grid, block, 0, stream>>>(
+        silu_mul_int8_kernel_warp_reduction<<<grid, block, 0, stream>>>(
             x1_2d.data_ptr<int8_t>(),
             x2_2d.data_ptr<int8_t>(),
             scale_x1_1d.data_ptr<float>(),

@@ -19,47 +19,36 @@ __device__ __forceinline__ int8_t quantize_int8(float value) {
 }
 
 
-__device__ __forceinline__ float warp_reduce_max(float value) {
-    #pragma unroll
+inline __device__ float warp_reduce_max(float v) {
+    unsigned mask = 0xffffffffu;
     for (int offset = 16; offset > 0; offset >>= 1) {
-        value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, offset));
+        v = fmaxf(v, __shfl_down_sync(mask, v, offset));
     }
-    return value;
+    return v;
 }
 
-__device__ __forceinline__ float block_reduce_max(float value) {
-    __shared__ float warp_maxima[32];
+inline __device__ float block_reduce_max(float v) {
+    __shared__ float smem[32];
+    int lane = threadIdx.x & 31; // index within the warp
+    int warp = threadIdx.x >> 5; // warp index within the block
 
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    const int num_warps = blockDim.x >> 5;
+    v = warp_reduce_max(v);
 
-    // Level 1: reduce inside each warp.
-    value = warp_reduce_max(value);
-
-    if (lane == 0) {
-        warp_maxima[warp] = value;
-    }
-
+    if (lane == 0) smem[warp] = v;
     __syncthreads();
 
-    // Level 2: first warp reduces the warp-level results.
-    float block_max = 0.0f;
-
+    // Only the first warp will read the results from shared memory
+    float out = 0.0f;
     if (warp == 0) {
-        block_max = lane < num_warps ? warp_maxima[lane] : 0.0f;
-
-        block_max = warp_reduce_max(block_max);
-
-        if (lane == 0) {
-            warp_maxima[0] = block_max;
-        }
+        int nw = (blockDim.x + 31) >> 5;  // number of warps in the block
+        out = (lane < nw) ? smem[lane] : 0.0f;
+        out = warp_reduce_max(out);
     }
-
-    // Broadcast final result to all threads.
     __syncthreads();
 
-    return warp_maxima[0];
+    if (threadIdx.x == 0) smem[0] = out;
+    __syncthreads();
+    return smem[0];
 }
 
 /*

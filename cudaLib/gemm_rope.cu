@@ -262,3 +262,4 @@ std::tuple<torch::Tensor, torch::Tensor> rope_int8_host(
 
     return std::make_tuple(out, scale_out);
 }
+

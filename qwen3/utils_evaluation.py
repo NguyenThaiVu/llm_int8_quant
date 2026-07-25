@@ -189,9 +189,7 @@ def evaluate_arc(
     max_samples=None,
 ):
     if subset not in {"ARC-Easy", "ARC-Challenge"}:
-        raise ValueError(
-            "subset must be 'ARC-Easy' or 'ARC-Challenge'"
-        )
+        raise ValueError("subset must be 'ARC-Easy' or 'ARC-Challenge'")
 
     dataset = load_dataset(
         "allenai/ai2_arc",
@@ -200,9 +198,7 @@ def evaluate_arc(
     )
 
     if max_samples is not None:
-        dataset = dataset.select(
-            range(min(max_samples, len(dataset)))
-        )
+        dataset = dataset.select(range(min(max_samples, len(dataset))))
 
     model.eval()
 
