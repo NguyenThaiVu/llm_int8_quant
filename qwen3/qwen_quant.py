@@ -21,7 +21,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "32B"  # Options: "4B", "8B", "14B"
 
 class Qwen3Model_Quant(nn.Module):
     def __init__(self, cfg):
@@ -180,7 +180,7 @@ if __name__ == "__main__":
     # ================================================================
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=2_000)
+                                                    split="train", n=10_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             
@@ -199,8 +199,9 @@ if __name__ == "__main__":
     # ========================================================================
     # Quantization mode
     print("\n===== Generated text after quantization: =====\n")
-    list_prompts = ["What is the capital of VietNam?",\
-                    "What is the Dragon Ball story?"]
+    # list_prompts = ["What is the capital of VietNam?",\
+    #                 "What is the Dragon Ball story?"]
+    list_prompts = ["What is the capital of VietNam?"]
 
     for idx, prompt in enumerate(list_prompts):
         input_token_ids = tokenizer.encode(prompt)

@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # select GPU "0", "1", "2",...
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # select GPU "0", "1", "2",...
 from pathlib import Path
 import zipfile
 import math
@@ -26,7 +26,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "32B"  # Options: "4B", "8B", "14B"
 
 if __name__ == "__main__":
     

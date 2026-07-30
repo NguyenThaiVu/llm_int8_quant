@@ -13,11 +13,11 @@ from config import get_llama_config
 from tokenizer import Tokenizer
 from utils_weight import load_weights_into_llama    
 from utils_generation import *
-from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text
+from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text, evaluate_arc, evaluate_piqa
 from utils_model import print_tensor_memory_all_attrs
 
 
-LLAMA_SIZE_STR = "3B" # "1B" or "3B"
+LLAMA_SIZE_STR = "1B" # "1B" or "3B"
 IS_INSTRUCT = True # True or False
 
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
@@ -188,3 +188,44 @@ torch.cuda.synchronize()
 end_time = time.time()
 avg_latency = (end_time - start_time) / n_iter
 print(f"Average latency per run: {avg_latency:.4f} seconds")
+
+# ===============================================
+# 5. ARC-Easy evaluation
+# ================================================================
+NUM_ARC_SAMPLES = None  # Use None for the complete test set
+# DATASET_ARC = "ARC-Easy"  # Options: "ARC-Easy", "ARC-Challenge"
+list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
+for DATASET_ARC in list_data_set_arc:
+    print(f"[INFO] Start {DATASET_ARC} Evaluation... \n")
+    
+    arc_result = evaluate_arc(
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        subset=DATASET_ARC,
+        max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
+    )
+    print(f"\n{DATASET_ARC} results")
+    print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
+    print(f"Number of questions: {arc_result['num_samples']}")
+    print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
+    print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}%")
+
+# ================================================================
+# 7. PIQA evaluation
+# ================================================================
+NUM_PIQA_SAMPLES = None  # None uses the complete validation set
+print("[INFO] Start PIQA Evaluation...\n")
+
+piqa_result = evaluate_piqa(
+    model=model,
+    tokenizer=tokenizer,
+    device=device,
+    max_samples=NUM_PIQA_SAMPLES,
+)
+
+print("\nPIQA results")
+print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
+print(f"Number of questions: {piqa_result['num_samples']}")
+print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
+print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")
