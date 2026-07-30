@@ -16,7 +16,7 @@ from utils_generation import *
 from utils_evaluation import *
 
 
-LLAMA_SIZE_STR = "3B" # "1B" or "3B"
+LLAMA_SIZE_STR = "1B" # "1B" or "3B"
 IS_INSTRUCT = True # True or False
 
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
@@ -100,7 +100,6 @@ del combined_weights  # free up memory
 # ===============================================
 # 4. Generate Text
 # ===============================================
-
 MAX_GENERATED_TOKENS = 2048
 PPL_CONTEXT_TOKENS = 2048
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
@@ -110,12 +109,11 @@ EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 # ================================================
 # Evaluation Latency
 # ===============================================
+model.eval()  
 
 samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
 samples = tokenizer.encode(samples)
-
 chunk_tokens = samples[0: PPL_CONTEXT_TOKENS]
-
 input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
 print(f"[INFO] Input tokens: {input_ids.shape}")
 
@@ -123,19 +121,19 @@ with torch.no_grad():
     out_ids = model(input_ids)
 print(f"[INFO] Output tokens: {out_ids.shape}")
 
-# Measure Latency
-for _ in range(5):
-    with torch.no_grad():
-        out_ids = model(input_ids)
+# # Measure Latency
+# for _ in range(5):
+#     with torch.no_grad():
+#         out_ids = model(input_ids)
         
-n_iter = 10
-start_time = time.time()
-for _ in range(n_iter):
-    with torch.no_grad():
-        out_ids = model(input_ids)
-end_time = time.time()
-avg_latency = (end_time - start_time) / n_iter
-print(f"\n[INFO] Average latency: {avg_latency:.4f} seconds per generation (BATCH = 1).")
+# n_iter = 10
+# start_time = time.time()
+# for _ in range(n_iter):
+#     with torch.no_grad():
+#         out_ids = model(input_ids)
+# end_time = time.time()
+# avg_latency = (end_time - start_time) / n_iter
+# print(f"\n[INFO] Average latency: {avg_latency:.4f} seconds per generation (BATCH = 1).")
     
 print(f"\nProfiling the model...")
 with torch.profiler.profile(
