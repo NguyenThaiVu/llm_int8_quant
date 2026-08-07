@@ -89,3 +89,5 @@ def measure_time(func, *args, repeat=100):
     torch.cuda.synchronize()
     elapsed_time = start_event.elapsed_time(end_event) / repeat
     return elapsed_time
+
+
