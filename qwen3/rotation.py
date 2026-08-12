@@ -58,7 +58,6 @@ def apply_block_hadamard_rotate(x, H, block_size=256):
 
 
 
-
 if __name__ == "__main__":
     d_type = torch.bfloat16
     M = 2048
@@ -73,10 +72,8 @@ if __name__ == "__main__":
     # ============================================================
     # 1. Float computation
     Y = X @ W.T
-    print(f"Shape of Y: {Y.shape}")
     torch_time = measure_time(torch.matmul, X, W.T)
     print(f"Time for torch.matmul: {torch_time:.6f} ms")
-    
     
     # ============================================================
     # 2. Quantization without rotation
@@ -93,8 +90,7 @@ if __name__ == "__main__":
     # 2. Quantization with rotation
     # R = create_hadamard_normalized_matrix(K)
     
-    rotation_block_size = 256
-    # H = create_hadamard_normalized_matrix(rotation_block_size)
+    H = create_hadamard_normalized_matrix(256)
     
     # # X_rot = apply_block_hadamard_rotate(X, H, block_size=256)
     # # W_rot = apply_block_hadamard_rotate(W, H, block_size=256)
@@ -105,8 +101,11 @@ if __name__ == "__main__":
     # # Quantize the rotated matrices
     # X_rot_i8, scale_x_rot = quantize_row_int8_symmetric_nd(X_rot)
     # W_rot_i8, scale_w_rot = quantize_row_int8_symmetric_nd(W_rot)
-    X_rot_i8, scale_x_rot = gemm_cutlass.func_fusion_hadamard_quant(X)
-    W_rot_i8, scale_w_rot = gemm_cutlass.func_fusion_hadamard_quant(W)
+    X_rot = apply_block_hadamard_rotate(X, H)
+    X_rot_i8, scale_x_rot = quantize_row_int8_symmetric_nd(X_rot)
+    
+    W_rot = apply_block_hadamard_rotate(W, H)
+    W_rot_i8, scale_w_rot = quantize_row_int8_symmetric_nd(W_rot)
     
     Y_rot_deq = gemm_cutlass.func_w8a8_matmul(X_rot_i8, W_rot_i8, scale_x_rot, scale_w_rot)
     
@@ -115,20 +114,28 @@ if __name__ == "__main__":
     mse_rotated = torch.mean((Y - Y_rot_deq) ** 2)
     print(f"MSE: {mse_rotated.item()}\n")
     
+    # ============================================================
+    # Measure time
+    print(f"Measure time for Hadamard rotation + quantization + i8 matmul")
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     n_iter = 1_000
     # warm up
     for _ in range(10):
-        _ = gemm_cutlass.func_fusion_hadamard_quant(X)
+        _ = gemm_cutlass.func_apply_hadamard(X)
     
     start_event.record()
     for _ in range(n_iter):
-        X_rot_i8, scale_x_rot = gemm_cutlass.func_fusion_hadamard_quant(X)
+        X_rot = gemm_cutlass.func_apply_hadamard(X)
+        X_rot_i8, scale_x_rot = gemm_cutlass.func_quantize_i8(X_rot)
+        Y_rot_deq = gemm_cutlass.func_w8a8_matmul(X_rot_i8, W_rot_i8, scale_x_rot, scale_w_rot)
     end_event.record()
     torch.cuda.synchronize()
     elapsed_time_ms = start_event.elapsed_time(end_event) / n_iter
-    print(f"Time for Hadamard rotation + quantization: {elapsed_time_ms:.6f} ms")
+    print(f"Time for Hadamard rotation + quantization + i8 matmul: {elapsed_time_ms:.6f} ms")
+    
+    speed_up = torch_time / elapsed_time_ms
+    print(f"Speed up (Rotated i8 vs torch): {speed_up:.2f}x")
     
     
     

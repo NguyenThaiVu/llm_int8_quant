@@ -28,6 +28,7 @@
 #include "gemv.cu"
 #include "gemm_sigmoid.cu"
 #include "hadamard.cu"
+#include "quantization.cu"
 
 using namespace torch::indexing;
 
@@ -330,12 +331,13 @@ torch::Tensor func_apply_hadamard(
     return apply_hadamard_cuda(input);
 }
 
-std::tuple<torch::Tensor, torch::Tensor> func_fusion_hadamard_quant(
+std::tuple<torch::Tensor, torch::Tensor> func_quantize_i8(
     torch::Tensor input  // BF16, shape (M, K)
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    return fusion_hadamard_quant_cuda(input);
+    return quantize_row_int8_cuda(input);
 }
+
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -451,7 +453,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &func_apply_hadamard,
         "Apply Hadamard transform to bf16 input, return bf16 output");
 
-    m.def("func_fusion_hadamard_quant",
-        &func_fusion_hadamard_quant,
-        "Apply Hadamard transform to bf16 input, return quantized int8 output with per-row scale");
+    m.def("func_quantize_i8",
+        &func_quantize_i8,
+        "Quantize a BF16 matrix to INT8 with per-row scale");
 }

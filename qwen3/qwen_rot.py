@@ -29,8 +29,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
-
+CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
 
 
 class Rot_Linear(nn.Module):
@@ -52,7 +51,8 @@ class Rot_Linear(nn.Module):
         if self.is_quantized == False:
             y = x @ self.weight.T
         else:
-            x_rot_q, scale_x = gemm_cutlass.func_fusion_hadamard_quant(x)
+            x_rot = gemm_cutlass.func_apply_hadamard(x)
+            x_rot_q, scale_x = gemm_cutlass.func_quantize_i8(x_rot)
             
             y = gemm_cutlass.func_w8a8_matmul(x_rot_q, self.weight_q, scale_x, self.scale_w)
             
@@ -67,7 +67,8 @@ class Rot_Linear(nn.Module):
         
         # w_rot = block_hadamard_rotate(self.weight)
         # w_rot_q, scale_w = quantize_row_int8_symmetric_nd(w_rot)
-        w_rot_q, scale_w = gemm_cutlass.func_fusion_hadamard_quant(self.weight)
+        w_rot = gemm_cutlass.func_apply_hadamard(self.weight)
+        w_rot_q, scale_w = gemm_cutlass.func_quantize_i8(w_rot)
         self.weight_q = w_rot_q
         self.scale_w = scale_w
         
@@ -418,20 +419,20 @@ if __name__ == "__main__":
     model.eval()
     print(f"\n[INFO] Finished QuantRot.\n")
     
-    # list_prompt = ["What is the capital of VietNam?",\
-    #                 "What is the Dragon Ball story?"]
-    # for idx, prompt in enumerate(list_prompt):
-    #     input_token_ids = tokenizer.encode(prompt)
-    #     input_token_ids_tensor = torch.tensor(input_token_ids, device=device)
+    list_prompt = ["What is the capital of VietNam?",\
+                    "What is the Dragon Ball story?"]
+    for idx, prompt in enumerate(list_prompt):
+        input_token_ids = tokenizer.encode(prompt)
+        input_token_ids_tensor = torch.tensor(input_token_ids, device=device)
 
-    #     generated_text = func_generate_text(
-    #         model=model,
-    #         token_ids=input_token_ids_tensor,
-    #         max_new_tokens=MAX_NEW_TOKENS,
-    #         eos_token_id=tokenizer.eos_token_id
-    #     )
-    #     response = get_clean_generated_text(generated_text, tokenizer)
-    #     print(f"{idx}. Generated response: {response} \n")
+        generated_text = func_generate_text(
+            model=model,
+            token_ids=input_token_ids_tensor,
+            max_new_tokens=MAX_NEW_TOKENS,
+            eos_token_id=tokenizer.eos_token_id
+        )
+        response = get_clean_generated_text(generated_text, tokenizer)
+        print(f"{idx}. Generated response: {response} \n")
     
     print(f"\n[INFO] Start Evaluation...")
 
