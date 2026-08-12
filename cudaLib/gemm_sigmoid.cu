@@ -160,7 +160,6 @@ torch::Tensor sigmoid_bf16_cuda(
 // Requirements:
 //   - cols % 4 == 0
 //   - blockDim.x is a multiple of 32
-//   - block_reduce_max returns the result to every thread
 // ============================================================
 __global__ void sigmoid_int8_vec4_kernel(
     const int8_t* __restrict__ x_int8,

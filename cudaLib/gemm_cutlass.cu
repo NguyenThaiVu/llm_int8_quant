@@ -19,17 +19,15 @@
 #include "cutlass/util/host_tensor.h"
 #include "cutlass/gemm/device/gemm.h"
 
-// #include "epilogue/thread/linear_combination.h" // my custom epilogue
-
 #include "gemm_softmax.cu"
 #include "gemm_rope.cu"
 #include "gemm_matmul.cu"
 #include "gemm_rmsnorm.cu"
-#include "gemm_layernorm.cu"
 #include "gemm_activation.cu"
 #include "gemm_matrix_utils.cu"
 #include "gemv.cu"
 #include "gemm_sigmoid.cu"
+#include "hadamard.cu"
 
 using namespace torch::indexing;
 
@@ -107,12 +105,12 @@ std::tuple<torch::Tensor, torch::Tensor> func_softmax_int8(
   return softmax_int8_cuda(x_q, scale_x);
 }
 
-std::tuple<torch::Tensor, torch::Tensor> func_softmax_int8_shared(
+std::tuple<torch::Tensor, torch::Tensor> func_softmax_int8_naive(
     torch::Tensor x_q,          // int8, shape (dim0, dim1, dim2)
     torch::Tensor scale_x      // float32, shape (dim0, dim1) 
 ) {
   const at::cuda::OptionalCUDAGuard device_guard(x_q.device());
-  return softmax_int8_explicit_shared_cuda(x_q, scale_x);
+  return softmax_int8_naive_cuda(x_q, scale_x);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> func_softmax_lastdim_int8_masking(
@@ -171,28 +169,6 @@ std::tuple<torch::Tensor, torch::Tensor> func_rmsnorm_naive_int8(
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     return rmsnorm_int8_naive_cuda(x, scale_x, gamma, eps);
-}
-
-std::tuple<torch::Tensor, torch::Tensor> func_layernorm_int8(
-    torch::Tensor x,      // INT8, shape (tokens, d_model)
-    torch::Tensor scale_x,
-    torch::Tensor gamma,  // FP32, shape (d_model,)
-    torch::Tensor beta,   // FP32, shape (d_model,)
-    float eps) 
-{
-    const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    return layernorm_int8_cuda(x, scale_x, gamma, beta, eps);
-}
-
-std::tuple<torch::Tensor, torch::Tensor> func_layernorm_int8_shared(
-    torch::Tensor x,      // INT8, shape (tokens, d_model)
-    torch::Tensor scale_x,
-    torch::Tensor gamma,  // FP32, shape (d_model,)
-    torch::Tensor beta,   // FP32, shape (d_model,)
-    float eps) 
-{
-    const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    return layernorm_int8_shared_cuda(x, scale_x, gamma, beta, eps);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> func_apply_rope_int8(
@@ -347,6 +323,19 @@ std::tuple<torch::Tensor, torch::Tensor> func_sigmoid_int8(
     return sigmoid_int8_cuda(x_int8, scale_x);
 }
 
+torch::Tensor func_apply_hadamard(
+    torch::Tensor input  // BF16, shape (M, K)
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(input.device());
+    return apply_hadamard_cuda(input);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> func_fusion_hadamard_quant(
+    torch::Tensor input  // BF16, shape (M, K)
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(input.device());
+    return fusion_hadamard_quant_cuda(input);
+}
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -374,9 +363,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &func_softmax_int8,
         "Softmax along last dimension for int8 with per-row scale");
 
-    m.def("func_softmax_int8_shared",
-        &func_softmax_int8_shared,
-        "Softmax along last dimension for int8 with per-row scale, EXPLICITLY using shared memory for reduction");
+    m.def("func_softmax_int8_naive",
+        &func_softmax_int8_naive,
+        "Softmax along last dimension for int8 with per-row scale, naive implementation.");
 
     m.def("func_softmax_lastdim_int8_masking",
         &func_softmax_lastdim_int8_masking,
@@ -401,14 +390,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_rmsnorm_quant",
         &func_rmsnorm_quant,
         "RMSNorm for 2D float32 input with float32 gamma, return quantized int8 output and per-row scale");
-
-    m.def("func_layernorm_int8",
-        &func_layernorm_int8,
-        "LayerNorm for int8 input with float32 gamma and beta, using global memory for reduction");
-
-    m.def("func_layernorm_int8_shared",
-        &func_layernorm_int8_shared,
-        "LayerNorm for int8 input with float32 gamma and beta, EXPLICITLY using shared memory for reduction");
 
     m.def("func_apply_rope_int8",
         &func_apply_rope_int8,
@@ -465,4 +446,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_sigmoid_int8",
         &func_sigmoid_int8,
         "Apply Sigmoid to int8 input with proper scaling, return int8 output with scale");
+
+    m.def("func_apply_hadamard",
+        &func_apply_hadamard,
+        "Apply Hadamard transform to bf16 input, return bf16 output");
+
+    m.def("func_fusion_hadamard_quant",
+        &func_fusion_hadamard_quant,
+        "Apply Hadamard transform to bf16 input, return quantized int8 output with per-row scale");
 }

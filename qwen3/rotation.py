@@ -37,7 +37,8 @@ def create_hadamard_normalized_matrix(n, device="cuda", dtype=torch.bfloat16):
     return H.to(device=device, dtype=dtype)
 
 
-def block_hadamard_rotate(x, block_size=256):
+
+def apply_block_hadamard_rotate(x, H, block_size=256):
     """
     x: [..., K]
     Apply Hadamard rotation independently to blocks
@@ -47,12 +48,7 @@ def block_hadamard_rotate(x, block_size=256):
     K = x.shape[-1]
     assert K % block_size == 0
     assert block_size > 0 and (block_size & (block_size - 1)) == 0
-
-    H = create_hadamard_normalized_matrix(
-        block_size,
-        device=x.device,
-        dtype=x.dtype
-    )
+    assert H.shape[0] == block_size and H.shape[1] == block_size
 
     # [..., K] -> [..., num_blocks, block_size]
     x_block = x.reshape(*x.shape[:-1], K // block_size, block_size)
@@ -60,20 +56,27 @@ def block_hadamard_rotate(x, block_size=256):
     x_rot = x_block @ H
     return x_rot.reshape_as(x)
 
+
+
+
 if __name__ == "__main__":
     d_type = torch.bfloat16
-    M = 1024
-    N = 2048
-    K = 4096
+    M = 2048
+    N = 4096
+    K = 8192
     
-    # 1. Float computation
     X = init_X_with_outliers(M, K, device="cuda", dtype=d_type)
     # W = torch.empty((N, K), dtype=d_type).cuda()
     # torch.nn.init.kaiming_uniform_(W, a=math.sqrt(5))
     W = init_X_with_outliers(N, K, device="cuda", dtype=d_type)
-
+    
+    # ============================================================
+    # 1. Float computation
     Y = X @ W.T
     print(f"Shape of Y: {Y.shape}")
+    torch_time = measure_time(torch.matmul, X, W.T)
+    print(f"Time for torch.matmul: {torch_time:.6f} ms")
+    
     
     # ============================================================
     # 2. Quantization without rotation
@@ -88,16 +91,22 @@ if __name__ == "__main__":
     
     # ============================================================
     # 2. Quantization with rotation
-    R = create_hadamard_normalized_matrix(K)
-    print(f"\nShape of rotation matrix R: {R.shape}")
+    # R = create_hadamard_normalized_matrix(K)
     
-    X_rot = block_hadamard_rotate(X, block_size=256)
-    W_rot = block_hadamard_rotate(W, block_size=256)
-    # Y_hadamard = X_rotated @ W_rotated
+    rotation_block_size = 256
+    # H = create_hadamard_normalized_matrix(rotation_block_size)
     
-    # Quantize the rotated matrices
-    X_rot_i8, scale_x_rot = quantize_row_int8_symmetric_nd(X_rot)
-    W_rot_i8, scale_w_rot = quantize_row_int8_symmetric_nd(W_rot)
+    # # X_rot = apply_block_hadamard_rotate(X, H, block_size=256)
+    # # W_rot = apply_block_hadamard_rotate(W, H, block_size=256)
+    # X_rot = gemm_cutlass.func_apply_hadamard(X)
+    # W_rot = gemm_cutlass.func_apply_hadamard(W)
+    # # Y_hadamard = X_rotated @ W_rotated
+    
+    # # Quantize the rotated matrices
+    # X_rot_i8, scale_x_rot = quantize_row_int8_symmetric_nd(X_rot)
+    # W_rot_i8, scale_w_rot = quantize_row_int8_symmetric_nd(W_rot)
+    X_rot_i8, scale_x_rot = gemm_cutlass.func_fusion_hadamard_quant(X)
+    W_rot_i8, scale_w_rot = gemm_cutlass.func_fusion_hadamard_quant(W)
     
     Y_rot_deq = gemm_cutlass.func_w8a8_matmul(X_rot_i8, W_rot_i8, scale_x_rot, scale_w_rot)
     
@@ -105,6 +114,22 @@ if __name__ == "__main__":
     print(f"Max difference: {max_diff_rotated.item()}")
     mse_rotated = torch.mean((Y - Y_rot_deq) ** 2)
     print(f"MSE: {mse_rotated.item()}\n")
+    
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    n_iter = 1_000
+    # warm up
+    for _ in range(10):
+        _ = gemm_cutlass.func_fusion_hadamard_quant(X)
+    
+    start_event.record()
+    for _ in range(n_iter):
+        X_rot_i8, scale_x_rot = gemm_cutlass.func_fusion_hadamard_quant(X)
+    end_event.record()
+    torch.cuda.synchronize()
+    elapsed_time_ms = start_event.elapsed_time(end_event) / n_iter
+    print(f"Time for Hadamard rotation + quantization: {elapsed_time_ms:.6f} ms")
+    
     
     
     

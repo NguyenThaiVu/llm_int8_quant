@@ -32,45 +32,6 @@ USE_INSTRUCT_MODEL = False
 CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
 
 
-def create_hadamard_normalized_matrix(n, device="cuda", dtype=torch.bfloat16):
-    assert n > 0 and (n & (n - 1)) == 0
-
-    H = torch.tensor([[1.0]], dtype=torch.float32)
-
-    while H.shape[0] < n:
-        H = torch.cat([
-            torch.cat([H, H], dim=1),
-            torch.cat([H, -H], dim=1)
-        ], dim=0)
-
-    H /= math.sqrt(n)
-
-    return H.to(device=device, dtype=dtype)
-
-
-def block_hadamard_rotate(x, block_size=128):
-    """
-    x: [..., K]
-    Apply Hadamard rotation independently to blocks
-    along the last dimension.
-    """
-
-    K = x.shape[-1]
-    assert K % block_size == 0, f"K={K} must be divisible by {block_size}"
-    assert block_size > 0 and (block_size & (block_size - 1)) == 0
-
-    H = create_hadamard_normalized_matrix(
-        block_size,
-        device=x.device,
-        dtype=x.dtype
-    )
-
-    # [..., K] -> [..., num_blocks, block_size]
-    x_block = x.reshape(*x.shape[:-1], K // block_size, block_size)
-
-    x_rot = x_block @ H
-    return x_rot.reshape_as(x)
-
 
 class Rot_Linear(nn.Module):
     def __init__(self, in_features, out_features, dtype=torch.bfloat16, bias=False):
@@ -91,8 +52,7 @@ class Rot_Linear(nn.Module):
         if self.is_quantized == False:
             y = x @ self.weight.T
         else:
-            x_rot = block_hadamard_rotate(x)
-            x_rot_q, scale_x = quantize_row_int8_symmetric_nd(x_rot)
+            x_rot_q, scale_x = gemm_cutlass.func_fusion_hadamard_quant(x)
             
             y = gemm_cutlass.func_w8a8_matmul(x_rot_q, self.weight_q, scale_x, self.scale_w)
             
@@ -105,12 +65,14 @@ class Rot_Linear(nn.Module):
         - Quantize the rotated weight matrix to int8.
         """
         
-        w_rot = block_hadamard_rotate(self.weight)
-        w_rot_q, scale_w = quantize_row_int8_symmetric_nd(w_rot)
+        # w_rot = block_hadamard_rotate(self.weight)
+        # w_rot_q, scale_w = quantize_row_int8_symmetric_nd(w_rot)
+        w_rot_q, scale_w = gemm_cutlass.func_fusion_hadamard_quant(self.weight)
         self.weight_q = w_rot_q
         self.scale_w = scale_w
         
         self.is_quantized = True
+
 
 class FeedForward(nn.Module):
     def __init__(self, cfg):
@@ -213,36 +175,18 @@ class Rot_GroupedQueryAttention(nn.Module):
         values = values.repeat_interleave(self.group_size, dim=0) # Shape: (num_heads, num_tokens, head_dim)
 
         # 5. Attention
-        if self.is_quantized == False:
-            keys = keys.transpose(1, 2) 
-            attn_scores = queries @ keys
-        else:
-            queries_rot = block_hadamard_rotate(queries)
-            keys_rot = block_hadamard_rotate(keys)
-
-            queries_rot_q, scale_q = quantize_row_int8_symmetric_nd(queries_rot)
-            keys_rot_q, scale_k = quantize_row_int8_symmetric_nd(keys_rot)
-
-            attn_scores = gemm_cutlass.func_w8a8_matmul(queries_rot_q, keys_rot_q, scale_q, scale_k)
+        keys = keys.transpose(1, 2) 
+        attn_scores = queries @ keys
             
         attn_scores = attn_scores.masked_fill(mask, -torch.inf)
         attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1) # Shape: (num_heads, num_tokens, num_tokens)
+        
+        context = attn_weights @ values  # Shape: (num_heads, num_tokens, head_dim)
 
         # 6. Output
-        if self.is_quantized == False:
-            context = attn_weights @ values  # Shape: (num_heads, num_tokens, head_dim)
-        else:
-            context_rot = block_hadamard_rotate(attn_weights)
-            context_rot_q, scale_c = quantize_row_int8_symmetric_nd(context_rot)
-            
-            values = values.transpose(1, 2)  # Shape: (num_heads, head_dim, num_tokens)
-            values_rot = block_hadamard_rotate(values)
-            values_rot_q, scale_v = quantize_row_int8_symmetric_nd(values_rot)
-            
-            context = gemm_cutlass.func_w8a8_matmul(context_rot_q, values_rot_q, scale_c, scale_v)
-            
         context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
-        return self.out_proj(context)
+        output = self.out_proj(context)
+        return output
 
     def finish_calibration(self):
         self.W_query.finish_calibration()
@@ -537,7 +481,6 @@ if __name__ == "__main__":
     # # 5. ARC-Easy evaluation
     # # ================================================================
     NUM_ARC_SAMPLES = None  # Use None for the complete test set
-    # DATASET_ARC = "ARC-Easy"  # Options: "ARC-Easy", "ARC-Challenge"
     list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
     for DATASET_ARC in list_data_set_arc:
         print(f"[INFO] Start {DATASET_ARC} Evaluation... \n")

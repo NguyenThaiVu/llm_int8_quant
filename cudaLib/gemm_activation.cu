@@ -92,7 +92,7 @@ __global__ void silu_mul_int8_kernel(
         const float x2 = static_cast<float>(x2_int8[idx]) * s_x2;
 
         // exact float computation remains unchanged
-        const float silu = x1 / (1.0f + expf(-x1));
+        const float silu = x1 / (1.0f + __expf(-x1));
         const float y = silu * x2;
 
         // apply SmoothQuant-style output smoothing only before quantization
@@ -136,7 +136,7 @@ __global__ void silu_mul_int8_kernel(
         const float x1 = static_cast<float>(x1_int8[idx]) * s_x1;
         const float x2 = static_cast<float>(x2_int8[idx]) * s_x2;
 
-        const float silu = x1 / (1.0f + expf(-x1));
+        const float silu = x1 / (1.0f + __expf(-x1));
         const float y = silu * x2;
 
         const float s = smooth_scale[col];
@@ -194,7 +194,7 @@ __global__ void silu_mul_int8_kernel_warp_reduction(
         const float x1 = static_cast<float>(x1_int8[idx]) * s_x1;
         const float x2 = static_cast<float>(x2_int8[idx]) * s_x2;
 
-        const float silu = x1 / (1.0f + expf(-x1));
+        const float silu = x1 / (1.0f + __expf(-x1));
         const float y = silu * x2;
 
         const float s = smooth_scale[col];
@@ -227,7 +227,7 @@ __global__ void silu_mul_int8_kernel_warp_reduction(
         const float x1 = static_cast<float>(x1_int8[idx]) * s_x1;
         const float x2 = static_cast<float>(x2_int8[idx]) * s_x2;
 
-        const float silu = x1 / (1.0f + expf(-x1));
+        const float silu = x1 / (1.0f + __expf(-x1));
         const float y = silu * x2;
 
         const float s = smooth_scale[col];
@@ -467,7 +467,7 @@ const __nv_bfloat16* __restrict__ x1,
         float a = __bfloat162float(x1_row[col]);
         float b = __bfloat162float(x2_row[col]);
 
-        float sigmoid = 1.0f / (1.0f + expf(-a));
+        float sigmoid = 1.0f / (1.0f + __expf(-a));
         float v = a * sigmoid * b;
 
         // SmoothQuant correction:
@@ -504,7 +504,7 @@ const __nv_bfloat16* __restrict__ x1,
         float a = __bfloat162float(x1_row[col]);
         float b = __bfloat162float(x2_row[col]);
 
-        float sigmoid = 1.0f / (1.0f + expf(-a));
+        float sigmoid = 1.0f / (1.0f + __expf(-a));
         float v = a * sigmoid * b;
 
         float s = smooth_scale[col];
@@ -600,7 +600,7 @@ __global__ void silu_mul_bf16_kernel(
         const float x1 = __bfloat162float(x1_bf16[index]);
         const float x2 = __bfloat162float(x2_bf16[index]);
 
-        const float silu = x1 / (1.0f + expf(-x1));
+        const float silu = x1 / (1.0f + __expf(-x1));
         const float y = silu * x2;
 
         // Per-channel smoothing
@@ -706,13 +706,13 @@ __global__ void silu_mul_bf16_vec4_kernel(
         // Compute four SiLU-multiply outputs in FP32.
         // ----------------------------------------------------
 
-        const float silu_0 = x1_01.x / (1.0f + expf(-x1_01.x));
+        const float silu_0 = x1_01.x / (1.0f + __expf(-x1_01.x));
 
-        const float silu_1 = x1_01.y / (1.0f + expf(-x1_01.y));
+        const float silu_1 = x1_01.y / (1.0f + __expf(-x1_01.y));
 
-        const float silu_2 = x1_23.x / (1.0f + expf(-x1_23.x));
+        const float silu_2 = x1_23.x / (1.0f + __expf(-x1_23.x));
 
-        const float silu_3 = x1_23.y / (1.0f + expf(-x1_23.y));
+        const float silu_3 = x1_23.y / (1.0f + __expf(-x1_23.y));
 
         const float out_0 =
             silu_0 * x2_01.x / smooth.x;

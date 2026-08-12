@@ -5,7 +5,7 @@ import torch
 import pynvml
 
 class PowerSampler:
-    def __init__(self, gpu_id=0, interval=0.01):
+    def __init__(self, gpu_id=0, interval=0.001):
         """
         interval: power sampling interval in seconds.
                   0.01 = 10 ms
@@ -90,7 +90,7 @@ def measure_power(func, *args, n_iterations=1_000):
     Returns:
     float: Average power consumption in watts.
     """
-    sampler = PowerSampler(interval=0.01)
+    sampler = PowerSampler(interval=0.001)
 
     # Warm-up
     with torch.no_grad():

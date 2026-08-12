@@ -27,29 +27,58 @@ inline __device__ float warp_reduce_max(float v) {
     return v;
 }
 
-inline __device__ float block_reduce_max(float v) {
+// inline __device__ float block_reduce_max(float v) {
+//     __shared__ float smem[32];
+//     int lane = threadIdx.x & 31; // index within the warp
+//     int warp = threadIdx.x >> 5; // warp index within the block
+
+//     v = warp_reduce_max(v);
+
+//     if (lane == 0) smem[warp] = v;
+//     __syncthreads();
+
+//     // Only the first warp will read the results from shared memory
+//     float out = 0.0f;
+//     if (warp == 0) {
+//         int nw = (blockDim.x + 31) >> 5;  // number of warps in the block
+//         out = (lane < nw) ? smem[lane] : 0.0f;
+//         out = warp_reduce_max(out);
+//     }
+//     __syncthreads();
+
+//     if (threadIdx.x == 0) smem[0] = out;
+//     __syncthreads();
+//     return smem[0];
+// }
+
+
+__device__ __forceinline__ float block_reduce_max(float v) {
     __shared__ float smem[32];
-    int lane = threadIdx.x & 31; // index within the warp
-    int warp = threadIdx.x >> 5; // warp index within the block
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int num_warps = (blockDim.x + 31) >> 5;
 
     v = warp_reduce_max(v);
 
-    if (lane == 0) smem[warp] = v;
-    __syncthreads();
-
-    // Only the first warp will read the results from shared memory
-    float out = 0.0f;
-    if (warp == 0) {
-        int nw = (blockDim.x + 31) >> 5;  // number of warps in the block
-        out = (lane < nw) ? smem[lane] : 0.0f;
-        out = warp_reduce_max(out);
+    if (lane == 0) {
+        smem[warp] = v;
     }
     __syncthreads();
 
-    if (threadIdx.x == 0) smem[0] = out;
+    if (warp == 0) {
+        float out = (lane < num_warps) ? smem[lane] : -FLT_MAX;
+        out = warp_reduce_max(out);
+
+        if (lane == 0) {
+            smem[0] = out;
+        }
+    }
     __syncthreads();
+
     return smem[0];
 }
+
 
 /*
 The function block_reduce_max_neg_inf is similar to block_reduce_max,

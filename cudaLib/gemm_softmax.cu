@@ -13,6 +13,10 @@
 
 #include "gemm_utils.cu"
 
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 256
+#endif
+
 
 // --------------------------------------------------
 // BF16 softmax kernel
@@ -62,7 +66,7 @@ __global__ void softmax_bf16_kernel(
 
     for (int i = tid; i < d_model; i += blockDim.x) {
         float x_fp = __bfloat162float(x[row_offset + i]);
-        float e = expf(x_fp - row_max);
+        float e = __expf(x_fp - row_max);
         local_sum_exp += e;
     }
 
@@ -83,14 +87,9 @@ __global__ void softmax_bf16_kernel(
 
     for (int i = tid; i < d_model; i += blockDim.x) {
         float x_fp = __bfloat162float(x[row_offset + i]);
-        float e = expf(x_fp - row_max);
+        float e = __expf(x_fp - row_max);
 
         float out = valid ? e / sum_exp : 0.0f;
-
-        if (!isfinite(out)) {
-            out = 0.0f;
-        }
-
         y[row_offset + i] = __float2bfloat16(out);
     }
 }
@@ -114,14 +113,11 @@ torch::Tensor softmax_bf16_cuda(torch::Tensor x) {
 
     auto y = torch::empty_like(x_contig);
 
-    int threads = static_cast<int>(std::min<int64_t>(d_model, 256));
-    threads = std::max(threads, 32);
-
+    int threads = BLOCK_SIZE;
     dim3 block(threads);
     dim3 grid(static_cast<unsigned int>(num_rows));
 
     auto stream = at::cuda::getCurrentCUDAStream();
-
     softmax_bf16_kernel<<<grid, block, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x_contig.data_ptr<at::BFloat16>()),
         reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
@@ -179,7 +175,7 @@ __global__ void softmax_int8_kernel(
 
     for (int i = tid; i < d_model; i += blockDim.x) {
         float x_fp = static_cast<float>(x_int8[row_offset + i]) * sx;
-        float e = expf(x_fp - row_max);
+        float e = __expf(x_fp - row_max);
         local_sum_exp += e;
     }
 
@@ -190,11 +186,8 @@ __global__ void softmax_int8_kernel(
 
         shared_sum_exp = sum_exp;
 
-        // max softmax value = 1 / sum_exp
-        float sy = (sum_exp > 0.0f && isfinite(sum_exp))
-                 ? 1.0f / (sum_exp * 127.0f)
-                 : 1.0f;
-
+        // Compute scale_y for quantization
+        float sy = (sum_exp > 0.0f) ? 1.0f / (sum_exp * 127.0f) : 1.0f;
         shared_scale_y = sy;
         scale_y[row] = sy;
     }
@@ -211,7 +204,7 @@ __global__ void softmax_int8_kernel(
     // --------------------------------------------------
     for (int i = tid; i < d_model; i += blockDim.x) {
         float x_fp = static_cast<float>(x_int8[row_offset + i]) * sx;
-        float e = expf(x_fp - row_max);
+        float e = __expf(x_fp - row_max);
 
         // Because scale_y = 1 / (sum_exp * 127),
         // q = softmax / scale_y = exp(x - max) * 127.
@@ -262,17 +255,12 @@ std::tuple<torch::Tensor, torch::Tensor> softmax_int8_cuda(
     auto y_int8 = torch::empty_like(x_contig);
     auto scale_y = torch::empty_like(scale_contig);
 
-    int threads = static_cast<int>(std::min<int64_t>(d_model, 256));
-    threads = std::max(threads, 32);
-
+    int threads = BLOCK_SIZE;
     dim3 block(threads);
     dim3 grid(static_cast<unsigned int>(num_rows));
-
-    // For implicit-shared-memory, no dynamic shared memory.
     size_t shared_mem_size = 0;
 
     auto stream = at::cuda::getCurrentCUDAStream();
-
     softmax_int8_kernel<<<grid, block, shared_mem_size, stream>>>(
         x_contig.data_ptr<int8_t>(),
         scale_contig.data_ptr<float>(),
@@ -291,7 +279,7 @@ std::tuple<torch::Tensor, torch::Tensor> softmax_int8_cuda(
 
 
 // ============================================================
-// Explicit shared-memory INT8 softmax
+// Naive shared-memory INT8 softmax
 //
 // x_int8  : [num_rows, d_model]
 // scale_x : [num_rows]
@@ -309,7 +297,7 @@ std::tuple<torch::Tensor, torch::Tensor> softmax_int8_cuda(
 // red_s is used for explicit reductions
 // ============================================================
 
-__global__ void softmax_int8_explicit_shared_kernel(
+__global__ void softmax_int8_naive_kernel(
     const int8_t* __restrict__ x_int8,
     const float*  __restrict__ scale_x,
     int8_t*       __restrict__ y_int8,
@@ -373,7 +361,7 @@ __global__ void softmax_int8_explicit_shared_kernel(
     float local_sum_exp = 0.0f;
 
     for (int i = tid; i < d_model; i += blockDim.x) {
-        float e = expf(x_s[i] - row_max);
+        float e = __expf(x_s[i] - row_max);
 
         // Reuse x_s to store exp(x - max)
         x_s[i] = e;
@@ -401,15 +389,8 @@ __global__ void softmax_int8_explicit_shared_kernel(
 
         shared_sum_exp = sum_exp;
 
-        // Softmax max value is 1 / sum_exp because max shifted exp is 1.
-        //
-        // scale_y = max(softmax) / 127
-        //         = (1 / sum_exp) / 127
-        //         = 1 / (sum_exp * 127)
-        float sy = (sum_exp > 0.0f && isfinite(sum_exp))
-                 ? 1.0f / (sum_exp * 127.0f)
-                 : 1.0f;
-
+        // Compute scale_y for quantization
+        float sy = (sum_exp > 0.0f) ? 1.0f / (sum_exp * 127.0f) : 1.0f;
         shared_scale_y = sy;
         scale_y[row] = sy;
     }
@@ -421,17 +402,6 @@ __global__ void softmax_int8_explicit_shared_kernel(
 
     // --------------------------------------------------
     // 5. Quantize softmax output
-    //
-    // softmax_i = exp_i / sum_exp
-    // y_q       = round(softmax_i / sy)
-    //
-    // Since sy = 1 / (sum_exp * 127),
-    //
-    // y_q = round((exp_i / sum_exp) * (sum_exp * 127))
-    //     = round(exp_i * 127)
-    //
-    // So we do not need to explicitly divide by sum_exp here.
-    // The output scale_y stores the normalization factor.
     // --------------------------------------------------
     bool valid = (sum_exp > 0.0f && isfinite(sum_exp) && sy > 0.0f);
 
@@ -448,12 +418,11 @@ __global__ void softmax_int8_explicit_shared_kernel(
 
         // Softmax is non-negative, so clamp to [0, 127]
         q = max(0, min(127, q));
-
         y_int8[row_offset + i] = static_cast<int8_t>(q);
     }
 }
 
-std::tuple<torch::Tensor, torch::Tensor> softmax_int8_explicit_shared_cuda(
+std::tuple<torch::Tensor, torch::Tensor> softmax_int8_naive_cuda(
     torch::Tensor x_int8,   // int8, shape [..., d_model]
     torch::Tensor scale_x   // float, shape [...]
 ) {
@@ -485,25 +454,16 @@ std::tuple<torch::Tensor, torch::Tensor> softmax_int8_explicit_shared_cuda(
     auto y_int8 = torch::empty_like(x_contig);
     auto scale_y = torch::empty_like(scale_contig);
 
-    int threads = static_cast<int>(std::min<int64_t>(d_model, 256));
-    threads = std::max(threads, 32);
-
+    int threads = BLOCK_SIZE;
     dim3 block(threads);
     dim3 grid(static_cast<unsigned int>(num_rows));
 
-    // Explicit shared memory:
-    // x_s[d_model] + red_s[threads]
-    size_t shared_mem_size =
-        static_cast<size_t>(d_model + threads) * sizeof(float);
+    // Explicit shared memory: x_s[d_model] + red_s[threads]
+    size_t shared_mem_size = static_cast<size_t>(d_model + threads) * sizeof(float);
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    softmax_int8_explicit_shared_kernel<<<
-        grid,
-        block,
-        shared_mem_size,
-        stream
-    >>>(
+    softmax_int8_naive_kernel<<<grid, block, shared_mem_size, stream>>>(
         x_contig.data_ptr<int8_t>(),
         scale_contig.data_ptr<float>(),
         y_int8.data_ptr<int8_t>(),

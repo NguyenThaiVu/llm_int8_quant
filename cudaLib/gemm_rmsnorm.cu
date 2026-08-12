@@ -27,7 +27,10 @@
 
 #include "gemm_utils.cu"
 
-using namespace torch::indexing;
+
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 256
+#endif
 
 // ================================================================
 /*
@@ -123,25 +126,9 @@ torch::Tensor rmsnorm_bf16_cuda(
         "x.numel must be divisible by d_model"
     );
 
-    TORCH_CHECK(
-        d_model <= std::numeric_limits<int>::max(),
-        "d_model is too large"
-    );
-
     auto y = torch::empty_like(x_contig, x_contig.options().dtype(torch::kBFloat16));
 
-    int threads = static_cast<int>(std::min<int64_t>(d_model, 256));
-
-    if (threads & (threads - 1)) {
-        int p = 1;
-        while ((p << 1) <= threads) {
-            p <<= 1;
-        }
-        threads = p;
-    }
-
-    threads = std::max(threads, 32);
-
+    int threads = BLOCK_SIZE;
     dim3 block(threads);
     dim3 grid(static_cast<unsigned int>(n_rows));
 
@@ -326,33 +313,11 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_bf16_to_int8_cuda(
         "x.numel must be divisible by d_model"
     );
 
-    TORCH_CHECK(
-        d_model <= std::numeric_limits<int>::max(),
-        "d_model is too large"
-    );
+    auto y = torch::empty_like(x_contig, x_contig.options().dtype(torch::kChar));
 
-    auto y = torch::empty_like(
-        x_contig,
-        x_contig.options().dtype(torch::kChar)
-    );
+    auto scale_y = torch::empty({n_rows}, x_contig.options().dtype(torch::kFloat32));
 
-    auto scale_y = torch::empty(
-        {n_rows},
-        x_contig.options().dtype(torch::kFloat32)
-    );
-
-    int threads = static_cast<int>(std::min<int64_t>(d_model, 256));
-
-    if (threads & (threads - 1)) {
-        int p = 1;
-        while ((p << 1) <= threads) {
-            p <<= 1;
-        }
-        threads = p;
-    }
-
-    threads = std::max(threads, 32);
-
+    int threads = BLOCK_SIZE;
     dim3 block(threads);
     dim3 grid(static_cast<unsigned int>(n_rows));
 
@@ -402,7 +367,6 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_bf16_to_int8_cuda(
 
 
 
-// ================================================================
 // ================================================================
 /*
 RMSNorm kernel for INT8 input and INT8 output. And we incorporate the "smooth quantization" 
@@ -512,8 +476,7 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_quant_cuda(
 
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be BF16");
     TORCH_CHECK(gamma.scalar_type() == torch::kBFloat16, "gamma must be BF16");
-    TORCH_CHECK(smooth_scale.scalar_type() == torch::kFloat32,
-                    "smooth_scale must be FP32");
+    TORCH_CHECK(smooth_scale.scalar_type() == torch::kFloat32, "smooth_scale must be FP32");
 
     TORCH_CHECK(x.dim() == 2 || x.dim() == 3,
                 "x must be 2D [tokens, d_model] or 3D [batch, tokens, d_model]");
@@ -546,16 +509,7 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_quant_cuda(
     );
 
     // Determine block and grid sizes
-    int threads = static_cast<int>(std::min<int64_t>(d_model, 512));
-    if (threads & (threads - 1)) {
-        int p = 1;
-        while ((p << 1) <= threads) {
-            p <<= 1;
-        }
-        threads = p;
-    }
-    threads = std::max(threads, 32);
-    dim3 block(threads);
+    dim3 block(BLOCK_SIZE);
     dim3 grid(static_cast<unsigned int>(num_rows));
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -710,14 +664,7 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_cuda(
     auto scale_y = torch::empty({n_rows}, x_contig.options().dtype(torch::kFloat32));
 
     // Determine block and grid sizes
-    int threads = (int)std::min<int64_t>(d_model, 256);
-    if (threads & (threads - 1)) {
-        int p = 1;
-        while ((p << 1) <= threads) p <<= 1;
-        threads = p;
-    }
-    threads = std::max(threads, 32);
-
+    int threads = BLOCK_SIZE;
     dim3 block(threads);
     dim3 grid((unsigned)n_rows);
     size_t shmem_bytes = 0; 
