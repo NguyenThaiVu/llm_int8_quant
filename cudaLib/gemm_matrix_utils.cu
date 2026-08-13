@@ -12,8 +12,6 @@
 #include <cmath>
 
 // In this script, we define the utility functions for matrix operations 
-// used in our custom GEMM kernels.
-// ===============================================================
 // ===============================================================
 
 /*

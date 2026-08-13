@@ -2,7 +2,6 @@ import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # select GPU "0", "1", "2",...
 from tqdm import tqdm
 import json
-
 import torch
 torch.manual_seed(123)
 import torch.nn as nn
@@ -15,13 +14,14 @@ from utils_model import *
 from utils_generation import *
 from utils_evaluation import evaluate_arc, load_wikitext_single_text, compute_ppl_single_text, evaluate_piqa
 from utils_model_quan import TransformerBlock_Quant
+from utils_power import *
     
 # Select which model to use via the following flag; only one can be True
 USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B"
 
 class Qwen3Model_Quant(nn.Module):
     def __init__(self, cfg):
@@ -153,8 +153,8 @@ if __name__ == "__main__":
     # ================================================================
     # 3. Text generation
     # ================================================================
-    MAX_NEW_TOKENS = 1024
-    PPL_CONTEXT_TOKENS = 1024
+    MAX_NEW_TOKENS = 2048
+    PPL_CONTEXT_TOKENS = 2048
     EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
@@ -180,7 +180,7 @@ if __name__ == "__main__":
     # ================================================================
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=5_000)
+                                                    split="train", n=10_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             
@@ -233,6 +233,21 @@ if __name__ == "__main__":
         out_ids = model(input_ids)
     torch.cuda.synchronize()
     print(f"[INFO] Output tokens: {out_ids.shape}")
+    
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+        with torch.no_grad():
+            out_ids = model(input_ids)
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
+    
+    measure_power(model, input_ids, n_iterations=10)
 
     # # ================================================================
     # # 5. PPL evaluation
@@ -250,43 +265,43 @@ if __name__ == "__main__":
     print(f"Context size: {PPL_CONTEXT_TOKENS}")
     print(f"Dataset evaluation: {EVALUATION_DATASET}")
     
-    # ================================================================
-    # 6. ARC-Easy evaluation
-    # ================================================================
-    NUM_ARC_SAMPLES = None  # Use None for the complete test set
-    # DATASET_ARC = "ARC-Easy"  # Options: "ARC-Easy", "ARC-Challenge"
-    list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
-    for DATASET_ARC in list_data_set_arc:
-        print(f"\n[INFO] Start {DATASET_ARC} Evaluation...")
+    # # ================================================================
+    # # 6. ARC-Easy evaluation
+    # # ================================================================
+    # NUM_ARC_SAMPLES = 100  # Use None for the complete test set
+    # # DATASET_ARC = "ARC-Easy"  # Options: "ARC-Easy", "ARC-Challenge"
+    # list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
+    # for DATASET_ARC in list_data_set_arc:
+    #     print(f"\n[INFO] Start {DATASET_ARC} Evaluation...")
         
-        arc_result = evaluate_arc(
-            model=model,
-            tokenizer=tokenizer,
-            device=device,
-            subset=DATASET_ARC,
-            max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
-        )
-        print(f"{DATASET_ARC} results")
-        print(f"Model: Qwen3-{CHOOSE_MODEL}")
-        print(f"Number of questions: {arc_result['num_samples']}")
-        print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
-        print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}% \n")
+    #     arc_result = evaluate_arc(
+    #         model=model,
+    #         tokenizer=tokenizer,
+    #         device=device,
+    #         subset=DATASET_ARC,
+    #         max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
+    #     )
+    #     print(f"{DATASET_ARC} results")
+    #     print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    #     print(f"Number of questions: {arc_result['num_samples']}")
+    #     print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
+    #     print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}% \n")
     
-    # ================================================================
-    # 7. PIQA evaluation
-    # ================================================================
-    NUM_PIQA_SAMPLES = None  # None uses the complete validation set
-    print("[INFO] Start PIQA Evaluation...\n")
+    # # ================================================================
+    # # 7. PIQA evaluation
+    # # ================================================================
+    # NUM_PIQA_SAMPLES = 100  # None uses the complete validation set
+    # print("[INFO] Start PIQA Evaluation...\n")
 
-    piqa_result = evaluate_piqa(
-        model=model,
-        tokenizer=tokenizer,
-        device=device,
-        max_samples=NUM_PIQA_SAMPLES,
-    )
+    # piqa_result = evaluate_piqa(
+    #     model=model,
+    #     tokenizer=tokenizer,
+    #     device=device,
+    #     max_samples=NUM_PIQA_SAMPLES,
+    # )
 
-    print("\nPIQA results")
-    print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    print(f"Number of questions: {piqa_result['num_samples']}")
-    print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
-    print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")
+    # print("\nPIQA results")
+    # print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    # print(f"Number of questions: {piqa_result['num_samples']}")
+    # print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
+    # print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")

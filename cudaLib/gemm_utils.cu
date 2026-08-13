@@ -12,6 +12,15 @@
 #include <cstdint>
 #include <cmath>
 
+template <typename scalar_t>
+struct alignas(16) Vec8 {
+    scalar_t x[8];
+};
+
+struct alignas(8) Int8Vec8 {
+    int8_t x[8];
+};
+
 __device__ __forceinline__ int8_t quantize_int8(float value) {
     int q = __float2int_rn(value);
     q = max(-127, min(127, q));

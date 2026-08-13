@@ -230,39 +230,19 @@ class Custom_Matmul(nn.Module):
         if self.is_quantized == False:
             if A.dim() == 2:
                 C = torch.matmul(A, B.T)
-            elif A.dim() == 3:
-                C = torch.matmul(A, B.transpose(-2, -1))
-            elif A.dim() == 4:
+            elif (A.dim() == 3) or (A.dim() == 4):
                 C = torch.matmul(A, B.transpose(-2, -1))
             else:
                 raise ValueError(f"Unsupported input dimensions: {A.dim()}")
             return C, 1.0
         else:
-            if A.dim() == 2:
+            if (A.dim() == 2) or (A.dim() == 3) or (A.dim() == 4):
                 if self.is_return_float:
                     C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)
                     return C, 1.0
                 else:
                     C_int8, scale_C = gemm_cutlass.func_int8_matmul_out_int8_three_scale(
                         A, B, scale_A, scale_B, 
-                    )
-                    return C_int8, scale_C
-            elif A.dim() == 3:
-                if self.is_return_float:
-                    C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)
-                    return C, 1.0
-                else:
-                    C_int8, scale_C = gemm_cutlass.func_int8_matmul_out_int8_three_scale_batched(
-                        A, B, scale_A, scale_B
-                    )
-                    return C_int8, scale_C
-            elif A.dim() == 4:
-                if self.is_return_float:
-                    C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)
-                    return C, 1.0
-                else:
-                    C_int8, scale_C = gemm_cutlass.func_int8_matmul_out_int8_three_scale_batched(
-                        A, B, scale_A, scale_B
                     )
                     return C_int8, scale_C
             else:
@@ -382,7 +362,7 @@ def compute_smooth_alpha(input_observer, weight, lambd=0.5):
 
 
 class Custom_Linear(nn.Module):
-    def __init__(self, in_features, out_features, max_seq_len=MAX_SEQ_LEN):
+    def __init__(self, in_features, out_features, max_seq_len=MAX_SEQ_LEN, is_return_float=False):
         super(Custom_Linear, self).__init__()
         
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
@@ -401,6 +381,8 @@ class Custom_Linear(nn.Module):
         self.out_observer = MinMaxObserverPerLastDim(max_seq_len=max_seq_len)
         self.scale_y = torch.ones(max_seq_len, dtype=torch.float32, device='cuda')
         self.is_quantized = False
+
+        self.is_return_float = is_return_float
         
     def forward(self, x, scale_x):
         if self.is_quantized == False:  
@@ -423,10 +405,12 @@ class Custom_Linear(nn.Module):
             row_scale = scale_x / scale_y_value  
             col_scale = self.scale_w.expand(self.out_features)
             
-            out_q = gemm_cutlass.func_w8a8o8_matmul(x, self.weight_q,\
-                row_scale, col_scale)
-            
-            return out_q, scale_y_value
+            if self.is_return_float:
+                out = gemm_cutlass.func_w8a8_matmul(x, self.weight_q, row_scale, col_scale)
+                return out, 1.0
+            else:
+                out_q = gemm_cutlass.func_w8a8o8_matmul(x, self.weight_q, row_scale, col_scale)
+                return out_q, scale_y_value
         
     def finish_calibration(self, alpha=None):
         if alpha is None:
@@ -676,10 +660,9 @@ class Custom_GroupedQueryAttention(nn.Module):
                                             attn_weights_scale,\
                                             values_int8,\
                                             values_scale)
-
-            # Output
-            context = context.transpose(0, 1).reshape(num_tokens, self.d_out) 
-            out, _ = self.out_proj(context, 1.0)  # Output float for better accuracy
+            # Context shape: (num_heads, num_tokens, head_dim)
+            context = context.transpose(0, 1).reshape(num_tokens, self.d_out)  # Shape: (num_tokens, d_out)
+            out, _ = self.out_proj(context, 1.0)  # Output float
         
         return out
     
@@ -697,7 +680,7 @@ class Custom_GroupedQueryAttention(nn.Module):
         self.softmax_layer.finish_calibration()
         self.qk_score_layer.finish_calibration()
         self.context_layer.finish_calibration()
-        # self.out_proj.finish_calibration()
+        
         self.is_quantized = True
 
 

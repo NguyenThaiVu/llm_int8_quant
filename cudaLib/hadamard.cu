@@ -12,12 +12,6 @@ constexpr int HADAMARD_THREADS = 32;
 constexpr int VALUES_PER_THREAD = 8;
 
 
-template <typename scalar_t>
-struct alignas(16) Vec8 {
-    scalar_t x[8];
-};
-
-
 __device__ __forceinline__
 void hadamard_8(float x[8])
 {

@@ -97,9 +97,17 @@ if __name__ == "__main__":
         FLOPS_bf16 = compute_flops_per_sec_gemv(X, W, gemv_bf16_time, unit='GFLOPS')
         print(f"BF16 GEMV: {FLOPS_bf16:.2f} GFLOPS")
         
-        # 3. Measure GEMV INT8
         X_i8, scale_x = quantize_row_int8_symmetric_nd(X)
         W_i8, scale_w = quantize_row_int8_symmetric_nd(W)
+        
+        # 3. GEMV W8A8
+        gemv_w8a8_time = measure_time(gemm_cutlass.func_i8_gemv_out_bf16, X_i8, W_i8,\
+                            scale_x, scale_w, 1.0, repeat=n_iter)
+        print(f"GEMV W8A8 latency: {gemv_w8a8_time:.6f} ms")
+        FLOPS_w8a8 = compute_flops_per_sec_gemv(X_i8, W_i8, gemv_w8a8_time, unit='GFLOPS')
+        print(f"W8A8 GEMV: {FLOPS_w8a8:.2f} GFLOPS")
+        
+        # 3. Measure GEMV W8A8O8
         _, scale_y = quantize_row_int8_symmetric_nd(Y_torch)
         gemv_int8_time = measure_time(gemm_cutlass.func_i8_gemv_out_i8, X_i8, W_i8,\
                             scale_x, scale_w, scale_y, 1.0, repeat=n_iter)

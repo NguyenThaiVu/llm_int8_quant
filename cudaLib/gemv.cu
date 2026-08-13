@@ -16,9 +16,15 @@
 #define CHECK_BF16(x) TORCH_CHECK(x.scalar_type() == torch::kBFloat16, #x " must be torch.bfloat16")
 #define CHECK_FP32(x) TORCH_CHECK(x.scalar_type() == torch::kFloat32, #x " must be torch.float32")
 
-const int WARP_SIZE = 32;
-const int THREADS = 256;
-const int WARPS_PER_BLOCK = THREADS / WARP_SIZE;
+#ifndef WARP_SIZE
+#define WARP_SIZE 32
+#endif
+
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 256
+#endif
+
+const int WARPS_PER_BLOCK = BLOCK_SIZE / WARP_SIZE;
 
 
 // ============================================================
@@ -227,7 +233,7 @@ torch::Tensor i8_gemv_out_bf16(
     const float* w_scale_ptr = w_scale.data_ptr<float>();
 
 
-    dim3 block(static_cast<unsigned int>(THREADS));
+    dim3 block(static_cast<unsigned int>(BLOCK_SIZE));
     dim3 grid(
         static_cast<unsigned int>((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK),
         static_cast<unsigned int>(R)
@@ -523,7 +529,7 @@ torch::Tensor i8_gemv_out_bf16_4d(
     const float* x_scale_ptr = x_scale.data_ptr<float>();
     const float* w_scale_ptr = w_scale.data_ptr<float>();
 
-    dim3 block(static_cast<unsigned int>(THREADS));
+    dim3 block(static_cast<unsigned int>(BLOCK_SIZE));
     dim3 grid(
         static_cast<unsigned int>((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK),
         static_cast<unsigned int>(R)
@@ -783,7 +789,7 @@ torch::Tensor int8_gemv_out_i8(
     const float* w_scale_ptr = w_scale.data_ptr<float>();
     const float* y_scale_ptr = y_scale.data_ptr<float>();
 
-    dim3 block(static_cast<unsigned int>(THREADS));
+    dim3 block(static_cast<unsigned int>(BLOCK_SIZE));
 
     dim3 grid(
         static_cast<unsigned int>((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK),
@@ -997,7 +1003,7 @@ torch::Tensor int8_gemv_out_i8_4d(
     const float* w_scale_ptr = w_scale.data_ptr<float>();
     const float* y_scale_ptr = y_scale.data_ptr<float>();
 
-    dim3 block(static_cast<unsigned int>(THREADS));
+    dim3 block(static_cast<unsigned int>(BLOCK_SIZE));
     dim3 grid(
         static_cast<unsigned int>((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK),
         static_cast<unsigned int>(R)
@@ -1200,8 +1206,7 @@ torch::Tensor bf16_gemv_out_bf16(
     __nv_bfloat16* y_ptr =
         reinterpret_cast<__nv_bfloat16*>(y_bf16_flat.data_ptr<at::BFloat16>());
 
-    
-    dim3 block(THREADS);
+    dim3 block(BLOCK_SIZE);
     dim3 grid(
         static_cast<unsigned int>((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK),
         static_cast<unsigned int>(R)

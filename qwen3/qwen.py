@@ -20,13 +20,14 @@ from utils_model import *
 from utils_generation import *
 from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text,\
                             evaluate_arc, evaluate_piqa
+from utils_power import measure_power
     
 # Select which model to use via the following flag; only one can be True
 USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "32B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B"
 
 if __name__ == "__main__":
     
@@ -128,9 +129,9 @@ if __name__ == "__main__":
     # ================================================================
     # 3. Text generation
     # ================================================================
-    MAX_NEW_TOKENS = 1024
-    PPL_CONTEXT_TOKENS = 1024
-    EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
+    MAX_NEW_TOKENS = 2048
+    PPL_CONTEXT_TOKENS = 2048
+    EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
     list_prompt = ["What is the capital of VietNam?",\
@@ -149,7 +150,38 @@ if __name__ == "__main__":
 
         response = get_clean_generated_text(generated_text, tokenizer)
         print(f"{idx}. Generated response: {response} \n")
-        
+    
+    # ================================================================
+    # 3. Measure latency
+    # ================================================================
+    model.eval()
+
+    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+    samples = tokenizer.encode(samples)
+    chunk_tokens = samples[0:PPL_CONTEXT_TOKENS]
+    input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
+    print(f"[INFO] Input tokens: {input_ids.shape}")
+
+    # Warm-up
+    with torch.no_grad():
+        out_ids = model(input_ids)
+    torch.cuda.synchronize()
+    print(f"[INFO] Output tokens: {out_ids.shape}")
+    
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+        with torch.no_grad():
+            out_ids = model(input_ids)
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
+    
+    measure_power(model, input_ids, n_iterations=10)
     
     # # ================================================================
     # # 4. Perplexity evaluation on Wikitext-103

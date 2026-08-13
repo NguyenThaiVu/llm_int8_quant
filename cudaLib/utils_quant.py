@@ -195,3 +195,5 @@ def compute_smooth_alpha(input_observer, weight, lambd=0.5):
     alpha = torch.pow(max_a, lambd) / torch.pow(max_w, (1.0 - lambd))
     alpha = torch.clamp(alpha, min=0.01, max=100.0)
     return alpha  
+
+

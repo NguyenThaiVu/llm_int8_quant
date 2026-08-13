@@ -236,17 +236,15 @@ std::tuple<torch::Tensor, torch::Tensor> func_int8_matmul_out_int8_three_scale(
     torch::Tensor col_scale  // FP32 - shape (N, 1)
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    return int8_matmul_out_int8_three_scale_host(input, weight, row_scale, col_scale);
-}
-
-std::tuple<torch::Tensor, torch::Tensor> func_int8_matmul_out_int8_three_scale_batched(
-    torch::Tensor input,   // INT8 - shape (B, M, K) 
-    torch::Tensor weight,  // INT8 - shape (B, N, K) or (N, K)
-    torch::Tensor row_scale, // FP32 - shape (B, M, 1) or (M, 1)
-    torch::Tensor col_scale // FP32 - shape (B, N, 1) or (N, 1)
-) {
-    const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    return int8_matmul_out_int8_three_scale_batched_host(input, weight, row_scale, col_scale);
+    if (input.dim() == 2) {
+        return int8_matmul_out_int8_three_scale_host(input, weight, row_scale, col_scale);
+    } else if (input.dim() == 3) {
+        return int8_matmul_out_int8_three_scale_batched_host(input, weight, row_scale, col_scale);
+    } else if (input.dim() == 4) {
+        return int8_matmul_out_int8_three_scale_batched_host(input, weight, row_scale, col_scale);
+    } else {
+        throw std::invalid_argument("Input tensor must be 2D or 3D");
+    }
 }
 
 torch::Tensor func_w8a8_matmul(
@@ -282,7 +280,7 @@ torch::Tensor func_w8a8o8_matmul(
     } else if (input.dim() == 4) {
         return matmul_w8a8o8_4D_host(input, weight, alphaRow, alphaCol);
     } else {
-        throw std::invalid_argument("Input tensor must be 2D or 3D");
+        throw std::invalid_argument("Input tensor must be 2D or 3D or 4D");
     }
 }
 
@@ -338,6 +336,14 @@ std::tuple<torch::Tensor, torch::Tensor> func_quantize_i8(
     return quantize_row_int8_cuda(input);
 }
 
+
+std::tuple<torch::Tensor, torch::Tensor> func_quantize_i8_smooth_cuda(
+    torch::Tensor input,  // BF16, shape (M, K)
+    torch::Tensor smooth_scale // FP32, shape (K,)
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(input.device());
+    return quantize_row_int8_smooth_cuda(input, smooth_scale);
+}
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -421,10 +427,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &func_int8_matmul_out_int8_three_scale,
         "Int8 MatMul with three scales using CUTLASS (INT8 input/weight, BFloat16 per-element scale, INT8 output)");
     
-    m.def("func_int8_matmul_out_int8_three_scale_batched",
-        &func_int8_matmul_out_int8_three_scale_batched,
-        "Batched Int8 MatMul with three scales using CUTLASS (INT8 input/weight, BFloat16 per-element scale, INT8 output)");
-
     m.def("func_w8a8_matmul",
         &func_w8a8_matmul,
         "MatMul for INT8 input and INT8 weight with per-row and per-column scales using CUTLASS (INT8 input/weight, FP32 per-row and per-column scales, FP32 output)");
@@ -456,4 +458,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_quantize_i8",
         &func_quantize_i8,
         "Quantize a BF16 matrix to INT8 with per-row scale");
+
+    m.def("func_quantize_i8_smooth_cuda",
+        &func_quantize_i8_smooth_cuda,
+        "Quantize a BF16 matrix to INT8 with per-row smooth quantization");
 }

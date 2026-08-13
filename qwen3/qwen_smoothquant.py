@@ -3,7 +3,7 @@ This script demonstrates how to convert a Qwen3 model to SmoothQuant technique.
 """
 import os
 import time
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  
 
 from pathlib import Path
 from tqdm import tqdm
@@ -23,6 +23,7 @@ from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text,
                             evaluate_arc, evaluate_piqa
 from utils_quant import *
 from utils_model_quan import compute_smooth_alpha, PerChannelAbsMaxObserver
+from utils_power import measure_power
 
 import gemm_cutlass
     
@@ -31,7 +32,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
 
 
 class SmoothQuant_Linear(nn.Module):
@@ -540,7 +541,7 @@ if __name__ == "__main__":
     # ================================================================
     MAX_NEW_TOKENS = 2048
     PPL_CONTEXT_TOKENS = 2048
-    EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
+    EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
     list_prompt = ["What is the capital of VietNam?",\
@@ -594,6 +595,9 @@ if __name__ == "__main__":
                                 context_size=PPL_CONTEXT_TOKENS,
                                 stride=PPL_STRIDE)
     print(f"\nPPL (SmoothQuant technique): {ppl} \n")
+    print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")
     
     # ================================================================
     # 3. Measure latency
@@ -627,11 +631,9 @@ if __name__ == "__main__":
             out_ids = model(input_ids)
 
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=50))
-    print()
-    print("Model Information (SmoothQuant technique):")
-    print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    print(f"Context size: {PPL_CONTEXT_TOKENS}")
-    print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")
+    
+    measure_power(model, input_ids, n_iterations=10)
+    
     
     # ================================================================
     # 5. ARC-Easy evaluation
