@@ -22,6 +22,8 @@ from utils_generation import *
 from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text,\
                             evaluate_arc, evaluate_piqa
 from utils_quant import *
+from utils_power import measure_power
+
 import gemm_cutlass
     
 # Select which model to use via the following flag; only one can be True
@@ -29,7 +31,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
 
 
 class Rot_Linear(nn.Module):
@@ -47,14 +49,18 @@ class Rot_Linear(nn.Module):
         
         self.is_quantized = False
     
-    def forward(self, x):
+    def forward(self, x, is_apply_rotation=True):
         if self.is_quantized == False:
             y = x @ self.weight.T
         else:
-            x_rot = gemm_cutlass.func_apply_hadamard(x)
-            x_rot_q, scale_x = gemm_cutlass.func_quantize_i8(x_rot)
-            
-            y = gemm_cutlass.func_w8a8_matmul(x_rot_q, self.weight_q, scale_x, self.scale_w)
+            if is_apply_rotation:
+                x_rot = gemm_cutlass.func_apply_hadamard(x)
+                x_rot_q, scale_x = gemm_cutlass.func_quantize_i8(x_rot)
+                y = gemm_cutlass.func_w8a8_matmul(x_rot_q, self.weight_q, scale_x, self.scale_w)
+            else:
+                (x_q, scale_x) = x 
+                assert x_q.dtype == torch.int8, "Input tensor must be quantized to int8."
+                y = gemm_cutlass.func_w8a8_matmul(x_q, self.weight_q, scale_x, self.scale_w)
             
         return y.to(dtype=self.dtype)
     
@@ -64,15 +70,15 @@ class Rot_Linear(nn.Module):
         - Apply Hadamard rotation to the weight matrix.
         - Quantize the rotated weight matrix to int8.
         """
-        
-        # w_rot = block_hadamard_rotate(self.weight)
-        # w_rot_q, scale_w = quantize_row_int8_symmetric_nd(w_rot)
         w_rot = gemm_cutlass.func_apply_hadamard(self.weight)
         w_rot_q, scale_w = gemm_cutlass.func_quantize_i8(w_rot)
         self.weight_q = w_rot_q
         self.scale_w = scale_w
         
         self.is_quantized = True
+        
+        # Delete bf16 weight and observer to save memory
+        del self.weight
 
 
 class FeedForward(nn.Module):
@@ -81,10 +87,18 @@ class FeedForward(nn.Module):
         self.fc1 = Rot_Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
         self.fc2 = Rot_Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
         self.fc3 = Rot_Linear(cfg["hidden_dim"], cfg["emb_dim"], dtype=cfg["dtype"], bias=False)
+        self.is_quantized = False
 
     def forward(self, x):
-        x_fc1 = self.fc1(x)
-        x_fc2 = self.fc2(x)
+        if self.is_quantized == False:
+            x_fc1 = self.fc1(x)
+            x_fc2 = self.fc2(x)
+        else:
+            x_rot = gemm_cutlass.func_apply_hadamard(x)
+            x_rot_q, scale_x = gemm_cutlass.func_quantize_i8(x_rot)
+            x_fc1 = self.fc1((x_rot_q, scale_x), is_apply_rotation=False)
+            x_fc2 = self.fc2((x_rot_q, scale_x), is_apply_rotation=False)
+            
         x = nn.functional.silu(x_fc1) * x_fc2
         return self.fc3(x)
     
@@ -92,6 +106,7 @@ class FeedForward(nn.Module):
         self.fc1.finish_calibration()
         self.fc2.finish_calibration()
         self.fc3.finish_calibration()
+        self.is_quantized = True
         print(f"[INFO] Finish calibration for FeedForward module.")
         
     
@@ -153,9 +168,16 @@ class Rot_GroupedQueryAttention(nn.Module):
         num_tokens, _ = x.shape
 
         # 1. QKV projections
-        queries = self.W_query(x)  # (num_tokens, num_heads * head_dim)
-        keys = self.W_key(x)       # (num_tokens, num_kv_groups * head_dim)
-        values = self.W_value(x)   # (num_tokens, num_kv_groups * head_dim)
+        if self.is_quantized == False:
+            queries = self.W_query(x)  # (num_tokens, num_heads * head_dim)
+            keys = self.W_key(x)       # (num_tokens, num_kv_groups * head_dim)
+            values = self.W_value(x)   # (num_tokens, num_kv_groups * head_dim)
+        else:
+            x_rot = gemm_cutlass.func_apply_hadamard(x)
+            x_rot_q, scale_x = gemm_cutlass.func_quantize_i8(x_rot)
+            queries = self.W_query((x_rot_q, scale_x), is_apply_rotation=False) 
+            keys = self.W_key((x_rot_q, scale_x), is_apply_rotation=False) 
+            values = self.W_value((x_rot_q, scale_x), is_apply_rotation=False) 
 
         # 2. Reshape and transpose for multi-head attention
         queries = queries.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
@@ -252,8 +274,8 @@ class Qwen3Model(nn.Module):
         cos, sin = compute_rope_params(
             head_dim=head_dim,
             theta_base=cfg["rope_base"],
-            # context_length=cfg["context_length"]
-            context_length=1024 * 10
+            context_length=cfg["context_length"]
+            # context_length=1024 * 10
         )
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
@@ -382,22 +404,21 @@ if __name__ == "__main__":
     EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
-    list_prompt = ["What is the capital of VietNam?",\
-                    "What is the Dragon Ball story?"]
+    # list_prompt = ["What is the capital of VietNam?"]
 
-    for idx, prompt in enumerate(list_prompt):
-        input_token_ids = tokenizer.encode(prompt)
-        input_token_ids_tensor = torch.tensor(input_token_ids, device=device)
+    # for idx, prompt in enumerate(list_prompt):
+    #     input_token_ids = tokenizer.encode(prompt)
+    #     input_token_ids_tensor = torch.tensor(input_token_ids, device=device)
 
-        generated_text = func_generate_text(
-            model=model,
-            token_ids=input_token_ids_tensor,
-            max_new_tokens=MAX_NEW_TOKENS,
-            eos_token_id=tokenizer.eos_token_id
-        )
+    #     generated_text = func_generate_text(
+    #         model=model,
+    #         token_ids=input_token_ids_tensor,
+    #         max_new_tokens=MAX_NEW_TOKENS,
+    #         eos_token_id=tokenizer.eos_token_id
+    #     )
 
-        response = get_clean_generated_text(generated_text, tokenizer)
-        print(f"{idx}. Generated response: {response} \n")
+    #     response = get_clean_generated_text(generated_text, tokenizer)
+    #     print(f"{idx}. Generated response: {response} \n")
     
     # Evaluate PPL before quantization
     samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
@@ -407,10 +428,6 @@ if __name__ == "__main__":
                                 context_size=PPL_CONTEXT_TOKENS,
                                 stride=PPL_STRIDE)
     print(f"\nPPL (Before Quantization): {ppl} \n")
-    print(f"Model Information: ")
-    print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    print(f"Context size: {PPL_CONTEXT_TOKENS}")
-    print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")
     
     # # =================================================
     # 4. Quantization
@@ -419,20 +436,20 @@ if __name__ == "__main__":
     model.eval()
     print(f"\n[INFO] Finished QuantRot.\n")
     
-    list_prompt = ["What is the capital of VietNam?",\
-                    "What is the Dragon Ball story?"]
-    for idx, prompt in enumerate(list_prompt):
-        input_token_ids = tokenizer.encode(prompt)
-        input_token_ids_tensor = torch.tensor(input_token_ids, device=device)
+    # list_prompt = ["What is the capital of VietNam?",\
+    #                 "What is the Dragon Ball story?"]
+    # for idx, prompt in enumerate(list_prompt):
+    #     input_token_ids = tokenizer.encode(prompt)
+    #     input_token_ids_tensor = torch.tensor(input_token_ids, device=device)
 
-        generated_text = func_generate_text(
-            model=model,
-            token_ids=input_token_ids_tensor,
-            max_new_tokens=MAX_NEW_TOKENS,
-            eos_token_id=tokenizer.eos_token_id
-        )
-        response = get_clean_generated_text(generated_text, tokenizer)
-        print(f"{idx}. Generated response: {response} \n")
+    #     generated_text = func_generate_text(
+    #         model=model,
+    #         token_ids=input_token_ids_tensor,
+    #         max_new_tokens=MAX_NEW_TOKENS,
+    #         eos_token_id=tokenizer.eos_token_id
+    #     )
+    #     response = get_clean_generated_text(generated_text, tokenizer)
+    #     print(f"{idx}. Generated response: {response} \n")
     
     print(f"\n[INFO] Start Evaluation...")
 
@@ -448,6 +465,7 @@ if __name__ == "__main__":
     print(f"Model: Qwen3-{CHOOSE_MODEL}")
     print(f"Context size: {PPL_CONTEXT_TOKENS}")
     print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")
+
     
     # ================================================================
     # 5. Measure Latency
@@ -463,6 +481,18 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     print(f"[INFO] Output tokens: {out_ids.shape}")
     
+    n_iter = 10
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    for i in range(n_iter):
+        with torch.no_grad():
+            out_ids = model(input_ids)  
+    end_event.record()
+    torch.cuda.synchronize()
+    latency = start_event.elapsed_time(end_event) / n_iter
+    print(f"Latency: {latency:.3f} ms")
+    
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
@@ -475,45 +505,47 @@ if __name__ == "__main__":
         with torch.no_grad():
             out_ids = model(input_ids)
 
-    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=50))
-        
-        
-    # # ================================================================
-    # # 5. ARC-Easy evaluation
-    # # ================================================================
-    NUM_ARC_SAMPLES = None  # Use None for the complete test set
-    list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
-    for DATASET_ARC in list_data_set_arc:
-        print(f"[INFO] Start {DATASET_ARC} Evaluation... \n")
-        
-        arc_result = evaluate_arc(
-            model=model,
-            tokenizer=tokenizer,
-            device=device,
-            subset=DATASET_ARC,
-            max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
-        )
-        print(f"\n{DATASET_ARC} results")
-        print(f"Model: Qwen3-{CHOOSE_MODEL}")
-        print(f"Number of questions: {arc_result['num_samples']}")
-        print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
-        print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}%")
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
     
-    # ================================================================
-    # 7. PIQA evaluation
-    # ================================================================
-    NUM_PIQA_SAMPLES = None  # None uses the complete validation set
-    print("[INFO] Start PIQA Evaluation...\n")
+    measure_power(model, input_ids, n_iterations=10)
+        
+        
+    # # # ================================================================
+    # # # 5. ARC-Easy evaluation
+    # # # ================================================================
+    # NUM_ARC_SAMPLES = None  # Use None for the complete test set
+    # list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
+    # for DATASET_ARC in list_data_set_arc:
+    #     print(f"[INFO] Start {DATASET_ARC} Evaluation... \n")
+        
+    #     arc_result = evaluate_arc(
+    #         model=model,
+    #         tokenizer=tokenizer,
+    #         device=device,
+    #         subset=DATASET_ARC,
+    #         max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
+    #     )
+    #     print(f"\n{DATASET_ARC} results")
+    #     print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    #     print(f"Number of questions: {arc_result['num_samples']}")
+    #     print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
+    #     print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}%")
+    
+    # # ================================================================
+    # # 7. PIQA evaluation
+    # # ================================================================
+    # NUM_PIQA_SAMPLES = None  # None uses the complete validation set
+    # print("[INFO] Start PIQA Evaluation...\n")
 
-    piqa_result = evaluate_piqa(
-        model=model,
-        tokenizer=tokenizer,
-        device=device,
-        max_samples=NUM_PIQA_SAMPLES,
-    )
+    # piqa_result = evaluate_piqa(
+    #     model=model,
+    #     tokenizer=tokenizer,
+    #     device=device,
+    #     max_samples=NUM_PIQA_SAMPLES,
+    # )
 
-    print("\nPIQA results")
-    print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    print(f"Number of questions: {piqa_result['num_samples']}")
-    print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
-    print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")
+    # print("\nPIQA results")
+    # print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    # print(f"Number of questions: {piqa_result['num_samples']}")
+    # print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
+    # print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")

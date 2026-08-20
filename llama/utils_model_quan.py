@@ -8,85 +8,7 @@ from utils_quant import quantize_row_int8_symmetric_nd
 MAX_SEQ_LEN = 2112 # 576 or 1040 or 2112
 BATCH_SIZE = 1 # 1, 4, 16, 64, 128
 
-# class Custom_Linear(nn.Module):
-#     """
-#     Linear layer with two execution modes:
-#     1. Calibration mode
-#         - Input: bf16
-#         - Weight: bf16
-#         - Output: bf16
-#         - Behavior: computes `x @ weight.T` and updates output observer
-    
-#     2. Quantization mode
-#         - Input: int8
-#         - Weight: int8
-#         - Output: int8
-#         - Behavior: computes quantized matmul with per-row scaling
-#                     and returns quantized output and its scale
-    
-#     This layer has: per-row scale for activation
-#                     per-tensor scale for weight. 
-#                     The output scale is per-row
-                    
-#     Input shapes: (M, K) or (B, M, K)
-#     Weight shapes: (N, K)
-#     Output shapes: (M, N) or (B, M, N)
-#     """
-#     def __init__(self, in_features, out_features, 
-#                  max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16):
-#         super(Custom_Linear, self).__init__()
-        
-#         self.in_features = in_features
-#         self.out_features = out_features
-#         self.weight = nn.Parameter(torch.empty(out_features, in_features, 
-#                                                dtype=dtype))
-        
-#         # Weight quantization
-#         self.weight_q = torch.empty(out_features, in_features, dtype=torch.int8)
-#         self.scale_w = torch.ones((1), dtype=torch.float32)
-        
-#         # Output scale quantization
-#         self.scale_y = torch.ones((out_features), dtype=torch.float32)  
-#         self.out_observer = MinMaxObserverPerLastDim(max_seq_len=max_seq_len)
-#         self.is_quantized = False
-        
-#     def forward(self, x, scale_x):
-#         if not self.is_quantized:  
-#             out = torch.matmul(x, self.weight.t())  
-#             self.out_observer(out)
-#             return out, 1.0
-#         else:
-#             assert x.dtype == torch.int8,\
-#                 "Expected int8 input in quantization"
-            
-#             if x.dim() == 2:
-#                 seq_len = x.shape[0]
-#                 scale_y_value = self.scale_y[:seq_len]
-#             elif x.dim() == 3:
-#                 seq_len = x.shape[1]
-#                 scale_y_value = self.scale_y[:, :seq_len]
-#             else:
-#                 raise ValueError(f"Unsupported input dimensions: {x.dim()}")
-            
-#             row_scale = scale_x / scale_y_value  
-#             col_scale = self.scale_w.expand(self.out_features)
-            
-#             out_q = gemm_cutlass.func_w8a8o8_matmul(x, self.weight_q,\
-#                 row_scale, col_scale)
 
-#             return out_q, scale_y_value
-        
-#     def finish_calibration(self):
-#         weight_q, scale_w = quantize_tensor(self.weight)
-#         self.weight_q = weight_q
-#         self.scale_w = scale_w
-        
-#         self.scale_y = self.out_observer.get_scale().to(self.scale_w.device)
-        
-#         self.is_quantized = True  
-#         del self.weight
-#         torch.cuda.empty_cache()
-        
         
 class Custom_Softmax(nn.Module):
     def __init__(self, num_heads=1):
@@ -281,7 +203,7 @@ class Custom_Matmul(nn.Module):
                     C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)
                     return C, 1.0
                 else:
-                    C_int8, scale_C = gemm_cutlass.func_int8_matmul_out_int8_three_scale(
+                    C_int8, scale_C = gemm_cutlass.func_w8a8o8_matmul(
                         A, B, scale_A, scale_B, 
                     )
                     return C_int8, scale_C
@@ -290,7 +212,7 @@ class Custom_Matmul(nn.Module):
                     C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)
                     return C, 1.0
                 else:
-                    C_int8, scale_C = gemm_cutlass.func_int8_matmul_out_int8_three_scale_batched(
+                    C_int8, scale_C = gemm_cutlass.func_w8a8o8_matmul_batched(
                         A, B, scale_A, scale_B
                     )
                     return C_int8, scale_C
@@ -299,7 +221,7 @@ class Custom_Matmul(nn.Module):
                     C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)
                     return C, 1.0
                 else:
-                    C_int8, scale_C = gemm_cutlass.func_int8_matmul_out_int8_three_scale_batched(
+                    C_int8, scale_C = gemm_cutlass.func_w8a8o8_matmul_batched(
                         A, B, scale_A, scale_B
                     )
                     return C_int8, scale_C
@@ -460,7 +382,7 @@ class Custom_Linear(nn.Module):
             row_scale = scale_x / scale_y_value  
             col_scale = self.scale_w.expand(self.out_features)
             
-            out_q = gemm_cutlass.func_w8a8o8_matmul(x, self.weight_q,\
+            out_q = gemm_cutlass.func_w8a8o8_matmul_fusion(x, self.weight_q,\
                 row_scale, col_scale)
             
             return out_q, scale_y_value

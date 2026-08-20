@@ -15,7 +15,7 @@ if __name__ == "__main__":
     X_i8, X_scale = gemm_cutlass.func_quantize_i8(X)
     W_i8, W_scale = gemm_cutlass.func_quantize_i8(W)
     
-    Y_i8, Y_scale = gemm_cutlass.func_int8_matmul_out_int8_three_scale(X_i8, W_i8, X_scale, W_scale)
+    Y_i8, Y_scale = gemm_cutlass.func_w8a8o8_matmul(X_i8, W_i8, X_scale, W_scale)
     
     Y_deq = Y_i8.to(torch.float32) * Y_scale.unsqueeze(-1)
     

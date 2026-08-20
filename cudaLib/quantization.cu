@@ -141,15 +141,11 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_row_int8_cuda(torch::Tensor in
     std::vector<int64_t> scale_shape(input.sizes().begin(), input.sizes().end() - 1);
     auto scales = torch::empty(scale_shape, input.options().dtype(torch::kFloat32));
 
-    // ========================================================
     // Launch
-    // ========================================================
-
     dim3 block(BLOCK_SIZE);
     dim3 grid(rows);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half,
         at::ScalarType::BFloat16,
@@ -167,6 +163,15 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_row_int8_cuda(torch::Tensor in
                 );
             } else if (K % 4 == 0) {
                 row_quant_int8_vec_kernel<scalar_t, 4>
+                <<<grid, block, 0, stream>>>(
+                    input.data_ptr<scalar_t>(),
+                    output.data_ptr<int8_t>(),
+                    scales.data_ptr<float>(),
+                    static_cast<int>(rows),
+                    static_cast<int>(K)
+                );
+            } else if (K % 2 == 0) {
+                row_quant_int8_vec_kernel<scalar_t, 2>
                 <<<grid, block, 0, stream>>>(
                     input.data_ptr<scalar_t>(),
                     output.data_ptr<int8_t>(),
@@ -369,6 +374,15 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_row_int8_smooth_cuda(
                     static_cast<int>(rows),
                     static_cast<int>(K)
                 );
+            } else if (K % 2 == 0) {
+                row_smooth_quant_int8_vec_kernel<scalar_t, 2><<<grid, block, 0, stream>>>(
+                    input.data_ptr<scalar_t>(),
+                    smooth_scale.data_ptr<float>(),
+                    output.data_ptr<int8_t>(),
+                    scales.data_ptr<float>(),
+                    static_cast<int>(rows),
+                    static_cast<int>(K)
+                );
             } else {
                 row_smooth_quant_int8_scalar_kernel<scalar_t><<<grid, block, 0, stream>>>(
                     input.data_ptr<scalar_t>(),
@@ -381,8 +395,6 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_row_int8_smooth_cuda(
             }
         }
     );
-
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-
     return std::make_tuple(output, scales);
 }

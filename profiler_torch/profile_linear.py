@@ -62,7 +62,7 @@ class Custom_Linear(nn.Module):
             row_scale = scale_x / scale_y_value  
             col_scale = self.scale_w.expand(self.out_features)
             
-            out_q = gemm_cutlass.func_w8a8o8_matmul(x, self.weight_q,\
+            out_q = gemm_cutlass.func_w8a8o8_matmul_fusion(x, self.weight_q,\
                 row_scale, col_scale)
 
             return out_q, scale_y_value

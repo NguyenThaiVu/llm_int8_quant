@@ -70,7 +70,7 @@ class Custom_Linear(nn.Module):
                 out_q = gemm_cutlass.func_i8_gemv_out_i8(\
                     x, self.weight_q, scale_x, self.scale_w, scale_y_value, 1.0)
             else:
-                out_q = gemm_cutlass.func_w8a8o8_matmul(x, self.weight_q,\
+                out_q = gemm_cutlass.func_w8a8o8_matmul_fusion(x, self.weight_q,\
                     row_scale, col_scale)
             
             return out_q, scale_y_value
@@ -398,7 +398,7 @@ class Custom_Matmul(nn.Module):
                 else:
                     row_scale = scale_A / scale_C
                     col_scale = scale_B
-                    C_i8 = gemm_cutlass.func_w8a8o8_matmul(A, B,\
+                    C_i8 = gemm_cutlass.func_w8a8o8_matmul_fusion(A, B,\
                         row_scale, col_scale)
                     
                 return C_i8, scale_C
@@ -456,7 +456,7 @@ class Custom_Matmul(nn.Module):
 #                     C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)
 #                     return C, 1.0
 #                 else:
-#                     C_int8, scale_C = gemm_cutlass.func_int8_matmul_out_int8_three_scale(
+#                     C_int8, scale_C = gemm_cutlass.func_w8a8o8_matmul(
 #                         A, B, scale_A, scale_B, 
 #                     )
 #                     return C_int8, scale_C
@@ -465,7 +465,7 @@ class Custom_Matmul(nn.Module):
 #                     C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)
 #                     return C, 1.0
 #                 else:
-#                     C_int8, scale_C = gemm_cutlass.func_int8_matmul_out_int8_three_scale_batched(
+#                     C_int8, scale_C = gemm_cutlass.func_w8a8o8_matmul_batched(
 #                         A, B, scale_A, scale_B
 #                     )
 #                     return C_int8, scale_C
@@ -474,7 +474,7 @@ class Custom_Matmul(nn.Module):
 #                     C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)
 #                     return C, 1.0
 #                 else:
-#                     C_int8, scale_C = gemm_cutlass.func_int8_matmul_out_int8_three_scale_batched(
+#                     C_int8, scale_C = gemm_cutlass.func_w8a8o8_matmul_batched(
 #                         A, B, scale_A, scale_B
 #                     )
 #                     return C_int8, scale_C

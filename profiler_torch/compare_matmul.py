@@ -74,8 +74,8 @@ if __name__ == "__main__":
         print(f"Torch INT8 matmul latency: {time_torch_int8:.2f} ms")
         
         # 4. Our custom INT8 matmul
-        Y_int8 = gemm_cutlass.func_w8a8o8_matmul(X_int8, W_int8, row_scale, scale_W)
-        time_int8 = measure_time(gemm_cutlass.func_w8a8o8_matmul, X_int8, W_int8, row_scale, scale_W)
+        Y_int8 = gemm_cutlass.func_w8a8o8_matmul_fusion(X_int8, W_int8, row_scale, scale_W)
+        time_int8 = measure_time(gemm_cutlass.func_w8a8o8_matmul_fusion, X_int8, W_int8, row_scale, scale_W)
         print(f"Custom INT8 matmul latency: {time_int8:.2f} ms")
         print(f"Speedup over Pytorch BF16: {time_torch / time_int8:.2f}x")
         print(f"Speedup over bitsandbytes INT8 (FP16 output): {time_bnb / time_int8:.2f}x")

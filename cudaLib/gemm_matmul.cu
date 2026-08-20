@@ -19,13 +19,30 @@
 #include "cutlass/util/host_tensor.h"
 #include "cutlass/gemm/device/gemm.h"
 
+#include <cutlass/gemm/device/gemm_universal.h>
+#include <cutlass/util/reference/host/gemm.h>
+#include <cutlass/util/reference/host/tensor_compare.h>
+#include <cutlass/util/reference/host/tensor_copy.h>
+#include <cutlass/util/reference/host/tensor_fill.h>
+#include <cutlass/util/tensor_view_io.h>
+
+#include <cutlass/gemm/device/gemm_universal_with_broadcast.h>
+#include <cutlass/gemm/device/gemm_universal_streamk_with_broadcast.h>
+
+#include <cutlass/util/reference/host/error_metrics.h>
+#include <cutlass/util/reference/host/tensor_foreach.h>
+#include <cutlass/epilogue/threadblock/fusion/visitors.hpp>
+#include <cutlass/gemm/kernel/default_gemm_universal_with_visitor.h>
+#include <cutlass/gemm/device/gemm_universal_adapter.h>
+
 #include "gemm_utils.cu"
+#include "quantization.cu"
 
 
 using namespace torch::indexing;
 
 /*
-Description: A custom int8 matrix multiplication using CUTLASS.
+This function performs int8 matrix multiplication using CUTLASS.
 
 Input: 
 - input: INT8 tensor of shape (M, K)
@@ -42,25 +59,19 @@ torch::Tensor int8_matmul(
 ) {
   TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
   TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+  TORCH_CHECK(input.dtype() == torch::kChar, "input must be torch.int8 (kChar)");
+  TORCH_CHECK(weight.dtype() == torch::kChar, "weight must be torch.int8 (kChar)");
 
-  TORCH_CHECK(input.dtype() == torch::kChar,
-              "input must be torch.int8 (kChar)");
-  TORCH_CHECK(weight.dtype() == torch::kChar,
-              "weight must be torch.int8 (kChar)");
-
-  TORCH_CHECK(input.dim() == 2 && weight.dim() == 2,
-              "input and weight must be 2D tensors");
+  TORCH_CHECK(input.dim() == 2 && weight.dim() == 2, "input and weight must be 2D tensors");
 
   auto M = input.size(0);
   auto K = input.size(1);
-  auto N = weight.size(0);  // weight is (N, K)
+  auto N = weight.size(0);  
+  TORCH_CHECK(weight.size(1) == K, "weight shape must be (N, K) with same K as input");
 
-  TORCH_CHECK(weight.size(1) == K,
-              "weight shape must be (N, K) with same K as input");
-
-  // We will pad K up to a multiple of 32 for int8 Tensor Cores (Sm80, mma 16x8x32)
+  // We will pad K up to a multiple of 32 for int8 Tensor Cores
   TORCH_CHECK(K > 0, "K must be > 0");
-  int64_t K_gemm = ((K + 31) / 32) * 32;  // padded K used for GEMM
+  int64_t K_gemm = ((K + 31) / 32) * 32;  
 
   input = input.contiguous();
   weight = weight.contiguous();
@@ -81,18 +92,18 @@ torch::Tensor int8_matmul(
 
   // ---- Pad input along K if needed: (M, K_gemm) ----
   if (padK) {
+    // Copy original data to first K columns
     input_used = torch::zeros({M, K_gemm}, input.options());
-    // Copy original data into first K columns
-    input_used.index_put_({Slice(), Slice(0, K)}, input);
+    input_used.index_put_({Slice(), Slice(0, K)}, input);  
   } else {
     input_used = input;
   }
 
   // ---- Pad weight along N and/or K: (N_gemm, K_gemm) row-major ----
   if (padN || padK) {
-    weight_used = torch::zeros({N_gemm, K_gemm}, weight.options());
     // Copy original weight into the top-left (N x K) block
-    weight_used.index_put_({Slice(0, N), Slice(0, K)}, weight);
+    weight_used = torch::zeros({N_gemm, K_gemm}, weight.options());
+    weight_used.index_put_({Slice(0, N), Slice(0, K)}, weight);  
   } else {
     weight_used = weight;
   }
@@ -225,24 +236,6 @@ torch::Tensor int8_matmul_host(
     return int8_matmul<TileShape, WarpShape, kStages>(input, weight, alpha);
   }
 }
-
-
-
-#include <cutlass/gemm/device/gemm_universal.h>
-#include <cutlass/util/reference/host/gemm.h>
-#include <cutlass/util/reference/host/tensor_compare.h>
-#include <cutlass/util/reference/host/tensor_copy.h>
-#include <cutlass/util/reference/host/tensor_fill.h>
-#include <cutlass/util/tensor_view_io.h>
-
-#include <cutlass/gemm/device/gemm_universal_with_broadcast.h>
-#include <cutlass/gemm/device/gemm_universal_streamk_with_broadcast.h>
-
-#include <cutlass/util/reference/host/error_metrics.h>
-#include <cutlass/util/reference/host/tensor_foreach.h>
-#include <cutlass/epilogue/threadblock/fusion/visitors.hpp>
-#include <cutlass/gemm/kernel/default_gemm_universal_with_visitor.h>
-#include <cutlass/gemm/device/gemm_universal_adapter.h>
 
 
 /*
@@ -573,24 +566,18 @@ torch::Tensor matmul_w8a8_batched_host(
             B_3d = B.contiguous();
         }
 
-        TORCH_CHECK(alphaRow.dim() == 2,
-                    "For 3D A, alphaRow must be [B, M]");
+        TORCH_CHECK(alphaRow.dim() == 2, "For 3D A, alphaRow must be [B, M]");
         TORCH_CHECK(alphaRow.size(0) == Bsz &&
-                    alphaRow.size(1) == M,
-                    "For 3D A, alphaRow must be [B, M]");
+                    alphaRow.size(1) == M, "For 3D A, alphaRow must be [B, M]");
 
         if (shared_B) {
-            TORCH_CHECK(alphaCol.dim() == 1,
-                        "For shared B, alphaCol must be shared [N]");
-            TORCH_CHECK(alphaCol.size(0) == N,
-                        "For shared B, alphaCol must have shape [N]");
+            TORCH_CHECK(alphaCol.dim() == 1, "For shared B, alphaCol must be shared [N]");
+            TORCH_CHECK(alphaCol.size(0) == N, "For shared B, alphaCol must have shape [N]");
             alphaCol_shared_1d = alphaCol.contiguous();
         } else {
-            TORCH_CHECK(alphaCol.dim() == 2,
-                        "For batched B, alphaCol must be [B, N]");
+            TORCH_CHECK(alphaCol.dim() == 2, "For batched B, alphaCol must be [B, N]");
             TORCH_CHECK(alphaCol.size(0) == Bsz &&
-                        alphaCol.size(1) == N,
-                        "For batched B, alphaCol must be [B, N]");
+                        alphaCol.size(1) == N, "For batched B, alphaCol must be [B, N]");
             alphaCol_2d = alphaCol.contiguous();
         }
 
@@ -614,23 +601,18 @@ torch::Tensor matmul_w8a8_batched_host(
         outer_batch = B0 * B1;
 
         if (shared_B) {
-            TORCH_CHECK(B.size(1) == K,
-                        "For shared B [N,K], B.size(1) must match A.size(3)");
+            TORCH_CHECK(B.size(1) == K, "For shared B [N,K], B.size(1) must match A.size(3)");
             N = B.size(0);
             B_shared_2d = B.contiguous();
         } else {
-            TORCH_CHECK(B.size(0) == B0,
-                        "For 4D B, B.size(0) must match A.size(0)");
-            TORCH_CHECK(B.size(1) == B1,
-                        "For 4D B, B.size(1) must match A.size(1)");
-            TORCH_CHECK(B.size(3) == K,
-                        "For 4D B, B.size(3) must match A.size(3)");
+            TORCH_CHECK(B.size(0) == B0, "For 4D B, B.size(0) must match A.size(0)");
+            TORCH_CHECK(B.size(1) == B1, "For 4D B, B.size(1) must match A.size(1)");
+            TORCH_CHECK(B.size(3) == K, "For 4D B, B.size(3) must match A.size(3)");
             N = B.size(2);
             B_3d = B.contiguous().reshape({outer_batch, N, K});
         }
 
-        TORCH_CHECK(alphaRow.dim() == 3,
-                    "For 4D A, alphaRow must be [B0, B1, M]");
+        TORCH_CHECK(alphaRow.dim() == 3, "For 4D A, alphaRow must be [B0, B1, M]");
         TORCH_CHECK(alphaRow.size(0) == B0 &&
                     alphaRow.size(1) == B1 &&
                     alphaRow.size(2) == M,
@@ -666,7 +648,7 @@ torch::Tensor matmul_w8a8_batched_host(
     );
 
     // ============================================================
-    // Reuse 2D GEMM for each flattened batch item
+    // Reuse function matmul_w8a8_2D_host for each flattened batch item
     // ============================================================
     for (int64_t b = 0; b < outer_batch; ++b) {
         auto A_b = A_3d.select(0, b);                // [M, K]
@@ -683,13 +665,7 @@ torch::Tensor matmul_w8a8_batched_host(
             alphaCol_b = alphaCol_2d.select(0, b);   // [N]
         }
 
-        auto D_b = matmul_w8a8_2D_host(
-            A_b,
-            B_b,
-            alphaRow_b,
-            alphaCol_b
-        );
-
+        auto D_b = matmul_w8a8_2D_host(A_b, B_b, alphaRow_b, alphaCol_b);
         D_3d.select(0, b).copy_(D_b);
     }
 
@@ -1181,9 +1157,21 @@ torch::Tensor matmul_w8a8o8_4D_host(
 
 
 
-#include "quantization.cu"
+/*
+Description: This function perform 2 steps:
+1. INT8 GEMM -> BF16
+2. BF16 -> row-wise INT8
 
-std::tuple<torch::Tensor, torch::Tensor> int8_matmul_out_int8_three_scale_host(
+Input: 
+- input: int8, (..., M, K)
+- weight: int8, (N, K) 
+- row_scale: float, (..., M)
+- col_scale: float, (N,)
+
+Output:
+- output: int8, (..., M, N), row-major
+*/
+std::tuple<torch::Tensor, torch::Tensor> matmul_w8a8_quantize_row_host(
     torch::Tensor input,       // (..., M, K) INT8
     torch::Tensor weight,      // (N, K) INT8
     torch::Tensor row_scale,
@@ -1193,34 +1181,21 @@ std::tuple<torch::Tensor, torch::Tensor> int8_matmul_out_int8_three_scale_host(
 
     // 1. INT8 GEMM -> BF16
     if (input.dim() == 2) {
-        bf16_out = matmul_w8a8_2D_host(
-            input,
-            weight,
-            row_scale,
-            col_scale
-        );
+        bf16_out = matmul_w8a8_2D_host(input, weight, row_scale, col_scale);
     } else if (input.dim() == 3 || input.dim() == 4) {
-        bf16_out = matmul_w8a8_batched_host(
-            input,
-            weight,
-            row_scale,
-            col_scale
-        );
+        bf16_out = matmul_w8a8_batched_host(input, weight, row_scale, col_scale );
     } else {
         TORCH_CHECK(false, "Input tensor must be 2D, 3D, or 4D");
     }
 
-    TORCH_CHECK(
-        bf16_out.defined(), "Output tensor is not defined, error in matmul_w8a8"
-    );
+    TORCH_CHECK(bf16_out.defined(), "Output tensor is not defined, error in matmul_w8a8");
 
     // 2. BF16 -> row-wise INT8
     return quantize_row_int8_cuda(bf16_out);
 }
 
 
-
-std::tuple<torch::Tensor, torch::Tensor> int8_matmul_out_int8_three_scale_batched_host(
+std::tuple<torch::Tensor, torch::Tensor> matmul_w8a8_quantize_row_host_batched_host(
     torch::Tensor A,           // int8 [B, M, K] or [B0, B1, M, K]
     torch::Tensor B,           // int8 [B, N, K] or [B0, B1, N, K]
     torch::Tensor row_scales,  // fp32 [B, M] or [B0, B1, M]
@@ -1236,11 +1211,8 @@ std::tuple<torch::Tensor, torch::Tensor> int8_matmul_out_int8_three_scale_batche
     TORCH_CHECK(row_scales.dtype() == torch::kFloat32, "row_scales must be float32");
     TORCH_CHECK(col_scales.dtype() == torch::kFloat32, "col_scales must be float32");
 
-    TORCH_CHECK(A.dim() == 3 || A.dim() == 4,
-                "A must be 3D [B, M, K] or 4D [B0, B1, M, K]");
-
-    TORCH_CHECK(B.dim() == A.dim(),
-                "B must have the same number of dimensions as A");
+    TORCH_CHECK(A.dim() == 3 || A.dim() == 4, "A must be 3D or 4D");
+    TORCH_CHECK(B.dim() == A.dim(), "B must have the same number of dimensions as A");
 
     const bool is_4d = (A.dim() == 4);
 
@@ -1267,25 +1239,19 @@ std::tuple<torch::Tensor, torch::Tensor> int8_matmul_out_int8_three_scale_batche
         M = A.size(1);
         K = A.size(2);
 
-        TORCH_CHECK(B.size(0) == Bsz,
-                    "For 3D input, B.size(0) must match A.size(0)");
-        TORCH_CHECK(B.size(2) == K,
-                    "For 3D input, B.size(2) must match A.size(2)");
+        TORCH_CHECK(B.size(0) == Bsz, "For 3D input, B.size(0) must match A.size(0)");
+        TORCH_CHECK(B.size(2) == K, "For 3D input, B.size(2) must match A.size(2)");
 
         N = B.size(1);
         outer_batch = Bsz;
 
-        TORCH_CHECK(row_scales.dim() == 2,
-                    "For 3D A, row_scales must be [B, M]");
+        TORCH_CHECK(row_scales.dim() == 2, "For 3D A, row_scales must be [B, M]");
         TORCH_CHECK(row_scales.size(0) == Bsz &&
-                    row_scales.size(1) == M,
-                    "For 3D A, row_scales shape must be [B, M]");
+                    row_scales.size(1) == M, "For 3D A, row_scales shape must be [B, M]");
 
-        TORCH_CHECK(col_scales.dim() == 2,
-                    "For 3D A, col_scales must be [B, N]");
+        TORCH_CHECK(col_scales.dim() == 2, "For 3D A, col_scales must be [B, N]");
         TORCH_CHECK(col_scales.size(0) == Bsz &&
-                    col_scales.size(1) == N,
-                    "For 3D A, col_scales shape must be [B, N]");
+                    col_scales.size(1) == N, "For 3D A, col_scales shape must be [B, N]");
 
         A_3d = A.contiguous();
         B_3d = B.contiguous();
@@ -1308,18 +1274,14 @@ std::tuple<torch::Tensor, torch::Tensor> int8_matmul_out_int8_three_scale_batche
         M = A.size(2);
         K = A.size(3);
 
-        TORCH_CHECK(B.size(0) == B0,
-                    "For 4D input, B.size(0) must match A.size(0)");
-        TORCH_CHECK(B.size(1) == B1,
-                    "For 4D input, B.size(1) must match A.size(1)");
-        TORCH_CHECK(B.size(3) == K,
-                    "For 4D input, B.size(3) must match A.size(3)");
+        TORCH_CHECK(B.size(0) == B0, "For 4D input, B.size(0) must match A.size(0)");
+        TORCH_CHECK(B.size(1) == B1, "For 4D input, B.size(1) must match A.size(1)");
+        TORCH_CHECK(B.size(3) == K, "For 4D input, B.size(3) must match A.size(3)");
 
         N = B.size(2);
         outer_batch = B0 * B1;
 
-        TORCH_CHECK(row_scales.dim() == 3,
-                    "For 4D A, row_scales must be [B0, B1, M]");
+        TORCH_CHECK(row_scales.dim() == 3, "For 4D A, row_scales must be [B0, B1, M]");
         TORCH_CHECK(row_scales.size(0) == B0 &&
                     row_scales.size(1) == B1 &&
                     row_scales.size(2) == M,
@@ -1353,7 +1315,7 @@ std::tuple<torch::Tensor, torch::Tensor> int8_matmul_out_int8_three_scale_batche
     );
 
     // ============================================================
-    // Reuse your existing 2D function per flattened batch item
+    // Reuse existing 2D function per flattened item
     // ============================================================
     for (int64_t b = 0; b < outer_batch; ++b) {
         auto A_b = A_3d.select(0, b).contiguous();              // [M, K]
@@ -1361,7 +1323,7 @@ std::tuple<torch::Tensor, torch::Tensor> int8_matmul_out_int8_three_scale_batche
         auto row_scales_b = row_scales_2d.select(0, b).contiguous(); // [M]
         auto col_scales_b = col_scales_2d.select(0, b).contiguous(); // [N]
 
-        auto result = int8_matmul_out_int8_three_scale_host(
+        auto result = matmul_w8a8_quantize_row_host(
             A_b,
             B_b,
             row_scales_b,

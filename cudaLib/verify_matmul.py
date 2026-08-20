@@ -15,15 +15,15 @@ from utils_power import measure_power
 
 if __name__ == "__main__":
     
-    batch = 32
-    M = 2048
-    N = 4096
-    K = 2048
+    # batch = 32
+    M = 8192
+    N = 8192
+    K = 8192
     dtype = torch.bfloat16
     
     # ================= 2D input =======================
-    X = torch.randn((batch, M, K), dtype=dtype).cuda()
-    W = torch.empty((batch, N, K), dtype=dtype).cuda()
+    X = torch.randn((M, K), dtype=dtype).cuda()
+    W = torch.empty((N, K), dtype=dtype).cuda()
     torch.nn.init.kaiming_uniform_(W, a=math.sqrt(5))
     print(f"Input shape: {X.shape}, Weight shape: {W.shape}")
     
@@ -37,10 +37,10 @@ if __name__ == "__main__":
     W_int8, scale_W = quantize_row_int8_symmetric_nd(W)
     
     # assume scale_Y via calibration
-    Y_int8, scale_Y = gemm_cutlass.func_int8_matmul_out_int8_three_scale(X_int8, W_int8, scale_X, scale_W)
-    time_int8 = measure_time(gemm_cutlass.func_int8_matmul_out_int8_three_scale, X_int8, W_int8, scale_X, scale_W)
+    Y_int8, scale_Y = gemm_cutlass.func_w8a8o8_matmul(X_int8, W_int8, scale_X, scale_W)
+    time_int8 = measure_time(gemm_cutlass.func_w8a8o8_matmul, X_int8, W_int8, scale_X, scale_W)
     print(f"Custom INT8 matmul latency: {time_int8:.2f} ms")
-    i8_energy = measure_power(gemm_cutlass.func_int8_matmul_out_int8_three_scale, X_int8, W_int8, scale_X, scale_W)
+    i8_energy = measure_power(gemm_cutlass.func_w8a8o8_matmul, X_int8, W_int8, scale_X, scale_W)
     
     print(f"Time Speedup: {time_torch / time_int8:.2f}x")
     print(f"Energy Improvement: {torch_energy / i8_energy:.2f}x")

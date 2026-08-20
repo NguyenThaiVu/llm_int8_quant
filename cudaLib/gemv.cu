@@ -355,7 +355,6 @@ __global__ void i8_gemv_out_bf16_4d_kernel(
     int w_scale_numel,
     float alpha
 ) {
-    constexpr int WARP_SIZE = 32;
 
     int tid = threadIdx.x;
     int warp_id = tid / WARP_SIZE;
@@ -858,8 +857,6 @@ __global__ void i8_gemv_out_i8_4d_kernel(
     int y_scale_numel,
     float alpha
 ) {
-    constexpr int WARP_SIZE = 32;
-
     int tid = threadIdx.x;
     int warp_id = tid / WARP_SIZE;
     int lane = tid % WARP_SIZE;

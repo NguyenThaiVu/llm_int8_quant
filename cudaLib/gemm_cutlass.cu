@@ -229,24 +229,6 @@ torch::Tensor func_silu_bf16(
     return silu_bf16_cuda(x_bf16);
 }
 
-std::tuple<torch::Tensor, torch::Tensor> func_int8_matmul_out_int8_three_scale(
-    torch::Tensor input,   // INT8 - shape (M, K)
-    torch::Tensor weight,  // INT8 - shape (N, K)
-    torch::Tensor row_scale, // FP32 - shape (M, 1)
-    torch::Tensor col_scale  // FP32 - shape (N, 1)
-) {
-    const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    if (input.dim() == 2) {
-        return int8_matmul_out_int8_three_scale_host(input, weight, row_scale, col_scale);
-    } else if (input.dim() == 3) {
-        return int8_matmul_out_int8_three_scale_batched_host(input, weight, row_scale, col_scale);
-    } else if (input.dim() == 4) {
-        return int8_matmul_out_int8_three_scale_batched_host(input, weight, row_scale, col_scale);
-    } else {
-        throw std::invalid_argument("Input tensor must be 2D or 3D");
-    }
-}
-
 torch::Tensor func_w8a8_matmul(
     torch::Tensor input,   // INT8 - shape (M, K)
     torch::Tensor weight,  // INT8 - shape (N, K)
@@ -265,7 +247,25 @@ torch::Tensor func_w8a8_matmul(
     }
 }
 
-torch::Tensor func_w8a8o8_matmul(
+std::tuple<torch::Tensor, torch::Tensor> func_w8a8o8_matmul(
+    torch::Tensor input,   // INT8 - shape (M, K)
+    torch::Tensor weight,  // INT8 - shape (N, K)
+    torch::Tensor row_scale, // FP32 - shape (M, 1)
+    torch::Tensor col_scale  // FP32 - shape (N, 1)
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(input.device());
+    if (input.dim() == 2) {
+        return matmul_w8a8_quantize_row_host(input, weight, row_scale, col_scale);
+    } else if (input.dim() == 3) {
+        return matmul_w8a8_quantize_row_host_batched_host(input, weight, row_scale, col_scale);
+    } else if (input.dim() == 4) {
+        return matmul_w8a8_quantize_row_host_batched_host(input, weight, row_scale, col_scale);
+    } else {
+        throw std::invalid_argument("Input tensor must be 2D or 3D");
+    }
+}
+
+torch::Tensor func_w8a8o8_matmul_fusion(
     torch::Tensor input,   // INT8 - shape (M, K) or (B, M, K)
     torch::Tensor weight,  // INT8 - shape (N, K) or (B, N, K)
     torch::Tensor alphaRow,  // FP32 - shape (M) or (B, M)
@@ -423,16 +423,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &func_silu_bf16,
         "Apply SiLU to bf16 input, return bf16 output");
 
-    m.def("func_int8_matmul_out_int8_three_scale",
-        &func_int8_matmul_out_int8_three_scale,
+    m.def("func_w8a8o8_matmul",
+        &func_w8a8o8_matmul,
         "Int8 MatMul with three scales using CUTLASS (INT8 input/weight, BFloat16 per-element scale, INT8 output)");
     
     m.def("func_w8a8_matmul",
         &func_w8a8_matmul,
         "MatMul for INT8 input and INT8 weight with per-row and per-column scales using CUTLASS (INT8 input/weight, FP32 per-row and per-column scales, FP32 output)");
 
-    m.def("func_w8a8o8_matmul",
-        &func_w8a8o8_matmul,
+    m.def("func_w8a8o8_matmul_fusion",
+        &func_w8a8o8_matmul_fusion,
         "MatMul for INT8 input and INT8 weight with per-row and per-column scales using CUTLASS (INT8 input/weight, FP32 per-row and per-column scales, INT8 output)");
 
     m.def("func_dequant_transpose_requant",
