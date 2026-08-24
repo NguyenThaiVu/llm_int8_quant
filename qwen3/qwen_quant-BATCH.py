@@ -1,6 +1,5 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # select GPU "0", "1", "2",...
-
 import time
 import torch
 torch.manual_seed(123)
@@ -25,7 +24,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
 
 class Custom_GroupedQueryAttention(nn.Module):
     def __init__(
@@ -51,13 +50,12 @@ class Custom_GroupedQueryAttention(nn.Module):
         self.W_value = Custom_Linear(d_in, num_kv_groups * head_dim).to(dtype)
         self.out_proj = Custom_Linear(self.d_out, d_in).to(dtype)
 
-        self.query_rope = Custom_RoPE(num_heads, max_seq_len=MAX_SEQ_LEN, head_dim=head_dim).to(dtype)
-        self.key_rope = Custom_RoPE(num_kv_groups, max_seq_len=MAX_SEQ_LEN, head_dim=head_dim).to(dtype)
+        self.query_rope = Custom_RoPE(num_heads, head_dim=head_dim).to(dtype)
+        self.key_rope = Custom_RoPE(num_kv_groups, head_dim=head_dim).to(dtype)
         
         self.softmax_layer = Custom_Softmax(num_heads=num_heads).to(dtype)    
-        self.qk_score_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)
-        self.context_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN,\
-            is_return_float=True).to(dtype)
+        self.qk_score_layer = Custom_Matmul(num_heads=num_heads).to(dtype)
+        self.context_layer = Custom_Matmul(num_heads=num_heads, is_return_float=True).to(dtype)
         
         self.q_norm = Custom_RMSNorm(head_dim, eps=1e-6).to(dtype)
         self.k_norm = Custom_RMSNorm(head_dim, eps=1e-6).to(dtype)
@@ -166,8 +164,8 @@ class Custom_GroupedQueryAttention(nn.Module):
         return out
     
     def finish_calibration(self):
-        self.W_query.finish_calibration()
         # Key and Value use the same smooth alpha as Query
+        self.W_query.finish_calibration()
         smooth_query = self.W_query.smooth_alpha
         self.W_key.finish_calibration(alpha=smooth_query) 
         self.W_value.finish_calibration(alpha=smooth_query) 
@@ -179,7 +177,6 @@ class Custom_GroupedQueryAttention(nn.Module):
         self.softmax_layer.finish_calibration()
         self.qk_score_layer.finish_calibration()
         self.context_layer.finish_calibration()
-        # self.out_proj.finish_calibration()
         self.is_quantized = True
 
 
@@ -424,13 +421,12 @@ if __name__ == "__main__":
 
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=1_000)
+                                                    split="train", n=10_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
 
     # Construct calibration batches
     CALIBRATION_BATCH_SIZE = BATCH_SIZE
-
     calibration_chunks = [
         calibrate_tokens[i:i + PPL_CONTEXT_TOKENS]
         for i in range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE)
@@ -489,7 +485,6 @@ if __name__ == "__main__":
     print(f"Context size: {PPL_CONTEXT_TOKENS}")
     print(f"Batch size: {CALIBRATION_BATCH_SIZE}\n")
         
-    
     print("\nProfiling the quantized model...")
     with torch.profiler.profile(
         activities=[

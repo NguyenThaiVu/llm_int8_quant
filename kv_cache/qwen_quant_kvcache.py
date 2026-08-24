@@ -22,7 +22,7 @@ from utils_evaluation import load_wikitext_single_text
 from utils_generation import generate_text_autoregressive
 
 
-CHOOSE_MODEL = "8B" # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "14B" # Options: "4B", "8B", "14B"
 
 # Select which model to use via the following flag; only one can be True
 USE_BASE_MODEL = True
@@ -260,10 +260,10 @@ print(f"Number of generated tokens: {generated_tokens}\n")
 # ========================================================
 # 4. Calibration for quantization
 # ========================================================
-PPL_CONTEXT_TOKENS = 512
+PPL_CONTEXT_TOKENS = 1024
 EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2 
-N_SAMPLES = 1_000
+N_SAMPLES = 10_000
 
 print("\nCollecting calibration for quantization...")
 calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,

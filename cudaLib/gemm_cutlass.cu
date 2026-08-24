@@ -37,6 +37,14 @@ using namespace torch::indexing;
 // PyBind entry point
 // ================================================================
 
+std::tuple<torch::Tensor, torch::Tensor> func_quantize_i8(
+    torch::Tensor input  // BF16, shape (M, K)
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(input.device());
+    return quantize_row_int8_cuda(input);
+}
+
+
 torch::Tensor func_bf16_gemv(
     torch::Tensor input,   // BF16 - shape (1, K) or (B, M, K)
     torch::Tensor weight,  // BF16 - shape (N, K)
@@ -77,6 +85,22 @@ torch::Tensor func_i8_gemv_out_i8(
         return int8_gemv_out_i8(input, weight, x_scale, w_scale, y_scale, alpha);
     } else if (input.dim() == 4) {
         return int8_gemv_out_i8_4d(input, weight, x_scale, w_scale, y_scale, alpha);
+    } else {
+        throw std::invalid_argument("Input tensor must be 2D or 3D or 4D");
+    }
+}
+
+std::tuple<torch::Tensor, torch::Tensor> func_i8_gemv_out_i8_separate(
+    torch::Tensor input,   // INT8 - shape (1, K) or (B, M, K)
+    torch::Tensor weight,  // INT8 - shape (N, K)
+    torch::Tensor x_scale, // FP32 - shape (1, 1) or (B, M, 1)
+    torch::Tensor w_scale, // FP32 - shape (N, 1)
+    float alpha            // FP32
+) {
+    const at::cuda::OptionalCUDAGuard device_guard(input.device());
+    if (input.dim() <= 4) {
+        torch::Tensor out = func_i8_gemv_out_bf16(input, weight, x_scale, w_scale, alpha);
+        return func_quantize_i8(out);
     } else {
         throw std::invalid_argument("Input tensor must be 2D or 3D or 4D");
     }
@@ -257,9 +281,9 @@ std::tuple<torch::Tensor, torch::Tensor> func_w8a8o8_matmul(
     if (input.dim() == 2) {
         return matmul_w8a8_quantize_row_host(input, weight, row_scale, col_scale);
     } else if (input.dim() == 3) {
-        return matmul_w8a8_quantize_row_host_batched_host(input, weight, row_scale, col_scale);
+        return matmul_w8a8_quantize_row_batched_host(input, weight, row_scale, col_scale);
     } else if (input.dim() == 4) {
-        return matmul_w8a8_quantize_row_host_batched_host(input, weight, row_scale, col_scale);
+        return matmul_w8a8_quantize_row_batched_host(input, weight, row_scale, col_scale);
     } else {
         throw std::invalid_argument("Input tensor must be 2D or 3D");
     }
@@ -329,14 +353,6 @@ torch::Tensor func_apply_hadamard(
     return apply_hadamard_cuda(input);
 }
 
-std::tuple<torch::Tensor, torch::Tensor> func_quantize_i8(
-    torch::Tensor input  // BF16, shape (M, K)
-) {
-    const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    return quantize_row_int8_cuda(input);
-}
-
-
 std::tuple<torch::Tensor, torch::Tensor> func_quantize_i8_smooth_cuda(
     torch::Tensor input,  // BF16, shape (M, K)
     torch::Tensor smooth_scale // FP32, shape (K,)
@@ -358,6 +374,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("func_i8_gemv_out_i8",
         &func_i8_gemv_out_i8,
         "Int8 GEMV with output quantization using DP4A (INT8 input/weight, INT8 output)");
+    
+    m.def("func_i8_gemv_out_i8_separate",
+        &func_i8_gemv_out_i8_separate,
+        "Int8 GEMV and return quantized output. (INT8 input/weight, INT8 output)");
 
     m.def("func_int8_matmul",
         &func_int8_matmul,

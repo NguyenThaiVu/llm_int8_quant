@@ -22,7 +22,7 @@ from utils_evaluation import load_wikitext_single_text
 from utils_generation import generate_text_autoregressive, benchmark_llm_decode
 
 
-CHOOSE_MODEL = "8B" # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "14B" # Options: "4B", "8B", "14B"
 
 # Select which model to use via the following flag; only one can be True
 USE_BASE_MODEL = True
@@ -210,8 +210,8 @@ tokenizer = Qwen3Tokenizer(
 # ========================================================
 # 4. Text generation with KV cache
 # ========================================================
-INPUT_PROMPT_LENGTH = 512
-MAX_NEW_TOKENS = 512
+INPUT_PROMPT_LENGTH = 256
+MAX_NEW_TOKENS = 256
 print("[INFO] INPUT PROMPT LENGTH:", INPUT_PROMPT_LENGTH)
 print("[INFO] MAX NEW TOKENS:", MAX_NEW_TOKENS)
 
@@ -261,7 +261,7 @@ print(f"Total time: {result['total_time']:.4f} ms\n")
 PPL_CONTEXT_TOKENS = 512
 EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2 
-N_SAMPLES = 1_000
+N_SAMPLES = 5_000
 
 print("\nCollecting calibration for quantization...")
 calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,

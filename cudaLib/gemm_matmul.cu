@@ -1195,11 +1195,11 @@ std::tuple<torch::Tensor, torch::Tensor> matmul_w8a8_quantize_row_host(
 }
 
 
-std::tuple<torch::Tensor, torch::Tensor> matmul_w8a8_quantize_row_host_batched_host(
-    torch::Tensor A,           // int8 [B, M, K] or [B0, B1, M, K]
-    torch::Tensor B,           // int8 [B, N, K] or [B0, B1, N, K]
-    torch::Tensor row_scales,  // fp32 [B, M] or [B0, B1, M]
-    torch::Tensor col_scales   // fp32 [B, N] or [B0, B1, N]
+std::tuple<torch::Tensor, torch::Tensor> matmul_w8a8_quantize_row_batched_host(
+    torch::Tensor A,
+    torch::Tensor B,
+    torch::Tensor row_scales,
+    torch::Tensor col_scales
 ) {
     TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
     TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
@@ -1208,120 +1208,206 @@ std::tuple<torch::Tensor, torch::Tensor> matmul_w8a8_quantize_row_host_batched_h
 
     TORCH_CHECK(A.dtype() == torch::kChar, "A must be torch.int8");
     TORCH_CHECK(B.dtype() == torch::kChar, "B must be torch.int8");
-    TORCH_CHECK(row_scales.dtype() == torch::kFloat32, "row_scales must be float32");
-    TORCH_CHECK(col_scales.dtype() == torch::kFloat32, "col_scales must be float32");
+    TORCH_CHECK(
+        row_scales.dtype() == torch::kFloat32,
+        "row_scales must be float32"
+    );
+    TORCH_CHECK(
+        col_scales.dtype() == torch::kFloat32,
+        "col_scales must be float32"
+    );
 
-    TORCH_CHECK(A.dim() == 3 || A.dim() == 4, "A must be 3D or 4D");
-    TORCH_CHECK(B.dim() == A.dim(), "B must have the same number of dimensions as A");
+    TORCH_CHECK(
+        A.dim() == 3 || A.dim() == 4,
+        "A must have shape [B,M,K] or [B0,B1,M,K]"
+    );
 
-    const bool is_4d = (A.dim() == 4);
+    const bool is_4d = A.dim() == 4;
 
-    int64_t outer_batch;
+    int64_t batch_count;
     int64_t M;
-    int64_t K;
     int64_t N;
+    int64_t K;
+
+    torch::Tensor A_flat;
+    torch::Tensor B_flat;
+    torch::Tensor row_scales_flat;
+    torch::Tensor col_scales_flat;
 
     std::vector<int64_t> output_shape;
-    std::vector<int64_t> scale_output_shape;
+    std::vector<int64_t> output_scale_shape;
 
-    torch::Tensor A_3d;
-    torch::Tensor B_3d;
-    torch::Tensor row_scales_2d;
-    torch::Tensor col_scales_2d;
+    bool B_is_shared = false;
+    bool col_scales_are_shared = false;
 
-    // ============================================================
-    // Case 1: 3D input
-    // A: [B, M, K]
-    // B: [B, N, K]
-    // ============================================================
     if (!is_4d) {
+        // A: [B, M, K]
         const int64_t Bsz = A.size(0);
+
         M = A.size(1);
         K = A.size(2);
+        batch_count = Bsz;
 
-        TORCH_CHECK(B.size(0) == Bsz, "For 3D input, B.size(0) must match A.size(0)");
-        TORCH_CHECK(B.size(2) == K, "For 3D input, B.size(2) must match A.size(2)");
+        TORCH_CHECK(
+            row_scales.dim() == 2 &&
+            row_scales.size(0) == Bsz &&
+            row_scales.size(1) == M,
+            "row_scales must have shape [B, M]"
+        );
 
-        N = B.size(1);
-        outer_batch = Bsz;
+        if (B.dim() == 2) {
+            // Shared weight: [N, K]
+            B_is_shared = true;
 
-        TORCH_CHECK(row_scales.dim() == 2, "For 3D A, row_scales must be [B, M]");
-        TORCH_CHECK(row_scales.size(0) == Bsz &&
-                    row_scales.size(1) == M, "For 3D A, row_scales shape must be [B, M]");
+            TORCH_CHECK(
+                B.size(1) == K,
+                "Shared B must have shape [N, K]"
+            );
 
-        TORCH_CHECK(col_scales.dim() == 2, "For 3D A, col_scales must be [B, N]");
-        TORCH_CHECK(col_scales.size(0) == Bsz &&
-                    col_scales.size(1) == N, "For 3D A, col_scales shape must be [B, N]");
+            N = B.size(0);
 
-        A_3d = A.contiguous();
-        B_3d = B.contiguous();
-        row_scales_2d = row_scales.contiguous();
-        col_scales_2d = col_scales.contiguous();
+            TORCH_CHECK(
+                col_scales.dim() == 1 &&
+                col_scales.size(0) == N,
+                "For shared B, col_scales must have shape [N]"
+            );
+
+            col_scales_are_shared = true;
+        } else {
+            // Batched weight: [B, N, K]
+            TORCH_CHECK(
+                B.dim() == 3 &&
+                B.size(0) == Bsz &&
+                B.size(2) == K,
+                "B must have shape [B, N, K]"
+            );
+
+            N = B.size(1);
+
+            TORCH_CHECK(
+                col_scales.dim() == 2 &&
+                col_scales.size(0) == Bsz &&
+                col_scales.size(1) == N,
+                "For batched B, col_scales must have shape [B, N]"
+            );
+        }
+
+        A_flat = A.contiguous();
+        row_scales_flat = row_scales.contiguous();
+
+        if (B_is_shared) {
+            B_flat = B.contiguous();
+            col_scales_flat = col_scales.contiguous();
+        } else {
+            B_flat = B.contiguous();
+            col_scales_flat = col_scales.contiguous();
+        }
 
         output_shape = {Bsz, M, N};
-        scale_output_shape = {Bsz, M};
-    }
-
-    // ============================================================
-    // Case 2: 4D input
-    // A: [B0, B1, M, K]
-    // B: [B0, B1, N, K]
-    // ============================================================
-    else {
+        output_scale_shape = {Bsz, M};
+    } else {
+        // A: [B0, B1, M, K]
         const int64_t B0 = A.size(0);
         const int64_t B1 = A.size(1);
 
         M = A.size(2);
         K = A.size(3);
+        batch_count = B0 * B1;
 
-        TORCH_CHECK(B.size(0) == B0, "For 4D input, B.size(0) must match A.size(0)");
-        TORCH_CHECK(B.size(1) == B1, "For 4D input, B.size(1) must match A.size(1)");
-        TORCH_CHECK(B.size(3) == K, "For 4D input, B.size(3) must match A.size(3)");
+        TORCH_CHECK(
+            row_scales.dim() == 3 &&
+            row_scales.size(0) == B0 &&
+            row_scales.size(1) == B1 &&
+            row_scales.size(2) == M,
+            "row_scales must have shape [B0, B1, M]"
+        );
 
-        N = B.size(2);
-        outer_batch = B0 * B1;
+        if (B.dim() == 2) {
+            // Shared weight: [N, K]
+            B_is_shared = true;
 
-        TORCH_CHECK(row_scales.dim() == 3, "For 4D A, row_scales must be [B0, B1, M]");
-        TORCH_CHECK(row_scales.size(0) == B0 &&
-                    row_scales.size(1) == B1 &&
-                    row_scales.size(2) == M,
-                    "For 4D A, row_scales shape must be [B0, B1, M]");
+            TORCH_CHECK(
+                B.size(1) == K,
+                "Shared B must have shape [N, K]"
+            );
 
-        TORCH_CHECK(col_scales.dim() == 3,
-                    "For 4D A, col_scales must be [B0, B1, N]");
-        TORCH_CHECK(col_scales.size(0) == B0 &&
-                    col_scales.size(1) == B1 &&
-                    col_scales.size(2) == N,
-                    "For 4D A, col_scales shape must be [B0, B1, N]");
+            N = B.size(0);
 
-        A_3d = A.contiguous().reshape({outer_batch, M, K});
-        B_3d = B.contiguous().reshape({outer_batch, N, K});
+            TORCH_CHECK(
+                col_scales.dim() == 1 &&
+                col_scales.size(0) == N,
+                "For shared B, col_scales must have shape [N]"
+            );
 
-        row_scales_2d = row_scales.contiguous().reshape({outer_batch, M});
-        col_scales_2d = col_scales.contiguous().reshape({outer_batch, N});
+            col_scales_are_shared = true;
+        } else {
+            // Batched weight: [B0, B1, N, K]
+            TORCH_CHECK(
+                B.dim() == 4 &&
+                B.size(0) == B0 &&
+                B.size(1) == B1 &&
+                B.size(3) == K,
+                "B must have shape [B0, B1, N, K]"
+            );
+
+            N = B.size(2);
+
+            TORCH_CHECK(
+                col_scales.dim() == 3 &&
+                col_scales.size(0) == B0 &&
+                col_scales.size(1) == B1 &&
+                col_scales.size(2) == N,
+                "For batched B, col_scales must have shape [B0, B1, N]"
+            );
+        }
+
+        A_flat = A.contiguous().reshape({batch_count, M, K});
+        row_scales_flat =
+            row_scales.contiguous().reshape({batch_count, M});
+
+        if (B_is_shared) {
+            B_flat = B.contiguous();
+            col_scales_flat = col_scales.contiguous();
+        } else {
+            B_flat =
+                B.contiguous().reshape({batch_count, N, K});
+
+            col_scales_flat =
+                col_scales.contiguous().reshape({batch_count, N});
+        }
 
         output_shape = {B0, B1, M, N};
-        scale_output_shape = {B0, B1, M};
+        output_scale_shape = {B0, B1, M};
     }
 
-    auto out_3d = torch::empty(
-        {outer_batch, M, N},
+    auto out_flat = torch::empty(
+        {batch_count, M, N},
         A.options().dtype(torch::kChar)
     );
 
-    auto out_scales_2d = torch::empty(
-        {outer_batch, M},
-        torch::dtype(torch::kFloat32).device(A.device())
+    auto out_scales_flat = torch::empty(
+        {batch_count, M},
+        row_scales.options()
     );
 
-    // ============================================================
-    // Reuse existing 2D function per flattened item
-    // ============================================================
-    for (int64_t b = 0; b < outer_batch; ++b) {
-        auto A_b = A_3d.select(0, b).contiguous();              // [M, K]
-        auto B_b = B_3d.select(0, b).contiguous();              // [N, K]
-        auto row_scales_b = row_scales_2d.select(0, b).contiguous(); // [M]
-        auto col_scales_b = col_scales_2d.select(0, b).contiguous(); // [N]
+    for (int64_t b = 0; b < batch_count; ++b) {
+        auto A_b = A_flat.select(0, b);
+        auto row_scales_b = row_scales_flat.select(0, b);
+
+        torch::Tensor B_b;
+        torch::Tensor col_scales_b;
+
+        if (B_is_shared) {
+            B_b = B_flat;
+        } else {
+            B_b = B_flat.select(0, b);
+        }
+
+        if (col_scales_are_shared) {
+            col_scales_b = col_scales_flat;
+        } else {
+            col_scales_b = col_scales_flat.select(0, b);
+        }
 
         auto result = matmul_w8a8_quantize_row_host(
             A_b,
@@ -1330,15 +1416,12 @@ std::tuple<torch::Tensor, torch::Tensor> matmul_w8a8_quantize_row_host_batched_h
             col_scales_b
         );
 
-        auto out_b_result = std::get<0>(result);        // [M, N]
-        auto scale_b_result = std::get<1>(result);      // [M]
-
-        out_3d.select(0, b).copy_(out_b_result);
-        out_scales_2d.select(0, b).copy_(scale_b_result);
+        out_flat.select(0, b).copy_(std::get<0>(result));
+        out_scales_flat.select(0, b).copy_(std::get<1>(result));
     }
 
-    auto out = out_3d.reshape(output_shape);
-    auto out_scales = out_scales_2d.reshape(scale_output_shape);
-
-    return {out, out_scales};
+    return {
+        out_flat.reshape(output_shape),
+        out_scales_flat.reshape(output_scale_shape)
+    };
 }
