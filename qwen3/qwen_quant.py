@@ -21,7 +21,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
 
 class Qwen3Model_Quant(nn.Module):
     def __init__(self, cfg):
@@ -153,9 +153,9 @@ if __name__ == "__main__":
     # ================================================================
     # 3. Text generation
     # ================================================================
-    MAX_NEW_TOKENS = 1024
-    PPL_CONTEXT_TOKENS = 1024
-    EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
+    MAX_NEW_TOKENS = 2048
+    PPL_CONTEXT_TOKENS = 2048
+    EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
     # list_prompts = ["What is the capital of VietNam?",\
@@ -182,7 +182,7 @@ if __name__ == "__main__":
     # ================================================================
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=10_000)
+                                                    split="train", n=1_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             
@@ -251,58 +251,58 @@ if __name__ == "__main__":
     
     measure_power(model, input_ids, n_iterations=10)
 
-    # # ================================================================
-    # # 5. PPL evaluation
-    # # ================================================================
-    print(f"[INFO] ...Start Evaluation...")
-    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
-    ppl = compute_ppl_single_text(model,
-                                tokenizer,
-                                samples,
-                                context_size=PPL_CONTEXT_TOKENS,
-                                stride=PPL_STRIDE)
-    print(f"\nPPL: {ppl}")
-    print(f"Model Information: ")
-    print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    print(f"Context size: {PPL_CONTEXT_TOKENS}")
-    print(f"Dataset evaluation: {EVALUATION_DATASET}")
+    # # # ================================================================
+    # # # 5. PPL evaluation
+    # # # ================================================================
+    # print(f"[INFO] ...Start Evaluation...")
+    # samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+    # ppl = compute_ppl_single_text(model,
+    #                             tokenizer,
+    #                             samples,
+    #                             context_size=PPL_CONTEXT_TOKENS,
+    #                             stride=PPL_STRIDE)
+    # print(f"\nPPL: {ppl}")
+    # print(f"Model Information: ")
+    # print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    # print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    # print(f"Dataset evaluation: {EVALUATION_DATASET}")
     
-    # ================================================================
-    # 6. ARC-Easy evaluation
-    # ================================================================
-    NUM_ARC_SAMPLES = None  # Use None for the complete test set
-    list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
-    for DATASET_ARC in list_data_set_arc:
-        print(f"\n[INFO] Start {DATASET_ARC} Evaluation...")
+    # # ================================================================
+    # # 6. ARC-Easy evaluation
+    # # ================================================================
+    # NUM_ARC_SAMPLES = None  # Use None for the complete test set
+    # list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
+    # for DATASET_ARC in list_data_set_arc:
+    #     print(f"\n[INFO] Start {DATASET_ARC} Evaluation...")
         
-        arc_result = evaluate_arc(
-            model=model,
-            tokenizer=tokenizer,
-            device=device,
-            subset=DATASET_ARC,
-            max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
-        )
-        print(f"{DATASET_ARC} results")
-        print(f"Model: Qwen3-{CHOOSE_MODEL}")
-        print(f"Number of questions: {arc_result['num_samples']}")
-        print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
-        print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}% \n")
+    #     arc_result = evaluate_arc(
+    #         model=model,
+    #         tokenizer=tokenizer,
+    #         device=device,
+    #         subset=DATASET_ARC,
+    #         max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
+    #     )
+    #     print(f"{DATASET_ARC} results")
+    #     print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    #     print(f"Number of questions: {arc_result['num_samples']}")
+    #     print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
+    #     print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}% \n")
     
-    # ================================================================
-    # 7. PIQA evaluation
-    # ================================================================
-    NUM_PIQA_SAMPLES = None  # None uses the complete validation set
-    print("[INFO] Start PIQA Evaluation...\n")
+    # # ================================================================
+    # # 7. PIQA evaluation
+    # # ================================================================
+    # NUM_PIQA_SAMPLES = None  # None uses the complete validation set
+    # print("[INFO] Start PIQA Evaluation...\n")
 
-    piqa_result = evaluate_piqa(
-        model=model,
-        tokenizer=tokenizer,
-        device=device,
-        max_samples=NUM_PIQA_SAMPLES,
-    )
+    # piqa_result = evaluate_piqa(
+    #     model=model,
+    #     tokenizer=tokenizer,
+    #     device=device,
+    #     max_samples=NUM_PIQA_SAMPLES,
+    # )
 
-    print("\nPIQA results")
-    print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    print(f"Number of questions: {piqa_result['num_samples']}")
-    print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
-    print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")
+    # print("\nPIQA results")
+    # print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    # print(f"Number of questions: {piqa_result['num_samples']}")
+    # print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
+    # print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")
