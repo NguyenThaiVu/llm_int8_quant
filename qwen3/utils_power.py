@@ -102,7 +102,7 @@ def measure_power(func, *args, n_iterations=1_000, unit='J'):
 
     torch.cuda.synchronize()
     time.sleep(1)  # Allow power to stabilize
-    torch.cuda.empty_cache()
+    # torch.cuda.empty_cache()
     
     sampler.start()
     start_time = torch.cuda.Event(enable_timing=True)

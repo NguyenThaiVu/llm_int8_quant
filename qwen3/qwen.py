@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # select GPU "0", "1", "2",...
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # select GPU "0", "1", "2",...
 from pathlib import Path
 import zipfile
 import math
@@ -168,6 +168,21 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     print(f"[INFO] Output tokens: {out_ids.shape}")
     
+    # Measure latency
+    n_iter = 10
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    with torch.no_grad():
+        for _ in range(n_iter):
+            out_ids = model(input_ids)
+    end_event.record()
+    torch.cuda.synchronize()
+    elapsed_time_ms = start_event.elapsed_time(end_event)
+    avg_latency_ms = elapsed_time_ms / n_iter
+    print(f"[INFO] Average latency over {n_iter} iterations: {avg_latency_ms:.2f} ms")
+    
+    # Profiler to check each kernel execution time
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
@@ -181,6 +196,7 @@ if __name__ == "__main__":
             out_ids = model(input_ids)
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
     
+    # Measure power consumption
     measure_power(model, input_ids, n_iterations=10)
     
     # # ================================================================
@@ -201,43 +217,43 @@ if __name__ == "__main__":
     # print(f"Context size: {PPL_CONTEXT_TOKENS}")
     # print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")
     
-    # ================================================================
-    # 5. ARC-Easy evaluation
-    # ================================================================
-    NUM_ARC_SAMPLES = None  # Use None for the complete test set
-    # DATASET_ARC = "ARC-Easy"  # Options: "ARC-Easy", "ARC-Challenge"
-    list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
-    for DATASET_ARC in list_data_set_arc:
-        print(f"[INFO] Start {DATASET_ARC} Evaluation... \n")
+    # # ================================================================
+    # # 5. ARC-Easy evaluation
+    # # ================================================================
+    # NUM_ARC_SAMPLES = None  # Use None for the complete test set
+    # # DATASET_ARC = "ARC-Easy"  # Options: "ARC-Easy", "ARC-Challenge"
+    # list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
+    # for DATASET_ARC in list_data_set_arc:
+    #     print(f"[INFO] Start {DATASET_ARC} Evaluation... \n")
         
-        arc_result = evaluate_arc(
-            model=model,
-            tokenizer=tokenizer,
-            device=device,
-            subset=DATASET_ARC,
-            max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
-        )
-        print(f"\n{DATASET_ARC} results")
-        print(f"Model: Qwen3-{CHOOSE_MODEL}")
-        print(f"Number of questions: {arc_result['num_samples']}")
-        print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
-        print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}%")
+    #     arc_result = evaluate_arc(
+    #         model=model,
+    #         tokenizer=tokenizer,
+    #         device=device,
+    #         subset=DATASET_ARC,
+    #         max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
+    #     )
+    #     print(f"\n{DATASET_ARC} results")
+    #     print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    #     print(f"Number of questions: {arc_result['num_samples']}")
+    #     print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
+    #     print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}%")
     
-    # ================================================================
-    # 7. PIQA evaluation
-    # ================================================================
-    NUM_PIQA_SAMPLES = None  # None uses the complete validation set
-    print("[INFO] Start PIQA Evaluation...\n")
+    # # ================================================================
+    # # 7. PIQA evaluation
+    # # ================================================================
+    # NUM_PIQA_SAMPLES = None  # None uses the complete validation set
+    # print("[INFO] Start PIQA Evaluation...\n")
 
-    piqa_result = evaluate_piqa(
-        model=model,
-        tokenizer=tokenizer,
-        device=device,
-        max_samples=NUM_PIQA_SAMPLES,
-    )
+    # piqa_result = evaluate_piqa(
+    #     model=model,
+    #     tokenizer=tokenizer,
+    #     device=device,
+    #     max_samples=NUM_PIQA_SAMPLES,
+    # )
 
-    print("\nPIQA results")
-    print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    print(f"Number of questions: {piqa_result['num_samples']}")
-    print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
-    print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")
+    # print("\nPIQA results")
+    # print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    # print(f"Number of questions: {piqa_result['num_samples']}")
+    # print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
+    # print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")

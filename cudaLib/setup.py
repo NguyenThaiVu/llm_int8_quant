@@ -3,15 +3,18 @@ import pathlib
 
 # Check CUDA HOME can be /usr/local/cuda-12.4 or /usr/local/cuda-12.3
 
-if not os.environ.get("CUDA_HOME"):
-    if pathlib.Path("/usr/local/cuda-12.4").exists():
-        os.environ["CUDA_HOME"] = "/usr/local/cuda-12.4"
-    elif pathlib.Path("/usr/local/cuda-12.3").exists():
-        os.environ["CUDA_HOME"] = "/usr/local/cuda-12.3"
-    elif pathlib.Path("/home/tnguyen10/cuda-12.1").exists():
-        os.environ["CUDA_HOME"] = "/home/tnguyen10/cuda-12.1"
-    else:
-        raise EnvironmentError("CUDA_HOME is not set.")
+# if not os.environ.get("CUDA_HOME"):
+if pathlib.Path("/usr/local/cuda-12.4").exists():
+    os.environ["CUDA_HOME"] = "/usr/local/cuda-12.4"
+elif pathlib.Path("/usr/local/cuda-12.3").exists():
+    os.environ["CUDA_HOME"] = "/usr/local/cuda-12.3"
+elif pathlib.Path("/home/tnguyen10/cuda-12.8").exists():
+    os.environ["CUDA_HOME"] = "/home/tnguyen10/cuda-12.8"
+elif pathlib.Path("/home/tnguyen10/cuda-12.1").exists():
+    os.environ["CUDA_HOME"] = "/home/tnguyen10/cuda-12.1"
+else:
+    raise EnvironmentError("CUDA_HOME is not set.")
+print(f"\n[INFO] CUDA_HOME is set to {os.environ['CUDA_HOME']}\n")
 
 
 os.environ["PATH"] = f"{os.environ['CUDA_HOME']}/bin:" + os.environ["PATH"]
@@ -33,7 +36,6 @@ include_dirs = [f"{path_root}/cutlass/include",\
 #                 "/sciclone/home/tnguyen10/Desktop/GPU_learn/cutlass/tools/util/include",\
 #                 "/sciclone/home/tnguyen10/Desktop/GPU_learn"]
 
-
 cuda  = os.environ.get("CUDA_HOME", "")
 
 setup(
@@ -51,6 +53,7 @@ setup(
                     "-gencode=arch=compute_80,code=sm_80",
                     "-gencode=arch=compute_86,code=sm_86",
                     "-gencode=arch=compute_90,code=sm_90",
+                    "-gencode=arch=compute_120,code=sm_120",
                 ],
             },
         )

@@ -1,5 +1,5 @@
 import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # select GPU "0", "1", "2",...
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # select GPU "0", "1", "2",...
 from tqdm import tqdm
 import json
 import torch
@@ -155,7 +155,7 @@ if __name__ == "__main__":
     # ================================================================
     MAX_NEW_TOKENS = 2048
     PPL_CONTEXT_TOKENS = 2048
-    EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
+    EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
     # list_prompts = ["What is the capital of VietNam?",\
@@ -236,6 +236,21 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     print(f"[INFO] Output tokens: {out_ids.shape}")
     
+    # Measure latency 
+    n_iter = 10
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    with torch.no_grad():
+        for _ in range(n_iter):
+            out_ids = model(input_ids)
+    end_event.record()
+    torch.cuda.synchronize()
+    elapsed_time_ms = start_event.elapsed_time(end_event)
+    avg_latency_ms = elapsed_time_ms / n_iter
+    print(f"[INFO] Average model latency over {n_iter} iterations: {avg_latency_ms:.4f} ms.")
+    
+    # Profiler to measure latency and memory usage
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
@@ -249,6 +264,7 @@ if __name__ == "__main__":
             out_ids = model(input_ids)
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
     
+    # Measure power consumption
     measure_power(model, input_ids, n_iterations=10)
 
     # # # ================================================================
@@ -287,7 +303,24 @@ if __name__ == "__main__":
     #     print(f"Number of questions: {arc_result['num_samples']}")
     #     print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
     #     print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}% \n")
+    #     arc_result = evaluate_arc(
+    #         model=model,
+    #         tokenizer=tokenizer,
+    #         device=device,
+    #         subset=DATASET_ARC,
+    #         max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
+    #     )
+    #     print(f"{DATASET_ARC} results")
+    #     print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    #     print(f"Number of questions: {arc_result['num_samples']}")
+    #     print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
+    #     print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}% \n")
     
+    # # ================================================================
+    # # 7. PIQA evaluation
+    # # ================================================================
+    # NUM_PIQA_SAMPLES = None  # None uses the complete validation set
+    # print("[INFO] Start PIQA Evaluation...\n")
     # # ================================================================
     # # 7. PIQA evaluation
     # # ================================================================
@@ -300,7 +333,18 @@ if __name__ == "__main__":
     #     device=device,
     #     max_samples=NUM_PIQA_SAMPLES,
     # )
+    # piqa_result = evaluate_piqa(
+    #     model=model,
+    #     tokenizer=tokenizer,
+    #     device=device,
+    #     max_samples=NUM_PIQA_SAMPLES,
+    # )
 
+    # print("\nPIQA results")
+    # print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    # print(f"Number of questions: {piqa_result['num_samples']}")
+    # print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
+    # print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")
     # print("\nPIQA results")
     # print(f"Model: Qwen3-{CHOOSE_MODEL}")
     # print(f"Number of questions: {piqa_result['num_samples']}")

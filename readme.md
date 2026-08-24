@@ -6,6 +6,14 @@ or /usr/local/cuda-12.3/bin/nvcc
 
 CONDA Enable: source /sciclone/apps/miniforge3-24.9.2-0/etc/profile.d/conda.sh
 CONDA Enable: source /sciclone/apps/miniforge3-24.9.2-0/etc/profile.d/conda.sh
+CONDA Enable: source /opt/anaconda/bin/activate ds_env
+
+Set CUDA path
+`
+export CUDA_HOME=$HOME/cuda-12.8
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+`
 
 
 NSight System path: /usr/local/cuda-12.4/nsight-systems-2023.4.4/bin/nsys
@@ -26,5 +34,7 @@ ncu \
   --set full \
   -o report_softmax \
   ./softmax
+
+
 
 
