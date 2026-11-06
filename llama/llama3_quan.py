@@ -19,8 +19,9 @@ from utils_model_quan import *
 from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text,\
     evaluate_arc, evaluate_piqa 
 
+from utils_power import *
 
-LLAMA_SIZE_STR = "3B" # "1B" or "3B"
+LLAMA_SIZE_STR = "1B" # "1B" or "3B"
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
 
 MODEL_FOLDER = f"Llama-3.2-{LLAMA_SIZE_STR}-Instruct"
@@ -41,8 +42,147 @@ print(f"[INFO] Path to model directory: {LOCAL_DIR}")
 # ===============================================
 # 1. Define Model Architecture
 # ===============================================
+# class Custom_GroupedQueryAttention(nn.Module):
+#     def __init__(
+#         self, d_in, num_heads, num_kv_groups, head_dim=None, dtype=None
+#     ):
+#         super().__init__()
+#         assert num_heads % num_kv_groups == 0, "num_heads must be divisible by num_kv_groups"
 
-class Custom_GroupedQueryAttention(nn.Module):
+#         self.num_heads = num_heads
+#         self.num_kv_groups = num_kv_groups
+#         self.group_size = num_heads // num_kv_groups
+
+#         if head_dim is None:
+#             assert d_in % num_heads == 0, "`d_in` must be divisible by `num_heads` if `head_dim` is not set"
+#             head_dim = d_in // num_heads
+
+#         self.head_dim = head_dim
+#         self.d_out = num_heads * head_dim
+#         self.inv_softmax_scale = 1 / (head_dim ** 0.5) 
+
+#         self.W_query = Custom_Linear(d_in, self.d_out).to(dtype)
+#         self.W_key = Custom_Linear(d_in, num_kv_groups * head_dim).to(dtype)
+#         self.W_value = Custom_Linear(d_in, num_kv_groups * head_dim).to(dtype)
+#         self.out_proj = Custom_Linear(self.d_out, d_in).to(dtype)
+
+#         self.query_rope = Custom_RoPE(num_heads, head_dim=head_dim).to(dtype)
+#         self.key_rope = Custom_RoPE(num_kv_groups, head_dim=head_dim).to(dtype)
+        
+#         self.softmax_layer = Custom_Softmax(num_heads=num_heads).to(dtype)    
+#         self.qk_score_layer = Custom_Matmul(num_heads=num_heads).to(dtype)
+#         self.context_layer = Custom_Matmul(num_heads=num_heads, is_return_float=True).to(dtype)
+    
+#         self.is_quantized = False
+
+#     def forward(self, x, scale_x, mask, cos, scale_cos, sin, scale_sin):
+#         num_tokens, _ = x.shape
+
+#         if self.is_quantized == False:  
+#             queries, _ = self.W_query(x, 1.0)
+#             keys, _ = self.W_key(x, 1.0)
+#             values, _ = self.W_value(x, 1.0)
+            
+#             # Reshape and transpose for multi-head attention
+#             queries = queries.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
+#             keys = keys.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+#             values = values.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+            
+#             # Apply RoPE to Q and K
+#             queries, _ = self.query_rope(queries, 1.0, cos, 1.0, sin, 1.0)
+#             keys, _ = self.key_rope(keys, 1.0, cos, 1.0, sin, 1.0)
+            
+#             keys = keys.repeat_interleave(self.group_size, dim=0)
+#             values = values.repeat_interleave(self.group_size, dim=0)
+            
+#             # Attention score 
+#             attn_scores, _ = self.qk_score_layer(queries, 1.0, keys, 1.0) 
+            
+#             # Softmax the attention scores
+#             attn_scores = attn_scores.masked_fill(mask, -torch.inf)
+#             attn_scores = attn_scores * self.inv_softmax_scale
+#             attn_weights, _ = self.softmax_layer(attn_scores, 1.0, 1.0)         
+            
+#             # Compute context
+#             values = values.transpose(1, 2)  # Shape: (num_heads, head_dim, num_tokens)
+#             context, _ = self.context_layer(attn_weights, 1.0, values, 1.0)
+            
+#             # Compute output
+#             context = context.transpose(0, 1).reshape(num_tokens, self.d_out) 
+#             out, _ = self.out_proj(context, 1.0)
+#         else: 
+#             # === Quantized computation ===
+#             x_int8 = x
+#             x_scale = scale_x
+            
+#             queries_int8, queries_scale = self.W_query(x_int8, x_scale)
+#             keys_int8, keys_scale = self.W_key(x_int8, x_scale)
+#             values_int8, values_scale = self.W_value(x_int8, x_scale)
+            
+#             # Reshape for multi-head 
+#             queries_int8 = queries_int8.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
+#             queries_scale = queries_scale.unsqueeze(0).expand(self.num_heads, -1)
+            
+#             keys_int8 = keys_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+#             keys_scale = keys_scale.unsqueeze(0).expand(self.num_kv_groups, -1)
+
+#             values_int8 = values_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
+#             values_scale = values_scale.unsqueeze(0).expand(self.num_kv_groups, -1)
+            
+#             # Apply RoPE to quantized Q and K
+#             queries_int8, queries_scale = self.query_rope(queries_int8, queries_scale,\
+#                                         cos, scale_cos, sin, scale_sin)
+            
+#             keys_int8, keys_scale = self.key_rope(keys_int8, keys_scale,\
+#                                         cos, scale_cos, sin, scale_sin)
+            
+#             # Repeat K and V for grouped attention
+#             keys_int8 = keys_int8.repeat_interleave(self.group_size, dim=0)
+#             keys_scale = keys_scale.repeat_interleave(self.group_size, dim=0)
+#             values_int8 = values_int8.repeat_interleave(self.group_size, dim=0)
+#             values_scale = values_scale.repeat_interleave(self.group_size, dim=0)
+            
+#             # Attention score with quantization    
+#             attn_scores_int8, attn_scores_scale = self.qk_score_layer(queries_int8,\
+#                                                         queries_scale,\
+#                                                         keys_int8,\
+#                                                         keys_scale)
+            
+#             # Softmax the attention scores with quantization 
+#             attn_scores_scale = attn_scores_scale * self.inv_softmax_scale  # Adjust scale for softmax
+#             attn_weights_int8, attn_weights_scale = self.softmax_layer(attn_scores_int8,\
+#                                                     attn_scores_scale, mask)
+            
+#             # Compute context with quantization
+#             values_int8, values_scale = gemm_cutlass.func_dequant_transpose_requant(values_int8,\
+#                                                         values_scale)
+            
+#             context, _ = self.context_layer(attn_weights_int8,\
+#                                             attn_weights_scale,\
+#                                             values_int8,\
+#                                             values_scale)
+
+#             context = context.transpose(0, 1).reshape(num_tokens, self.d_out) 
+#             out, _ = self.out_proj(context, 1.0)  # Output float for better accuracy
+        
+#         return out
+    
+#     def finish_calibration(self):
+#         self.W_query.finish_calibration()
+#         # Key and Value use the same smooth alpha as Query
+#         smooth_query = self.W_query.smooth_alpha
+#         self.W_key.finish_calibration(alpha=smooth_query) 
+#         self.W_value.finish_calibration(alpha=smooth_query) 
+        
+#         self.query_rope.finish_calibration()
+#         self.key_rope.finish_calibration()
+#         self.softmax_layer.finish_calibration()
+#         self.qk_score_layer.finish_calibration()
+#         self.context_layer.finish_calibration()
+#         # self.out_proj.finish_calibration()
+#         self.is_quantized = True
+
+class Custom_GroupedQueryAttention_Hybrid(nn.Module):
     def __init__(
         self, d_in, num_heads, num_kv_groups, head_dim=None, dtype=None
     ):
@@ -52,6 +192,7 @@ class Custom_GroupedQueryAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_groups = num_kv_groups
         self.group_size = num_heads // num_kv_groups
+        self.dtype = dtype
 
         if head_dim is None:
             assert d_in % num_heads == 0, "`d_in` must be divisible by `num_heads` if `head_dim` is not set"
@@ -66,13 +207,12 @@ class Custom_GroupedQueryAttention(nn.Module):
         self.W_value = Custom_Linear(d_in, num_kv_groups * head_dim).to(dtype)
         self.out_proj = Custom_Linear(self.d_out, d_in).to(dtype)
 
-        self.query_rope = Custom_RoPE(num_heads, max_seq_len=MAX_SEQ_LEN, head_dim=head_dim).to(dtype)
-        self.key_rope = Custom_RoPE(num_kv_groups, max_seq_len=MAX_SEQ_LEN, head_dim=head_dim).to(dtype)
+        self.query_rope = Custom_RoPE(num_heads, head_dim=head_dim).to(dtype)
+        self.key_rope = Custom_RoPE(num_kv_groups, head_dim=head_dim).to(dtype)
         
         self.softmax_layer = Custom_Softmax(num_heads=num_heads).to(dtype)    
-        self.qk_score_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN).to(dtype)
-        self.context_layer = Custom_Matmul(num_heads=num_heads, max_seq_len=MAX_SEQ_LEN,\
-            is_return_float=True).to(dtype)
+        self.qk_score_layer = Custom_Matmul(num_heads=num_heads).to(dtype)
+        self.context_layer = Custom_Matmul(num_heads=num_heads, is_return_float=True).to(dtype)
     
         self.is_quantized = False
 
@@ -137,34 +277,35 @@ class Custom_GroupedQueryAttention(nn.Module):
             keys_int8, keys_scale = self.key_rope(keys_int8, keys_scale,\
                                         cos, scale_cos, sin, scale_sin)
             
-            # Repeat K and V for grouped attention
-            keys_int8 = keys_int8.repeat_interleave(self.group_size, dim=0)
-            keys_scale = keys_scale.repeat_interleave(self.group_size, dim=0)
-            values_int8 = values_int8.repeat_interleave(self.group_size, dim=0)
-            values_scale = values_scale.repeat_interleave(self.group_size, dim=0)
-            
-            # Attention score with quantization    
-            attn_scores_int8, attn_scores_scale = self.qk_score_layer(queries_int8,\
-                                                        queries_scale,\
-                                                        keys_int8,\
-                                                        keys_scale)
-            
-            # Softmax the attention scores with quantization 
-            attn_scores_scale = attn_scores_scale * self.inv_softmax_scale  # Adjust scale for softmax
-            attn_weights_int8, attn_weights_scale = self.softmax_layer(attn_scores_int8,\
-                                                    attn_scores_scale, mask)
-            
-            # Compute context with quantization
-            values_int8, values_scale = gemm_cutlass.func_dequant_transpose_requant(values_int8,\
-                                                        values_scale)
-            
-            context, _ = self.context_layer(attn_weights_int8,\
-                                            attn_weights_scale,\
-                                            values_int8,\
-                                            values_scale)
+            # --------------------------------------------------
+            # Hybrid boundary: INT8 -> BF16
+            # --------------------------------------------------
+            queries = (queries_int8.to(self.dtype) * queries_scale.unsqueeze(-1).to(self.dtype))
+            keys = (keys_int8.to(self.dtype) * keys_scale.unsqueeze(-1).to(self.dtype))
+            values = (values_int8.to(self.dtype) * values_scale.unsqueeze(-1).to(self.dtype))
 
-            context = context.transpose(0, 1).reshape(num_tokens, self.d_out) 
-            out, _ = self.out_proj(context, 1.0)  # Output float for better accuracy
+            queries = queries.unsqueeze(0)
+            keys = keys.unsqueeze(0)
+            values = values.unsqueeze(0)
+
+            # --------------------------------------------------
+            # FlashAttention / SDPA
+            # --------------------------------------------------
+            context = F.scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                dropout_p=0.0,
+                is_causal=True,
+                enable_gqa=True
+            )
+
+            # [1, Hq, S, D] -> [S, Hq * D]
+            context = context.squeeze(0)
+            context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
+
+            # Output projection
+            out, _ = self.out_proj(context, 1.0)
         
         return out
     
@@ -180,7 +321,6 @@ class Custom_GroupedQueryAttention(nn.Module):
         self.softmax_layer.finish_calibration()
         self.qk_score_layer.finish_calibration()
         self.context_layer.finish_calibration()
-        # self.out_proj.finish_calibration()
         self.is_quantized = True
 
     
@@ -189,7 +329,8 @@ class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
 
-        self.att = Custom_GroupedQueryAttention(
+        # self.att = Custom_GroupedQueryAttention(
+        self.att = Custom_GroupedQueryAttention_Hybrid(
             d_in=cfg["emb_dim"],
             num_heads=cfg["n_heads"],
             num_kv_groups=cfg["n_kv_groups"],
@@ -206,7 +347,7 @@ class TransformerBlock(nn.Module):
             theta_base=cfg["rope_base"],
             # context_length=cfg["context_length"],
             context_length=MAX_SEQ_LEN,
-            freq_config=cfg["rope_freq"]
+            # freq_config=cfg["rope_freq"]
         )
         self.register_buffer("cos", cos.to(cfg["dtype"]))
         self.register_buffer("sin", sin.to(cfg["dtype"]))
@@ -358,10 +499,10 @@ if __name__ == "__main__":
     # ===============================================
     # 4. Generate Text 
     # ===============================================
-    MAX_GENERATED_TOKENS = 1024
-    PPL_CONTEXT_TOKENS = 1024
+    MAX_GENERATED_TOKENS = 2048
+    PPL_CONTEXT_TOKENS = 2048
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-    EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
+    EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
     list_prompts = ["What is the capital of VietNam?"]
 
@@ -382,7 +523,7 @@ if __name__ == "__main__":
 
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=10_000)
+                                                    split="train", n=5_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             
@@ -398,55 +539,55 @@ if __name__ == "__main__":
     print(f"[INFO] Finished calibration.")
     model.to(device)
     model.eval()
-        
+    model = torch.compile(model)
+    print(f"\n[INFO] Model compiled successfully. Start evaluation... \n")
+    
     # ===============================================
-    # Measure Memory usage
+    # Measure Latency
     # ===============================================
     samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
     samples = tokenizer.encode(samples)
     chunk_tokens = samples[0:PPL_CONTEXT_TOKENS]
     input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
     print(f"[INFO] Input tokens: {input_ids.shape}")
-
-    # WARM-UP
-    with torch.no_grad():
-        _ = model(input_ids)
-    torch.cuda.synchronize()
-
-    time.sleep(1)  
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.synchronize()
-
-    # Actual measured run
-    with torch.no_grad():
-        out_ids = model(input_ids)
-    torch.cuda.synchronize()
-    print(f"[INFO] Output tokens: {out_ids.shape}")
-
-    def calc_gpu_gb(x):
-        return f"{x / 1024 / 1024 / 1024:.2f} GB"
-    print(f"GPU memory used: {calc_gpu_gb(torch.cuda.max_memory_allocated())}\n")
     
-    # ===============================================
-    # Measure Latency
-    # ===============================================
+    
     # Warm-up 
     for _ in range(5):
         with torch.no_grad():
             _ = model(input_ids)
     torch.cuda.synchronize()    
     
-    # Measured iterations
+    # Measure latency 
     n_iter = 10
-    time_start = time.time()
-    for _ in range(n_iter):
-        with torch.no_grad():
-            _ = model(input_ids)
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    with torch.no_grad():
+        for _ in range(n_iter):
+            out_ids = model(input_ids)
+    end_event.record()
     torch.cuda.synchronize()
-    end_time = time.time()
-    avg_time = (end_time - time_start) / n_iter
-    print(f"Latency per inference: {avg_time * 1000:.2f} ms")
+    elapsed_time_ms = start_event.elapsed_time(end_event)
+    avg_latency_ms = elapsed_time_ms / n_iter
+    print(f"[INFO] Average model latency over {n_iter} iterations: {avg_latency_ms:.4f} ms.")
+    
+    # Profiler to measure latency and memory usage
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+        with torch.no_grad():
+            out_ids = model(input_ids)
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
+    
+    # Measure power consumption
+    measure_power(model, input_ids, n_iterations=10)
     
     # ========================================================================
     # Quantization text generation
@@ -466,62 +607,62 @@ if __name__ == "__main__":
         output_text = token_ids_to_text(token_ids, tokenizer)
         print("\nResponse:\n", clean_text(output_text)) 
     
-    # ===============================================
-    # PPL evaluation after quantization
-    # ===============================================
-    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+    # # ===============================================
+    # # PPL evaluation after quantization
+    # # ===============================================
+    # samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
 
-    ppl = compute_ppl_single_text(model,
-                                tokenizer, 
-                                samples,
-                                context_size=PPL_CONTEXT_TOKENS,
-                                stride=PPL_STRIDE)
-    print("PPL (after quantization):", ppl)   
+    # ppl = compute_ppl_single_text(model,
+    #                             tokenizer, 
+    #                             samples,
+    #                             context_size=PPL_CONTEXT_TOKENS,
+    #                             stride=PPL_STRIDE)
+    # print("PPL (after quantization):", ppl)   
     
-    print("\nModel information:")
-    print(f" - Model: LLaMA-3.2-{LLAMA_SIZE_STR}-Instruct")
-    print(f"Context size: {PPL_CONTEXT_TOKENS}")
-    print(f"Dataset evaluation: {EVALUATION_DATASET}")
+    # print("\nModel information:")
+    # print(f" - Model: LLaMA-3.2-{LLAMA_SIZE_STR}-Instruct")
+    # print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    # print(f"Dataset evaluation: {EVALUATION_DATASET}")
     
-    # ===============================================
-    # 5. ARC-Easy evaluation
-    # ================================================================
-    NUM_ARC_SAMPLES = None  # Use None for the complete test set
-    # DATASET_ARC = "ARC-Easy"  # Options: "ARC-Easy", "ARC-Challenge"
-    list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
-    for DATASET_ARC in list_data_set_arc:
-        print(f"[INFO] Start {DATASET_ARC} Evaluation... \n")
+    # # ===============================================
+    # # 5. ARC-Easy evaluation
+    # # ================================================================
+    # NUM_ARC_SAMPLES = None  # Use None for the complete test set
+    # # DATASET_ARC = "ARC-Easy"  # Options: "ARC-Easy", "ARC-Challenge"
+    # list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
+    # for DATASET_ARC in list_data_set_arc:
+    #     print(f"[INFO] Start {DATASET_ARC} Evaluation... \n")
         
-        arc_result = evaluate_arc(
-            model=model,
-            tokenizer=tokenizer,
-            device=device,
-            subset=DATASET_ARC,
-            max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
-        )
-        print(f"\n{DATASET_ARC} results")
-        print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
-        print(f"Number of questions: {arc_result['num_samples']}")
-        print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
-        print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}%")
+    #     arc_result = evaluate_arc(
+    #         model=model,
+    #         tokenizer=tokenizer,
+    #         device=device,
+    #         subset=DATASET_ARC,
+    #         max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
+    #     )
+    #     print(f"\n{DATASET_ARC} results")
+    #     print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
+    #     print(f"Number of questions: {arc_result['num_samples']}")
+    #     print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
+    #     print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}%")
 
-    # ================================================================
-    # 7. PIQA evaluation
-    # ================================================================
-    NUM_PIQA_SAMPLES = None  # None uses the complete validation set
-    print("[INFO] Start PIQA Evaluation...\n")
+    # # ================================================================
+    # # 7. PIQA evaluation
+    # # ================================================================
+    # NUM_PIQA_SAMPLES = None  # None uses the complete validation set
+    # print("[INFO] Start PIQA Evaluation...\n")
 
-    piqa_result = evaluate_piqa(
-        model=model,
-        tokenizer=tokenizer,
-        device=device,
-        max_samples=NUM_PIQA_SAMPLES,
-    )
+    # piqa_result = evaluate_piqa(
+    #     model=model,
+    #     tokenizer=tokenizer,
+    #     device=device,
+    #     max_samples=NUM_PIQA_SAMPLES,
+    # )
 
-    print("\nPIQA results")
-    print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
-    print(f"Number of questions: {piqa_result['num_samples']}")
-    print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
-    print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")
+    # print("\nPIQA results")
+    # print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
+    # print(f"Number of questions: {piqa_result['num_samples']}")
+    # print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
+    # print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")
     
     

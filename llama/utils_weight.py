@@ -40,11 +40,21 @@ def load_weights_into_llama(model, param_config, params):
             params[f"model.layers.{l}.self_attn.o_proj.weight"],
             f"model.layers.{l}.self_attn.o_proj.weight"
         )
-        model.trf_blocks[l].norm1.weight = assign(
-            model.trf_blocks[l].norm1.weight,
-            params[f"model.layers.{l}.input_layernorm.weight"],
-            f"model.layers.{l}.input_layernorm.weight"
-        )
+        
+        if hasattr(model.trf_blocks[l].norm1, "weight"):
+            model.trf_blocks[l].norm1.weight = assign(
+                model.trf_blocks[l].norm1.weight,
+                params[f"model.layers.{l}.input_layernorm.weight"],
+                f"model.layers.{l}.input_layernorm.weight"
+            )
+        elif hasattr(model.trf_blocks[l].norm1, "scale"):
+            model.trf_blocks[l].norm1.scale = assign(
+                model.trf_blocks[l].norm1.scale,
+                params[f"model.layers.{l}.input_layernorm.weight"],
+                f"model.layers.{l}.input_layernorm.weight"
+            )
+        else:
+            raise ValueError(f"Layer {l} has no 'weight' or 'scale' attribute in norm1.")
 
         # Load FeedForward weights
         model.trf_blocks[l].ff.fc1.weight = assign(
@@ -62,11 +72,21 @@ def load_weights_into_llama(model, param_config, params):
             params[f"model.layers.{l}.mlp.down_proj.weight"],
             f"model.layers.{l}.mlp.down_proj.weight"
         )
-        model.trf_blocks[l].norm2.weight = assign(
-            model.trf_blocks[l].norm2.weight,
-            params[f"model.layers.{l}.post_attention_layernorm.weight"],
-            f"model.layers.{l}.post_attention_layernorm.weight"
-        )
+        
+        if hasattr(model.trf_blocks[l].norm2, "weight"):
+            model.trf_blocks[l].norm2.weight = assign(
+                model.trf_blocks[l].norm2.weight,
+                params[f"model.layers.{l}.post_attention_layernorm.weight"],
+                f"model.layers.{l}.post_attention_layernorm.weight"
+            )
+        elif hasattr(model.trf_blocks[l].norm2, "scale"):
+            model.trf_blocks[l].norm2.scale = assign(
+                model.trf_blocks[l].norm2.scale,
+                params[f"model.layers.{l}.post_attention_layernorm.weight"],
+                f"model.layers.{l}.post_attention_layernorm.weight"
+            )
+        else:
+            raise ValueError(f"Layer {l} has no 'weight' or 'scale' attribute in norm2.")
 
     # Load output layer weights
     model.final_norm.weight = assign(model.final_norm.weight, params["model.norm.weight"], "model.norm.weight")

@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # select GPU "0", "1", "2",...
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # select GPU "0", "1", "2",...
 from tqdm import tqdm
 import json
 import torch
@@ -21,7 +21,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
 
 class Qwen3Model_Quant(nn.Module):
     def __init__(self, cfg):
@@ -196,13 +196,15 @@ if __name__ == "__main__":
             
     model.finish_calibration()
     print(f"[INFO] Finished calibration.")
+    
+    model.eval()
+    model = torch.compile(model)
+    print(f"\n[INFO] Model compiled successfully. Start evaluation... \n")
 
 
     # ========================================================================
     # Quantization mode
     print("\n===== Generated text after quantization: =====\n")
-    # list_prompts = ["What is the capital of VietNam?",\
-    #                 "What is the Dragon Ball story?"]
     list_prompts = ["What is the capital of VietNam?"]
 
     for idx, prompt in enumerate(list_prompts):
@@ -222,7 +224,7 @@ if __name__ == "__main__":
     # ================================================================
     # 3. Measure latency
     # ================================================================
-    model.eval()
+    
 
     samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
     samples = tokenizer.encode(samples)

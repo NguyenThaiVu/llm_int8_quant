@@ -4,14 +4,7 @@ import matplotlib.pyplot as plt
 # --------------------------------------------------
 # Profiling data
 # --------------------------------------------------
-models = [
-    "Qwen 4B",
-    "Qwen 8B",
-    "Qwen 14B",
-    "Llama 3.2 1B",
-    "Llama 3.2 3B",
-]
-
+models = ["Qwen 4B", "Qwen 8B", "Qwen 14B", "Llama 3.2 1B", "Llama 3.2 3B"]
 categories = ["Matmul", "Reduction", "Element-wise", "Others"]
 
 times_ms = {
@@ -43,7 +36,7 @@ percentages = {
 # --------------------------------------------------
 # Create plot
 # --------------------------------------------------
-fig, ax = plt.subplots(figsize=(12, 7))
+fig, ax = plt.subplots(figsize=(12, 8))
 
 y_positions = np.arange(len(models))
 left = np.zeros(len(models))
@@ -76,10 +69,11 @@ for category_index, category in enumerate(categories):
             ax.text(
                 x_center,
                 y_center,
-                f"{width:.0f} ms\n({percentage}%)",
+                # f"{width:.0f} ms\n({percentage}%)",
+                f"{width:.0f}\n({percentage}%)",
                 ha="center",
                 va="center",
-                fontsize=9,
+                fontsize=12,
             )
 
         # Place labels above narrow segments
@@ -90,7 +84,7 @@ for category_index, category in enumerate(categories):
                 f"{width:.0f} ms",
                 ha="center",
                 va="bottom",
-                fontsize=8,
+                fontsize=10,
             )
 
     left += values
@@ -105,7 +99,7 @@ for model_index, model in enumerate(models):
         f"Total: {reported_totals_ms[model]} ms",
         ha="left",
         va="center",
-        fontsize=10,
+        fontsize=12,
         fontweight="bold",
     )
 
@@ -113,10 +107,10 @@ for model_index, model in enumerate(models):
 # Formatting
 # --------------------------------------------------
 ax.set_yticks(y_positions)
-ax.set_yticklabels(models, fontsize=11)
+ax.set_yticklabels(models, fontsize=13)
 ax.invert_yaxis()
 
-ax.set_xlabel("Prefill time (ms)", fontsize=12)
+ax.set_xlabel("Prefill time (ms)", fontsize=13)
 
 ax.set_title(
     "Prefill-Time Breakdown at 2,048-Token Context Length",
@@ -124,11 +118,13 @@ ax.set_title(
     pad=14,
 )
 
+# Show legend below the plot with 4 columns 
 ax.legend(
     ncol=4,
     loc="upper center",
     bbox_to_anchor=(0.5, -0.10),
     frameon=False,
+    fontsize=13
 )
 
 ax.grid(axis="x", alpha=0.25)
@@ -136,18 +132,13 @@ ax.grid(axis="x", alpha=0.25)
 ax.spines["top"].set_visible(False)
 ax.spines["right"].set_visible(False)
 
-ax.set_xlim(
-    0,
-    max(reported_totals_ms.values()) * 1.18,
-)
+ax.set_xlim(0, max(reported_totals_ms.values()) * 1.18)
 
 fig.tight_layout()
 
 # Save high-resolution figure
-fig.savefig(
-    "prefill_time_breakdown.png",
-    dpi=300,
-    bbox_inches="tight",
-)
+fig.savefig("prefill_time_breakdown.png", dpi=300, bbox_inches="tight")
+fig.savefig("prefill_time_breakdown.pdf", bbox_inches="tight")
+print(f"[INFO] Saved figure as 'prefill_time_breakdown.png' and 'prefill_time_breakdown.pdf'.")
 
-plt.show()
+# plt.show()

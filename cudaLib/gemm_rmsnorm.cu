@@ -626,6 +626,92 @@ __global__ void rmsnorm_int8_kernel(
     }
 }
 
+
+
+
+
+template <typename T>
+__global__ void rmsnorm_int8_kernel_opt(
+    const int8_t* __restrict__ x,
+    const float* __restrict__ scale_x,
+    const T* __restrict__ gamma,
+    int8_t* __restrict__ y,
+    float* __restrict__ scale_y,
+    int d_model,
+    float eps
+) {
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    const int tid = threadIdx.x;
+
+    const int64_t base = row * static_cast<int64_t>(d_model);
+
+    const int8_t* row_x = x + base;
+    int8_t* row_y = y + base;
+
+    const float sx = scale_x[row];
+
+    // -----------------------------------------------------
+    // Pass 1: Compute two statistics
+    // S = sum(q_i^2)
+    // A = max(abs(q_i * gamma_i))
+    // -----------------------------------------------------
+    SumMax stats = {0.0f, 0.0f};
+
+    for (int col = tid; col < d_model; col += BLOCK_SIZE) {
+        const float q = static_cast<float>(row_x[col]);
+        const float g = static_cast<float>(gamma[col]);
+
+        stats.sum += q * q;
+        stats.amax = fmaxf(stats.amax, fabsf(q * g));
+    }
+
+    // Combined block reduction
+    stats = block_reduce_sum_max<BLOCK_SIZE>(stats);
+
+    const float S = stats.sum;
+    const float A = stats.amax;
+
+    // -----------------------------------------------------
+    // Compute output scale.
+    // -----------------------------------------------------
+    if (tid == 0) {
+
+        // Computer rms_inv
+        const float mean_q2 = S / static_cast<float>(d_model);
+        const float rms_inv = rsqrtf(sx * sx * mean_q2 + eps);
+
+        const float alpha = sx * rms_inv;
+
+        // Compute output scale
+        const float sy = fabsf(alpha) * (A / 127.0f);
+        scale_y[row] = (sy > 0.0f) ? sy : 1.0f;
+    }
+
+    // -----------------------------------------------------
+    // Pass 2: Direct INT8 quantization
+    // y_q = round(127 * q * gamma / A)
+    // -----------------------------------------------------
+    float quant_mul = 0.0f;
+
+    if (A > 0.0f && sx != 0.0f) {
+        quant_mul = (sx > 0.0f ? 127.0f : -127.0f) / A;
+    }
+
+    for (int col = tid; col < d_model; col += BLOCK_SIZE) {
+        const float q = static_cast<float>(row_x[col]);
+        const float g = static_cast<float>(gamma[col]);
+
+        const float v = (q * g) * quant_mul;
+
+        int result = __float2int_rn(v);
+        result = max(-127, min(127, result));
+
+        row_y[col] = static_cast<int8_t>(result);
+    }
+}
+
+
+
 std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_cuda(
     torch::Tensor x,      // INT8 - (..., d_model)
     torch::Tensor scale_x,  // Float32 scalar scale for INT8 input
@@ -651,12 +737,11 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_cuda(
     auto gamma_contig = gamma.contiguous();
 
     const int64_t d_model = x_contig.size(-1);
-    TORCH_CHECK(d_model > 0, "d_model must be > 0");
     const int64_t n_rows = x_contig.numel() / d_model;
     TORCH_CHECK(n_rows * d_model == x_contig.numel(), "x.numel must be divisible by d_model");
 
-    TORCH_CHECK(scale_x.is_cuda() && scale_x.scalar_type() == torch::kFloat32,
-            "scale_x must be CUDA float32");
+    TORCH_CHECK(scale_x.is_cuda(), "scale_x must be CUDA");
+    TORCH_CHECK(scale_x.scalar_type() == torch::kFloat32, "scale_x must be float32");
     TORCH_CHECK(scale_x.numel() == n_rows, "scale_x must have n_rows elements");
 
     // output same shape as input
@@ -674,9 +759,8 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_cuda(
         gamma_contig.scalar_type(),
         "rmsnorm_int8_cuda",
         AT_DISPATCH_CASE(at::ScalarType::Float, [&] {
-            cudaFuncAttributes attr;
-            cudaFuncGetAttributes(&attr, rmsnorm_int8_kernel<float>);
-            rmsnorm_int8_kernel<float><<<grid, block, shmem_bytes, stream>>>(
+            // rmsnorm_int8_kernel<float><<<grid, block, shmem_bytes, stream>>>(
+            rmsnorm_int8_kernel_opt<float><<<grid, block, shmem_bytes, stream>>>(
                 x_contig.data_ptr<int8_t>(),
                 scale_x_contig.data_ptr<float>(),
                 gamma_contig.data_ptr<float>(),
@@ -688,9 +772,8 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_cuda(
         })
 
         AT_DISPATCH_CASE(at::ScalarType::BFloat16, [&] {
-            cudaFuncAttributes attr;
-            cudaFuncGetAttributes(&attr, rmsnorm_int8_kernel<at::BFloat16>);
-            rmsnorm_int8_kernel<at::BFloat16><<<grid, block, shmem_bytes, stream>>>(
+            // rmsnorm_int8_kernel<at::BFloat16><<<grid, block, shmem_bytes, stream>>>(
+            rmsnorm_int8_kernel_opt<at::BFloat16><<<grid, block, shmem_bytes, stream>>>(
                 x_contig.data_ptr<int8_t>(),
                 scale_x_contig.data_ptr<float>(),
                 gamma_contig.data_ptr<at::BFloat16>(),
@@ -705,6 +788,9 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_int8_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return std::make_tuple(y.view(x.sizes()), scale_y.view(scale_x.sizes()));  
 }
+
+
+
 
 
 /*

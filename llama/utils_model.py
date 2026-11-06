@@ -130,26 +130,47 @@ class GroupedQueryAttention(nn.Module):
         keys = apply_rope(keys, cos, sin)
         queries = apply_rope(queries, cos, sin)
 
-        # Expand keys and values to match the number of heads
-        # Shape: (num_heads, num_tokens, head_dim)
-        keys = keys.repeat_interleave(self.group_size, dim=0)  
-        values = values.repeat_interleave(self.group_size, dim=0)
+        # # Expand keys and values to match the number of heads
+        # # Shape: (num_heads, num_tokens, head_dim)
+        # keys = keys.repeat_interleave(self.group_size, dim=0)  
+        # values = values.repeat_interleave(self.group_size, dim=0)
 
-        # Compute attention scores
-        attn_scores = queries @ keys.transpose(1, 2)
-        attn_scores = attn_scores.masked_fill(mask, -torch.inf)
+        # # Compute attention scores
+        # attn_scores = queries @ keys.transpose(1, 2)
+        # attn_scores = attn_scores.masked_fill(mask, -torch.inf)
 
-        attn_weights = torch.softmax(attn_scores / keys.shape[-1]**0.5, dim=-1)
-        assert keys.shape[-1] == self.head_dim
+        # attn_weights = torch.softmax(attn_scores / keys.shape[-1]**0.5, dim=-1)
+        # assert keys.shape[-1] == self.head_dim
 
-        # Shape: (num_tokens, num_heads, head_dim)
-        context_vec = (attn_weights @ values).transpose(0, 1).contiguous()
+        # # Shape: (num_tokens, num_heads, head_dim)
+        # context_vec = attn_weights @ values
+        
+        if 1:
+            context_vec = F.scaled_dot_product_attention(
+                                    queries.unsqueeze(0),
+                                    keys.unsqueeze(0),
+                                    values.unsqueeze(0),
+                                        is_causal=True,
+                                        enable_gqa=True
+                                    ).squeeze(0)
+        else:
+            # 4. Expand K and V to match number of heads
+            keys = keys.repeat_interleave(self.group_size, dim=0)
+            values = values.repeat_interleave(self.group_size, dim=0)
 
-        # Combine heads, where self.d_out = self.num_heads * self.head_dim
+            # 5. Attention
+            attn_scores = queries @ keys.transpose(1, 2)
+            attn_scores = attn_scores.masked_fill(mask, -torch.inf)
+            attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
+
+            # 6. Output
+            context_vec = attn_weights @ values  # Shape: (num_heads, num_tokens, head_dim)
+        
+        context_vec = context_vec.transpose(0, 1).contiguous()  # Shape: (num_tokens, num_heads, head_dim)
         context_vec = context_vec.reshape(num_tokens, self.d_out)
-        context_vec = self.out_proj(context_vec)  # optional projection
-
-        return context_vec
+        
+        out = self.out_proj(context_vec) 
+        return out
     
     
 class TransformerBlock(nn.Module):

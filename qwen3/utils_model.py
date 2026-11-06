@@ -1,6 +1,7 @@
 import os 
 import torch 
 from torch import nn
+from torch.nn import functional as F
 
 class FeedForward(nn.Module):
     def __init__(self, cfg):
@@ -131,17 +132,28 @@ class SmoothQuant_GroupedQueryAttention(nn.Module):
         queries = apply_rope(queries, cos, sin)
         keys = apply_rope(keys, cos, sin)
 
-        # 4. Expand K and V to match number of heads
-        keys = keys.repeat_interleave(self.group_size, dim=0)
-        values = values.repeat_interleave(self.group_size, dim=0)
+        if 1:
+            context = F.scaled_dot_product_attention(
+                                    queries.unsqueeze(0),
+                                    keys.unsqueeze(0),
+                                    values.unsqueeze(0),
+                                        is_causal=True,
+                                        enable_gqa=True
+                                    ).squeeze(0)
+        else:
+            # 4. Expand K and V to match number of heads
+            keys = keys.repeat_interleave(self.group_size, dim=0)
+            values = values.repeat_interleave(self.group_size, dim=0)
 
-        # 5. Attention
-        attn_scores = queries @ keys.transpose(1, 2)
-        attn_scores = attn_scores.masked_fill(mask, -torch.inf)
-        attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
+            # 5. Attention
+            attn_scores = queries @ keys.transpose(1, 2)
+            attn_scores = attn_scores.masked_fill(mask, -torch.inf)
+            attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
 
-        # 6. Output
-        context = attn_weights @ values  # Shape: (num_heads, num_tokens, head_dim)
+            # 6. Output
+            context = attn_weights @ values  # Shape: (num_heads, num_tokens, head_dim)
+        
+        
         context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
         return self.out_proj(context)
     

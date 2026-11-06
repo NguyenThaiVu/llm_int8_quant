@@ -61,7 +61,7 @@ def quantize_row_int8_symmetric_nd(
     return q_mat, scales.to(scale_dtype)
 
 
-def measure_time(func, *args, repeat=100):
+def measure_time(func, *args, repeat=1_000, n_warmup=100):
     """
     Measure the average execution time of a function over a number of repetitions.
 
@@ -79,7 +79,7 @@ def measure_time(func, *args, repeat=100):
     
     # warm-up
     with torch.no_grad():
-        for _ in range(5):
+        for _ in range(n_warmup):
             func(*args)
 
     torch.cuda.synchronize()
@@ -95,6 +95,7 @@ def measure_time(func, *args, repeat=100):
     torch.cuda.synchronize()
     elapsed_time = start_event.elapsed_time(end_event) / repeat 
     return elapsed_time
+
 
 
 class MinMaxObserverPerLastDim(nn.Module): 

@@ -1,100 +1,52 @@
 """
-In this script,  
-- We verify the correctness of our custom RMSNorm with PyTorch's built-in RMSNorm. 
-- We evaluate the performance of our INT8 quantized version against the bfloat16 version.
-- We test both 2D and 3D inputs.
+In this script, we verify the correctness and latency of the RMSNorm implementation, between:
+- PyTorch.
+- Our Kernel.
 """
 
-import os 
-import torch
-import torch.nn.functional as F
-import gemm_cutlass
-from utils_quant import *
+import os
+import torch 
+from torch import nn
 
-class Custom_RMSNorm(torch.nn.Module):
-    def __init__(self, d_model, eps=1e-6):
-        super().__init__()
-        self.d_model = d_model
-        self.norm_shape = (d_model,)
-        self.eps = eps
-        self.weight = torch.nn.Parameter(torch.ones(d_model))
-        self.is_quantized = False
-    
-    def forward(self, x, scale_x=1.0):
-        if self.is_quantized == False:
-            y = F.rms_norm(x, self.norm_shape, self.weight, eps=self.eps)
-            return y
-        else:
-            x_int8, scale_x = gemm_cutlass.func_rmsnorm_int8(x, scale_x, self.weight, self.eps)
-            return x_int8, scale_x
-    
-    def finish_calibration(self):
-        self.is_quantized = True
+from utils_quant import quantize_row_int8_symmetric_nd, measure_time
+
+import gemm_cutlass
+
+
 
 if __name__ == "__main__":
+    device = "cuda"
+    dtype = torch.bfloat16
+    L = 2048
+    d = 1024 * 8
     
-    # =========================== 2D Input ====================================
-    seq_len = 2048
-    embed_dim = 8192
-    print(f"\nTesting RMSNorm with 2D input, seq_len={seq_len}, embed_dim={embed_dim}")
+    X = torch.randn((L, d), device=device, dtype=dtype)
+    gamma = torch.randn((d,), device=device, dtype=dtype)
     
-    # list_seq_len = [1024, 2048, 3072]
-    # list_embed_dim = [2048, 4096, 5120, 8192]
-    d_type = torch.bfloat16
+    # 1. Torch RMSNorm
+    rmsnorm = nn.RMSNorm(d, eps=1e-5).to(device=device, dtype=dtype)
+    rmsnorm.weight.data = gamma
+    rmsnorm.eval()
+    rmsnorm = torch.compile(rmsnorm)
     
-    # for seq_len in list_seq_len:
-        # for embed_dim in list_embed_dim:
-    print(f"\nTesting RMSNorm with seq_len={seq_len}, embed_dim={embed_dim}")
-    x = torch.randn((seq_len, embed_dim), dtype=d_type, device='cuda')
-    gamma = torch.randn((embed_dim,), dtype=d_type, device='cuda')
+    Y = rmsnorm(X)
+    time_torch = measure_time(rmsnorm, X)
+    print(f"PyTorch RMSNorm time: {time_torch:.6f} seconds")
     
-    rmsnorm_layer = Custom_RMSNorm(embed_dim).cuda()
-    rmsnorm_layer.weight.data.copy_(gamma)
+    # 2. Our Kernel RMSNorm
+    X_i8, scale_X = quantize_row_int8_symmetric_nd(X)
     
-    # Baseline with PyTorch
-    y_torch = rmsnorm_layer(x, 1.0)
-    torch_rmsnorm_time = measure_time(rmsnorm_layer, x, 1.0)
-    print(f"PyTorch RMSNorm time: {torch_rmsnorm_time:.2f} ms")
+    our_time = measure_time(gemm_cutlass.func_rmsnorm_int8, X_i8, scale_X, gamma, 1e-6)
+    print(f"Our Kernel RMSNorm time: {our_time:.6f} seconds")
     
-    # quantization
-    rmsnorm_layer.finish_calibration()
-    x_int8, scale_x = quantize_row_int8_symmetric_nd(x)
+    Y_i8, scale_Y = gemm_cutlass.func_rmsnorm_int8(X_i8, scale_X, gamma, 1e-6)
+    Y_deq = Y_i8.to(torch.float32) * scale_Y.unsqueeze(-1)
     
-    y_int8, scale_y = rmsnorm_layer(x_int8, scale_x)
-    int8_rmsnorm_time = measure_time(rmsnorm_layer, x_int8, scale_x)
-    print(f"INT8 RMSNorm time: {int8_rmsnorm_time:.2f} ms\n")
-
-    # y_dequant = y_int8.to(torch.float32) * scale_y.unsqueeze(-1)
-    # y_dequant = y_dequant.to(d_type)
+    max_diff = (Y - Y_deq).abs().max()
+    print(f"Max difference: {max_diff:.6f}")
+    mse = ((Y - Y_deq) ** 2).mean().item()
+    print(f"MSE: {mse:.6f}")
     
-    # compare
-    # print("Max absolute difference:", (y_dequant - y_torch).abs().max().item())
-    # print("Mean absolute difference:", (y_dequant - y_torch).abs().mean().item(), "\n")        
-    # print(f"Sample output (torch): {y_torch[:5, :5]}")
-    # print(f"Sample output (dequantized): {y_dequant[:5, :5]}\n")
-    
-    # ============================== 3D Input ====================================
-    batch_size = 16
-    seq_len = 128
-    embed_dim = 8192
-    print(f"\nTesting RMSNorm with 3D input, batch_size={batch_size}, seq_len={seq_len}, embed_dim={embed_dim}")
-    X = torch.randn((batch_size, seq_len, embed_dim), dtype=d_type, device='cuda')
-    gamma = torch.randn((embed_dim,), dtype=d_type, device='cuda')
-    rmsnorm_layer = Custom_RMSNorm(embed_dim).cuda()
-    rmsnorm_layer.weight.data.copy_(gamma)
-    
-    # Baseline with PyTorch
-    Y_torch = rmsnorm_layer(X, 1.0)
-    torch_rmsnorm_time = measure_time(rmsnorm_layer, X, 1.0)
-    print(f"PyTorch RMSNorm time: {torch_rmsnorm_time:.2f} ms") 
-    
-    # quantization
-    rmsnorm_layer.finish_calibration()
-    X_int8, scale_X = quantize_row_int8_symmetric_nd(X) 
-    
-    Y_int8, scale_Y = rmsnorm_layer(X_int8, scale_X)
-    int8_rmsnorm_time = measure_time(rmsnorm_layer, X_int8, scale_X)
-    print(f"INT8 RMSNorm time: {int8_rmsnorm_time:.2f} ms\n")
     
     
     

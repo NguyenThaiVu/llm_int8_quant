@@ -17,10 +17,11 @@ from config import get_llama_config
 from tokenizer import Tokenizer
 from utils_weight import load_weights_into_llama    
 from utils_generation import *
-from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text
+from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text, evaluate_arc, evaluate_piqa
+from utils_power import measure_power
 
 
-LLAMA_SIZE_STR = "3B" # "1B" or "3B"
+LLAMA_SIZE_STR = "1B" # "1B" or "3B"
 IS_INSTRUCT = True # True or False
 
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
@@ -421,3 +422,76 @@ with torch.profiler.profile(
         out_ids = int8_model(input_ids)
 
 print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
+
+# =================================================
+# Measure Latency 
+# =================================================
+
+samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+samples = tokenizer.encode(samples)
+
+chunk_tokens = samples[0: PPL_CONTEXT_TOKENS]
+
+input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
+print(f"[INFO] Input tokens: {input_ids.shape}")
+
+with torch.no_grad():
+    out_ids = int8_model(input_ids)
+print(f"[INFO] Output tokens: {out_ids.shape}")
+    
+with torch.profiler.profile(
+    activities=[
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ],
+    record_shapes=True,
+    profile_memory=True,
+    with_stack=True
+) as prof:
+    with torch.no_grad():
+        out_ids = int8_model(input_ids)
+
+print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
+
+measure_power(int8_model, input_ids, n_iterations=100)
+
+# # ===============================================
+# # 5. ARC-Easy evaluation
+# # ================================================================
+# NUM_ARC_SAMPLES = None  # Use None for the complete test set
+# list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
+# for DATASET_ARC in list_data_set_arc:
+#     print(f"[INFO] Start {DATASET_ARC} Evaluation... \n")
+    
+#     arc_result = evaluate_arc(
+#         model=model,
+#         tokenizer=tokenizer,
+#         device=device,
+#         subset=DATASET_ARC,
+#         max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
+#     )
+#     print(f"\n{DATASET_ARC} results")
+#     print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
+#     print(f"Number of questions: {arc_result['num_samples']}")
+#     print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
+#     print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}%")
+
+# # ================================================================
+# # 7. PIQA evaluation
+# # ================================================================
+# NUM_PIQA_SAMPLES = None  # None uses the complete validation set
+# print("[INFO] Start PIQA Evaluation...\n")
+
+# piqa_result = evaluate_piqa(
+#     model=model,
+#     tokenizer=tokenizer,
+#     device=device,
+#     max_samples=NUM_PIQA_SAMPLES,
+# )
+
+# print("\nPIQA results")
+# print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
+# print(f"Number of questions: {piqa_result['num_samples']}")
+# print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
+# print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")
+

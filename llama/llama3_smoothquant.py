@@ -23,8 +23,11 @@ from utils_model_quan import compute_smooth_alpha, PerChannelAbsMaxObserver
 from utils_model import compute_rope_params, apply_rope
 import gemm_cutlass
 
+from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text, evaluate_arc, evaluate_piqa
+from utils_power import measure_power
 
-LLAMA_SIZE_STR = "3B" # "1B" or "3B"
+
+LLAMA_SIZE_STR = "1B" # "1B" or "3B"
 IS_INSTRUCT = True # True or False
 
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
@@ -242,7 +245,6 @@ class SmoothQuant_FeedForward(nn.Module):
         self.silu_mul_layer.enable_smooth_scale(fc3_smooth_alpha)
         
         self.is_quantized = True
-
 
 class SmoothQuant_GroupedQueryAttention(nn.Module):
     def __init__(
@@ -532,7 +534,6 @@ for prompt in list_prompts:
     output_text = token_ids_to_text(token_ids, tokenizer)
     print("\nResponse:\n", clean_text(output_text))
     
-    
 # # =================================================
 # Quantization
 # # =================================================
@@ -567,45 +568,43 @@ ppl = compute_ppl_single_text(model,
                             context_size=PPL_CONTEXT_TOKENS,
                             stride=PPL_STRIDE)
 
-# ================================================================
-# Measure latency
-# ================================================================
+print()
+print(f"\nPPL (SmoothQuant technique): {ppl} \n")
+print(f"Evaluation Information:")
+print(f"Model: LLaMA 3.2 {LLAMA_SIZE_STR} {'Instruct' if IS_INSTRUCT else 'Base'}")
+print(f"Context size for evaluation: {PPL_CONTEXT_TOKENS}")
+print(f"Dataset: {EVALUATION_DATASET}")
+
+# ===============================================
+# Measure Latency
+# ===============================================
+samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
 samples = tokenizer.encode(samples)
 chunk_tokens = samples[0:PPL_CONTEXT_TOKENS]
 input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
-
 print(f"[INFO] Input tokens: {input_ids.shape}")
 
-# Warm-up
-with torch.no_grad():
-    out_ids = model(input_ids)
-torch.cuda.synchronize()
-
-print(f"[INFO] Output tokens: {out_ids.shape}")
-
-# Clear previous peak stats after warm-up
-torch.cuda.reset_peak_memory_stats()
-torch.cuda.synchronize()
-
-# Actual measured run
-with torch.no_grad():
-    out_ids = model(input_ids)
-torch.cuda.synchronize()
-
-def calc_gpu_gb(x):
-    return f"{x / 1024 / 1024 / 1024:.2f} GB"
-print(f"GPU memory used: {calc_gpu_gb(torch.cuda.max_memory_allocated())}")
-
-start_time = time.time()
-for _ in range(10):
+# Warm-up 
+for _ in range(5):
     with torch.no_grad():
+        _ = model(input_ids)
+torch.cuda.synchronize()    
+
+# Measure latency 
+n_iter = 10
+start_event = torch.cuda.Event(enable_timing=True)
+end_event = torch.cuda.Event(enable_timing=True)
+start_event.record()
+with torch.no_grad():
+    for _ in range(n_iter):
         out_ids = model(input_ids)
+end_event.record()
 torch.cuda.synchronize()
-end_time = time.time()
-avg_time = (end_time - start_time) / 10
-print(f"Average inference time (context length = {PPL_CONTEXT_TOKENS}): {avg_time:.4f} seconds")
+elapsed_time_ms = start_event.elapsed_time(end_event)
+avg_latency_ms = elapsed_time_ms / n_iter
+print(f"[INFO] Average model latency over {n_iter} iterations: {avg_latency_ms:.4f} ms.")
 
-
+# Profiler to measure latency and memory usage
 with torch.profiler.profile(
     activities=[
         torch.profiler.ProfilerActivity.CPU,
@@ -617,11 +616,48 @@ with torch.profiler.profile(
 ) as prof:
     with torch.no_grad():
         out_ids = model(input_ids)
+print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
 
-print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=50))
-print()
-print(f"\nPPL (SmoothQuant technique): {ppl} \n")
-print(f"Evaluation Information:")
-print(f"Model: LLaMA 3.2 {LLAMA_SIZE_STR} {'Instruct' if IS_INSTRUCT else 'Base'}")
-print(f"Context size for evaluation: {PPL_CONTEXT_TOKENS}")
-print(f"Dataset: {EVALUATION_DATASET}")
+# Measure power consumption
+measure_power(model, input_ids, n_iterations=10)
+
+
+# # ===============================================
+# # 5. ARC-Easy evaluation
+# # ================================================================
+# NUM_ARC_SAMPLES = None  # Use None for the complete test set
+# list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
+# for DATASET_ARC in list_data_set_arc:
+#     print(f"[INFO] Start {DATASET_ARC} Evaluation... \n")
+    
+#     arc_result = evaluate_arc(
+#         model=model,
+#         tokenizer=tokenizer,
+#         device=device,
+#         subset=DATASET_ARC,
+#         max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
+#     )
+#     print(f"\n{DATASET_ARC} results")
+#     print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
+#     print(f"Number of questions: {arc_result['num_samples']}")
+#     print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
+#     print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}%")
+
+# # ================================================================
+# # 7. PIQA evaluation
+# # ================================================================
+# NUM_PIQA_SAMPLES = None  # None uses the complete validation set
+# print("[INFO] Start PIQA Evaluation...\n")
+
+# piqa_result = evaluate_piqa(
+#     model=model,
+#     tokenizer=tokenizer,
+#     device=device,
+#     max_samples=NUM_PIQA_SAMPLES,
+# )
+
+# print("\nPIQA results")
+# print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
+# print(f"Number of questions: {piqa_result['num_samples']}")
+# print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
+# print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")

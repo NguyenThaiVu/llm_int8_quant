@@ -14,7 +14,7 @@ from tokenizer import Tokenizer
 from utils_weight import load_weights_into_llama    
 from utils_generation import *
 from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text, evaluate_arc, evaluate_piqa
-from utils_model import print_tensor_memory_all_attrs
+from utils_power import measure_power
 
 
 LLAMA_SIZE_STR = "1B" # "1B" or "3B"
@@ -101,10 +101,10 @@ print(f"[INFO] Weights loaded successfully.\n")
 # ===============================================
 # 4. Generate Text
 # ===============================================
-MAX_GENERATED_TOKENS = 1024
-PPL_CONTEXT_TOKENS = 1024
+MAX_GENERATED_TOKENS = 2048
+PPL_CONTEXT_TOKENS = 2048
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
+EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
 
 list_prompts = ["What is the capital of Vietnam?",]
 
@@ -124,20 +124,20 @@ for prompt in list_prompts:
 # 5. Evaluation
 # ===============================================
 
-samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+# samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
 
-ppl = compute_ppl_single_text(model,
-                            tokenizer, 
-                            samples,
-                            context_size=PPL_CONTEXT_TOKENS,
-                            stride=PPL_STRIDE)
-print(f"\nPPL: {ppl} \n")
-print("Model information:")
-print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
-print(f"Context size: {PPL_CONTEXT_TOKENS}")
+# ppl = compute_ppl_single_text(model,
+#                             tokenizer, 
+#                             samples,
+#                             context_size=PPL_CONTEXT_TOKENS,
+#                             stride=PPL_STRIDE)
+# print(f"\nPPL: {ppl} \n")
+# print("Model information:")
+# print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
+# print(f"Context size: {PPL_CONTEXT_TOKENS}")
 
 # ===============================================
-# Measure Memory usage
+# Measure Latency
 # ===============================================
 samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
 samples = tokenizer.encode(samples)
@@ -145,87 +145,80 @@ chunk_tokens = samples[0:PPL_CONTEXT_TOKENS]
 input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
 print(f"[INFO] Input tokens: {input_ids.shape}")
 
-
-time.sleep(1)  
-torch.cuda.empty_cache()
-torch.cuda.reset_peak_memory_stats()
-torch.cuda.synchronize()
-
-# Actual measured run
-with torch.no_grad():
-    out_ids = model(input_ids)
-torch.cuda.synchronize()
-print(f"[INFO] Output tokens: {out_ids.shape}")
-
-def calc_gpu_gb(x):
-    return f"{x / 1024 / 1024 / 1024:.2f} GB"
-print(f"GPU memory used: {calc_gpu_gb(torch.cuda.max_memory_allocated())}\n")
-
-total_model_size = sum(p.numel() * p.element_size() for p in model.parameters())
-print(f"Total model size: {calc_gpu_gb(total_model_size)}\n")
-
-embed_size = model.tok_emb.weight.numel() * model.tok_emb.weight.element_size()
-logit_layer_size = model.out_head.weight.numel() * model.out_head.weight.element_size()
-print(f"Embedding layer size: {calc_gpu_gb(embed_size)}")
-print(f"Logit layer size: {calc_gpu_gb(logit_layer_size)}\n")
-
-# ===============================================
-# Measure Latency
-# ===============================================
 # Warm-up 
 for _ in range(5):
     with torch.no_grad():
         _ = model(input_ids)
 torch.cuda.synchronize()    
 
-# Measured iterations
+# Measure latency 
 n_iter = 10
-start_time = time.time()
-for _ in range(n_iter):
-    with torch.no_grad():
-        _ = model(input_ids)
+start_event = torch.cuda.Event(enable_timing=True)
+end_event = torch.cuda.Event(enable_timing=True)
+start_event.record()
+with torch.no_grad():
+    for _ in range(n_iter):
+        out_ids = model(input_ids)
+end_event.record()
 torch.cuda.synchronize()
-end_time = time.time()
-avg_latency = (end_time - start_time) / n_iter
-print(f"Average latency per run: {avg_latency:.4f} seconds")
+elapsed_time_ms = start_event.elapsed_time(end_event)
+avg_latency_ms = elapsed_time_ms / n_iter
+print(f"[INFO] Average model latency over {n_iter} iterations: {avg_latency_ms:.4f} ms.")
 
-# ===============================================
-# 5. ARC-Easy evaluation
-# ================================================================
-NUM_ARC_SAMPLES = None  # Use None for the complete test set
-# DATASET_ARC = "ARC-Easy"  # Options: "ARC-Easy", "ARC-Challenge"
-list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
-for DATASET_ARC in list_data_set_arc:
-    print(f"[INFO] Start {DATASET_ARC} Evaluation... \n")
+# Profiler to measure latency and memory usage
+with torch.profiler.profile(
+    activities=[
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ],
+    record_shapes=True,
+    profile_memory=True,
+    with_stack=True
+) as prof:
+    with torch.no_grad():
+        out_ids = model(input_ids)
+print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
+
+# Measure power consumption
+measure_power(model, input_ids, n_iterations=10)
     
-    arc_result = evaluate_arc(
-        model=model,
-        tokenizer=tokenizer,
-        device=device,
-        subset=DATASET_ARC,
-        max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
-    )
-    print(f"\n{DATASET_ARC} results")
-    print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
-    print(f"Number of questions: {arc_result['num_samples']}")
-    print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
-    print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}%")
+# # ===============================================
+# # 5. ARC-Easy evaluation
+# # ================================================================
+# NUM_ARC_SAMPLES = None  # Use None for the complete test set
+# # DATASET_ARC = "ARC-Easy"  # Options: "ARC-Easy", "ARC-Challenge"
+# list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
+# for DATASET_ARC in list_data_set_arc:
+#     print(f"[INFO] Start {DATASET_ARC} Evaluation... \n")
+    
+#     arc_result = evaluate_arc(
+#         model=model,
+#         tokenizer=tokenizer,
+#         device=device,
+#         subset=DATASET_ARC,
+#         max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
+#     )
+#     print(f"\n{DATASET_ARC} results")
+#     print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
+#     print(f"Number of questions: {arc_result['num_samples']}")
+#     print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
+#     print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}%")
 
-# ================================================================
-# 7. PIQA evaluation
-# ================================================================
-NUM_PIQA_SAMPLES = None  # None uses the complete validation set
-print("[INFO] Start PIQA Evaluation...\n")
+# # ================================================================
+# # 7. PIQA evaluation
+# # ================================================================
+# NUM_PIQA_SAMPLES = None  # None uses the complete validation set
+# print("[INFO] Start PIQA Evaluation...\n")
 
-piqa_result = evaluate_piqa(
-    model=model,
-    tokenizer=tokenizer,
-    device=device,
-    max_samples=NUM_PIQA_SAMPLES,
-)
+# piqa_result = evaluate_piqa(
+#     model=model,
+#     tokenizer=tokenizer,
+#     device=device,
+#     max_samples=NUM_PIQA_SAMPLES,
+# )
 
-print("\nPIQA results")
-print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
-print(f"Number of questions: {piqa_result['num_samples']}")
-print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
-print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")
+# print("\nPIQA results")
+# print(f"Model: Llama-3.2-{LLAMA_SIZE_STR}")
+# print(f"Number of questions: {piqa_result['num_samples']}")
+# print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
+# print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")

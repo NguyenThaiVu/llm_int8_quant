@@ -36,31 +36,6 @@ inline __device__ float warp_reduce_max(float v) {
     return v;
 }
 
-// inline __device__ float block_reduce_max(float v) {
-//     __shared__ float smem[32];
-//     int lane = threadIdx.x & 31; // index within the warp
-//     int warp = threadIdx.x >> 5; // warp index within the block
-
-//     v = warp_reduce_max(v);
-
-//     if (lane == 0) smem[warp] = v;
-//     __syncthreads();
-
-//     // Only the first warp will read the results from shared memory
-//     float out = 0.0f;
-//     if (warp == 0) {
-//         int nw = (blockDim.x + 31) >> 5;  // number of warps in the block
-//         out = (lane < nw) ? smem[lane] : 0.0f;
-//         out = warp_reduce_max(out);
-//     }
-//     __syncthreads();
-
-//     if (threadIdx.x == 0) smem[0] = out;
-//     __syncthreads();
-//     return smem[0];
-// }
-
-
 __device__ __forceinline__ float block_reduce_max(float v) {
     __shared__ float smem[32];
 
@@ -220,3 +195,69 @@ __inline__ __device__ float block_reduce_max_float(float val) {
 
     return val;
 }
+
+
+struct SumMax {
+    float sum;
+    float amax;
+};
+
+template <int THREADS> 
+__device__ __forceinline__ SumMax block_reduce_sum_max(SumMax v) {
+    static_assert(THREADS >= 32 &&
+                  THREADS <= 1024 &&
+                  THREADS % 32 == 0);
+
+    constexpr int NUM_WARPS = THREADS / 32;
+    constexpr unsigned MASK = 0xffffffffu;
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    // Step 1: Reduce both statistics within each WARP
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v.sum += __shfl_down_sync(MASK, v.sum, offset);
+        v.amax = fmaxf(v.amax,__shfl_down_sync(MASK, v.amax, offset));
+    }
+
+    // Fast path: one warp requires no shared memory
+    if constexpr (NUM_WARPS == 1) {
+        v.sum  = __shfl_sync(MASK, v.sum, 0);
+        v.amax = __shfl_sync(MASK, v.amax, 0);
+        return v;
+    } else {
+        __shared__ SumMax partial[NUM_WARPS];
+
+        // Step 2: Each warp stores its partial results
+        if (lane == 0) {
+            partial[warp] = v;
+        }
+        __syncthreads();
+
+        // Step 3: Warp 0 reduces the warp results
+        if (warp == 0) {
+            SumMax total;
+            total.sum = (lane < NUM_WARPS) ? partial[lane].sum : 0.0f;
+
+            total.amax = (lane < NUM_WARPS) ? partial[lane].amax : 0.0f;
+
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                total.sum += __shfl_down_sync(MASK, total.sum, offset);
+                total.amax = fmaxf(total.amax, __shfl_down_sync( MASK, total.amax, offset));
+            }
+
+            // Assign the final result to shared memory at index 0
+            if (lane == 0) {
+                partial[0] = total;
+            }
+        }
+        __syncthreads();
+        return partial[0];
+    }
+}
+
+
+

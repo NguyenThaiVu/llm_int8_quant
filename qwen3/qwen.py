@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # select GPU "0", "1", "2",...
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # select GPU "0", "1", "2",...
 from pathlib import Path
 import zipfile
 import math
@@ -27,7 +27,7 @@ USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = False
 
-CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
 
 if __name__ == "__main__":
     
@@ -134,8 +134,7 @@ if __name__ == "__main__":
     EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
-    list_prompt = ["What is the capital of VietNam?",\
-                    "What is the Dragon Ball story?"]
+    list_prompt = ["What is the capital of VietNam?"]
 
     for idx, prompt in enumerate(list_prompt):
         input_token_ids = tokenizer.encode(prompt)
@@ -155,6 +154,8 @@ if __name__ == "__main__":
     # 3. Measure latency
     # ================================================================
     model.eval()
+    model = torch.compile(model)
+    print(f"\n[INFO] Model compiled successfully. Start evaluation... \n")
 
     samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
     samples = tokenizer.encode(samples)

@@ -9,7 +9,6 @@ MAX_SEQ_LEN = 2112 # 576 or 1040 or 2112
 BATCH_SIZE = 1 # 1, 4, 16, 64, 128
 
 
-        
 class Custom_Softmax(nn.Module):
     def __init__(self, num_heads=1):
         super(Custom_Softmax, self).__init__()
@@ -26,15 +25,34 @@ class Custom_Softmax(nn.Module):
             out = torch.softmax(x, dim=-1)
             return out, 1.0
         else:          
-            x_int8 = x
+            assert x.dtype == torch.int8, "Expected int8 in quantization mode"
             out_q, scale_out = gemm_cutlass.func_softmax_lastdim_int8_masking(
-                x_int8, scale_x, mask
-            )
-            
+                x, scale_x, mask)
             return out_q, scale_out
     
     def finish_calibration(self):
         self.is_quantized = True  
+        
+
+class Custom_RMSNorm(torch.nn.Module):
+    def __init__(self, d_model, eps=1e-6):
+        super().__init__()
+        self.d_model = d_model
+        self.norm_shape = (d_model,)
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.ones(d_model))
+        self.is_quantized = False
+    
+    def forward(self, x, scale_x):
+        if self.is_quantized == False:
+            y = F.rms_norm(x, self.norm_shape, self.weight, eps=self.eps)
+            return y
+        else:
+            x_int8, scale_x = gemm_cutlass.func_rmsnorm_int8(x, scale_x, self.weight, self.eps)
+            return x_int8, scale_x
+    
+    def finish_calibration(self):
+        self.is_quantized = True
         
         
 class RMSNorm_Fuse_Quant(nn.Module):
@@ -99,10 +117,10 @@ class RMSNorm_Fuse_Quant(nn.Module):
         
         
 class Custom_RoPE(nn.Module):
-    def __init__(self, num_heads, max_seq_len=MAX_SEQ_LEN, head_dim=None):
+    def __init__(self, num_heads, head_dim=None):
         super(Custom_RoPE, self).__init__()
         self.num_heads = num_heads
-        self.max_seq_len = max_seq_len
+        # self.max_seq_len = max_seq_len
         self.head_dim = head_dim
         
         self.is_quantized = False
@@ -157,6 +175,28 @@ class Custom_RoPE(nn.Module):
         self.is_quantized = True
         
 
+def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=torch.float32):
+    assert head_dim % 2 == 0, "Embedding dimension must be even"
+
+    # Compute the inverse frequencies
+    inv_freq = 1.0 / (theta_base ** (torch.arange(0, head_dim, 2, dtype=dtype)[: (head_dim // 2)].float() / head_dim))
+
+    # Generate position indices
+    positions = torch.arange(context_length, dtype=dtype)
+
+    # Compute the angles
+    angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)  # Shape: (context_length, head_dim // 2)
+
+    # Expand angles to match the head_dim
+    angles = torch.cat([angles, angles], dim=1)  # Shape: (context_length, head_dim)
+
+    # Precompute sine and cosine
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+
+    return cos, sin
+        
+
 class Custom_Matmul(nn.Module):
     """
     C = A @ B^T
@@ -178,10 +218,9 @@ class Custom_Matmul(nn.Module):
         C: (M, N) - int8
         scale_C: (M,) - float32
     """
-    def __init__(self, num_heads=1, max_seq_len=MAX_SEQ_LEN, is_return_float=False):
+    def __init__(self, num_heads=1, is_return_float=False):
         super().__init__()
         self.num_heads = num_heads
-        self.max_seq_len = max_seq_len
         self.is_return_float = is_return_float
 
         self.is_quantized = False
@@ -190,41 +229,21 @@ class Custom_Matmul(nn.Module):
         if self.is_quantized == False:
             if A.dim() == 2:
                 C = torch.matmul(A, B.T)
-            elif A.dim() == 3:
-                C = torch.matmul(A, B.transpose(-2, -1))
-            elif A.dim() == 4:
+            elif (A.dim() == 3) or (A.dim() == 4):
                 C = torch.matmul(A, B.transpose(-2, -1))
             else:
                 raise ValueError(f"Unsupported input dimensions: {A.dim()}")
             return C, 1.0
         else:
-            if A.dim() == 2:
+            if (A.dim() == 2) or (A.dim() == 3) or (A.dim() == 4):
                 if self.is_return_float:
                     C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)
                     return C, 1.0
                 else:
-                    C_int8, scale_C = gemm_cutlass.func_w8a8o8_matmul(
+                    C_i8, scale_C = gemm_cutlass.func_w8a8o8_matmul(
                         A, B, scale_A, scale_B, 
                     )
-                    return C_int8, scale_C
-            elif A.dim() == 3:
-                if self.is_return_float:
-                    C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)
-                    return C, 1.0
-                else:
-                    C_int8, scale_C = gemm_cutlass.func_w8a8o8_matmul_batched(
-                        A, B, scale_A, scale_B
-                    )
-                    return C_int8, scale_C
-            elif A.dim() == 4:
-                if self.is_return_float:
-                    C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)
-                    return C, 1.0
-                else:
-                    C_int8, scale_C = gemm_cutlass.func_w8a8o8_matmul_batched(
-                        A, B, scale_A, scale_B
-                    )
-                    return C_int8, scale_C
+                    return C_i8, scale_C
             else:
                 raise ValueError(f"Unsupported input dimensions: {A.dim()}")
         
@@ -236,12 +255,10 @@ class MinMaxObserverPerLastDim(nn.Module):
     def __init__(self, max_batch=BATCH_SIZE, max_seq_len=MAX_SEQ_LEN): 
         super().__init__() 
         self.max_batch = max_batch 
-        self.max_seq_len = max_seq_len 
+        self.max_seq_len = MAX_SEQ_LEN 
     
-        self.max_val = torch.full((max_batch, max_seq_len),\
-                            -torch.inf, device='cuda')
-        self.min_val = torch.full((max_batch, max_seq_len),\
-                            torch.inf, device='cuda')
+        self.max_val = torch.full((max_batch, max_seq_len), -torch.inf, device='cuda')
+        self.min_val = torch.full((max_batch, max_seq_len), torch.inf, device='cuda')
         
     @torch.no_grad() 
     def forward(self, x: torch.Tensor): 
@@ -298,6 +315,7 @@ class MinMaxObserverPerLastDim(nn.Module):
         scale = (max_abs / qmax).clamp(min=1e-8)
         return scale
     
+    
 
 class PerChannelAbsMaxObserver(nn.Module):
     """Tracks max(abs(x)) per last dimension (channel)."""
@@ -341,7 +359,7 @@ def compute_smooth_alpha(input_observer, weight, lambd=0.5):
 
 
 class Custom_Linear(nn.Module):
-    def __init__(self, in_features, out_features, max_seq_len=MAX_SEQ_LEN):
+    def __init__(self, in_features, out_features, max_seq_len=MAX_SEQ_LEN, is_return_float=False):
         super(Custom_Linear, self).__init__()
         
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
@@ -357,35 +375,28 @@ class Custom_Linear(nn.Module):
         self.in_observer = PerChannelAbsMaxObserver(in_features)
         
         # Output scale quantization
-        self.out_observer = MinMaxObserverPerLastDim(max_seq_len=max_seq_len)
-        self.scale_y = torch.ones(max_seq_len, dtype=torch.float32, device='cuda')
+        # self.out_observer = MinMaxObserverPerLastDim(max_seq_len=max_seq_len)
+        # self.scale_y = torch.ones(max_seq_len, dtype=torch.float32, device='cuda')
         self.is_quantized = False
+
+        self.is_return_float = is_return_float
         
     def forward(self, x, scale_x):
         if self.is_quantized == False:  
             self.in_observer(x) # Calibrate input for SmoothQuant
              
             out = torch.matmul(x, self.weight.t())  
-            self.out_observer(out)
+            # self.out_observer(out)
             return out, 1.0
         else:
             assert x.dtype == torch.int8, "Expect int8 input in quantization"
-            if x.dim() == 2:
-                seq_len = x.shape[0]
-                scale_y_value = self.scale_y[:seq_len]
-            elif x.dim() == 3:
-                seq_len = x.shape[1]
-                scale_y_value = self.scale_y[:, :seq_len]
+            if self.is_return_float:
+                out = gemm_cutlass.func_w8a8_matmul(x, self.weight_q, scale_x, self.scale_w)
+                return out, 1.0
             else:
-                raise ValueError(f"Unsupported input dimensions: {x.dim()}")
-            
-            row_scale = scale_x / scale_y_value  
-            col_scale = self.scale_w.expand(self.out_features)
-            
-            out_q = gemm_cutlass.func_w8a8o8_matmul_fusion(x, self.weight_q,\
-                row_scale, col_scale)
-            
-            return out_q, scale_y_value
+                out_i8, scale_out = gemm_cutlass.func_w8a8o8_matmul(x, self.weight_q, scale_x, self.scale_w)
+                return out_i8, scale_out
+        
         
     def finish_calibration(self, alpha=None):
         if alpha is None:
@@ -396,18 +407,17 @@ class Custom_Linear(nn.Module):
         w_smooth = self.weight * alpha.unsqueeze(0) 
         self.weight_q, self.scale_w = quantize_row_int8_symmetric_nd(w_smooth)
 
-        self.scale_y = self.out_observer.get_scale().to(self.scale_w.device)
+        # self.scale_y = self.out_observer.get_scale().to(self.scale_w.device)
         self.is_quantized = True  
         
         # Delete weight and out_observer to save memory
         del self.weight
-        del self.out_observer
+        # del self.out_observer
         del self.in_observer
         self.weight = None
-        self.out_observer = None
+        # self.out_observer = None
         self.in_observer = None
-        
-        
+
 class Custom_Silu(nn.Module):
     def __init__(self, emb_dim, dtype=torch.bfloat16):
         super().__init__()

@@ -210,8 +210,8 @@ tokenizer = Qwen3Tokenizer(
 # ========================================================
 # 4. Text generation with KV cache
 # ========================================================
-INPUT_PROMPT_LENGTH = 128
-MAX_NEW_TOKENS = 128
+INPUT_PROMPT_LENGTH = 2048
+MAX_NEW_TOKENS = 2048
 print("[INFO] INPUT PROMPT LENGTH:", INPUT_PROMPT_LENGTH)
 print("[INFO] MAX NEW TOKENS:", MAX_NEW_TOKENS)
 
@@ -263,10 +263,10 @@ print(f"Total time: {result['total_time']:.4f} ms\n")
 # ========================================================
 # 4. Calibration for quantization
 # ========================================================
-PPL_CONTEXT_TOKENS = 128
+PPL_CONTEXT_TOKENS = 2048
 EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2 
-N_SAMPLES = 1_000
+N_SAMPLES = 5_000
 
 print("\nCollecting calibration for quantization...")
 calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
