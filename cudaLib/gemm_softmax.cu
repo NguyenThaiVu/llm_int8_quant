@@ -206,8 +206,6 @@ __global__ void softmax_int8_kernel(
         float x_fp = static_cast<float>(x_int8[row_offset + i]) * sx;
         float e = __expf(x_fp - row_max);
 
-        // Because scale_y = 1 / (sum_exp * 127),
-        // q = softmax / scale_y = exp(x - max) * 127.
         float qf = valid ? e * 127.0f : 0.0f;
 
         if (!isfinite(qf)) {
@@ -222,6 +220,67 @@ __global__ void softmax_int8_kernel(
         y_int8[row_offset + i] = static_cast<int8_t>(q);
     }
 }
+
+
+__global__ void softmax_int8_kernel_opt(
+    const int8_t* __restrict__ x_int8,
+    const float* __restrict__ scale_x,
+    int8_t* __restrict__ y_int8,
+    float* __restrict__ scale_y,
+    int d_model
+) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const int64_t row_offset = static_cast<int64_t>(row) * d_model;
+
+    const int8_t* row_x = x_int8 + row_offset;
+    int8_t* row_y = y_int8 + row_offset;
+
+    const float sx = scale_x[row];
+
+    // --------------------------------------------------
+    // Pass 1: Compute maximum input
+    // --------------------------------------------------
+    float local_max = -FLT_MAX;
+
+    for (int i = tid; i < d_model; i += blockDim.x) {
+        const float x = static_cast<float>(row_x[i]) * sx;
+        local_max = fmaxf(local_max, x);
+    }
+    const float row_max = block_reduce_max(local_max);
+
+    // --------------------------------------------------
+    // Pass 2: Compute exp, quantize, accumulate sum
+    // --------------------------------------------------
+    float local_sum = 0.0f;
+
+    for (int i = tid; i < d_model; i += blockDim.x) {
+        const float x = static_cast<float>(row_x[i]) * sx;
+
+        const float e = __expf(x - row_max);
+
+        // Direct INT8 quantization: no division by sum_exp
+        int q = __float2int_rn(e * 127.0f);
+        q = max(0, min(127, q));
+
+        row_y[i] = static_cast<int8_t>(q);
+
+        // Accumulate for output scale
+        local_sum += e;
+    }
+
+    // --------------------------------------------------
+    // Final reduction: compute output scale
+    // --------------------------------------------------
+    const float S = block_reduce_sum(local_sum);
+
+    if (tid == 0) {
+        scale_y[row] = 1.0f / (127.0f * S);
+    }
+}
+
+
 
 std::tuple<torch::Tensor, torch::Tensor> softmax_int8_cuda(
     torch::Tensor x_int8,   // int8, shape [..., d_model]
@@ -238,10 +297,7 @@ std::tuple<torch::Tensor, torch::Tensor> softmax_int8_cuda(
     auto scale_contig = scale_x.contiguous();
 
     const int64_t d_model = x_contig.size(-1);
-    TORCH_CHECK(d_model > 0, "d_model must be > 0");
-
     const int64_t num_rows = x_contig.numel() / d_model;
-
     TORCH_CHECK(
         num_rows * d_model == x_contig.numel(),
         "x_int8.numel() must be divisible by last dimension"
@@ -261,7 +317,8 @@ std::tuple<torch::Tensor, torch::Tensor> softmax_int8_cuda(
     size_t shared_mem_size = 0;
 
     auto stream = at::cuda::getCurrentCUDAStream();
-    softmax_int8_kernel<<<grid, block, shared_mem_size, stream>>>(
+    // softmax_int8_kernel<<<grid, block, shared_mem_size, stream>>>(
+    softmax_int8_kernel_opt<<<grid, block, shared_mem_size, stream>>>(
         x_contig.data_ptr<int8_t>(),
         scale_contig.data_ptr<float>(),
         y_int8.data_ptr<int8_t>(),
