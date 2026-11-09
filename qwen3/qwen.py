@@ -25,9 +25,9 @@ from utils_power import measure_power
 # Select which model to use via the following flag; only one can be True
 USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
-USE_INSTRUCT_MODEL = False
+USE_INSTRUCT_MODEL = True
 
-CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
 
 if __name__ == "__main__":
     
@@ -134,9 +134,10 @@ if __name__ == "__main__":
     EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
-    list_prompt = ["What is the capital of VietNam?"]
+    # list_prompts = ["What is the capital of VietNam?"]
+    list_prompts = ["Describe the Vietnames culture in few sentences."]
 
-    for idx, prompt in enumerate(list_prompt):
+    for idx, prompt in enumerate(list_prompts):
         input_token_ids = tokenizer.encode(prompt)
         input_token_ids_tensor = torch.tensor(input_token_ids, device=device)
 

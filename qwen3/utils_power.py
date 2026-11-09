@@ -113,8 +113,8 @@ def measure_power(func, *args, n_iterations=1_000, unit='J'):
         for _ in range(n_iterations):
             func(*args)
 
-    torch.cuda.synchronize()
     end_time.record()
+    torch.cuda.synchronize()
     sampler.stop()
     
     # Compute output
@@ -138,4 +138,4 @@ def measure_power(func, *args, n_iterations=1_000, unit='J'):
         print(f"  {'Energy / operation':<28} {energy_per_op * 1000:>15.4f} mJ")
     print("─" * 56 + "\n")
 
-    
+    return energy_per_op

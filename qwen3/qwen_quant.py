@@ -19,9 +19,9 @@ from utils_power import *
 # Select which model to use via the following flag; only one can be True
 USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
-USE_INSTRUCT_MODEL = False
+USE_INSTRUCT_MODEL = True
 
-CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
 
 class Qwen3Model_Quant(nn.Module):
     def __init__(self, cfg):
@@ -126,7 +126,7 @@ if __name__ == "__main__":
     # ================================================================
     # 2. Load tokenizer
     # ================================================================
-    if USE_REASONING_MODEL:
+    if USE_REASONING_MODEL or USE_INSTRUCT_MODEL:
         tokenizer_file_path = f"Qwen3-{CHOOSE_MODEL}/tokenizer.json"
     else:
         tokenizer_file_path = f"Qwen3-{CHOOSE_MODEL}-Base/tokenizer.json"
@@ -155,12 +155,13 @@ if __name__ == "__main__":
     # ================================================================
     MAX_NEW_TOKENS = 2048
     PPL_CONTEXT_TOKENS = 2048
-    EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
+    EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
     PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
     # list_prompts = ["What is the capital of VietNam?",\
                     # "What is the Dragon Ball story?"]
-    list_prompts = ["What is the capital of VietNam?"]
+    # list_prompts = ["What is the capital of VietNam?"]
+    list_prompts = ["Describe the Vietnames culture in few sentences."]
     
 
     for idx, prompt in enumerate(list_prompts):
@@ -182,7 +183,7 @@ if __name__ == "__main__":
     # ================================================================
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=1_000)
+                                                    split="train", n=10_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             
@@ -205,7 +206,8 @@ if __name__ == "__main__":
     # ========================================================================
     # Quantization mode
     print("\n===== Generated text after quantization: =====\n")
-    list_prompts = ["What is the capital of VietNam?"]
+    # list_prompts = ["What is the capital of VietNam?"]
+    list_prompts = ["Describe the Vietnames culture in few sentences."]
 
     for idx, prompt in enumerate(list_prompts):
         input_token_ids = tokenizer.encode(prompt)
@@ -224,8 +226,6 @@ if __name__ == "__main__":
     # ================================================================
     # 3. Measure latency
     # ================================================================
-    
-
     samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
     samples = tokenizer.encode(samples)
     chunk_tokens = samples[0:PPL_CONTEXT_TOKENS]
@@ -269,21 +269,21 @@ if __name__ == "__main__":
     # Measure power consumption
     measure_power(model, input_ids, n_iterations=10)
 
-    # # # ================================================================
-    # # # 5. PPL evaluation
-    # # # ================================================================
-    # print(f"[INFO] ...Start Evaluation...")
-    # samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
-    # ppl = compute_ppl_single_text(model,
-    #                             tokenizer,
-    #                             samples,
-    #                             context_size=PPL_CONTEXT_TOKENS,
-    #                             stride=PPL_STRIDE)
-    # print(f"\nPPL: {ppl}")
-    # print(f"Model Information: ")
-    # print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    # print(f"Context size: {PPL_CONTEXT_TOKENS}")
-    # print(f"Dataset evaluation: {EVALUATION_DATASET}")
+    # # ================================================================
+    # # 5. PPL evaluation
+    # # ================================================================
+    print(f"[INFO] ...Start Evaluation...")
+    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+    ppl = compute_ppl_single_text(model,
+                                tokenizer,
+                                samples,
+                                context_size=PPL_CONTEXT_TOKENS,
+                                stride=PPL_STRIDE)
+    print(f"\nPPL: {ppl}")
+    print(f"Model Information: ")
+    print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    print(f"Dataset evaluation: {EVALUATION_DATASET}")
     
     # # ================================================================
     # # 6. ARC-Easy evaluation
