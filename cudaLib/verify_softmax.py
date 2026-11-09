@@ -15,7 +15,7 @@ if __name__ == "__main__":
     device = "cuda"
     dtype = torch.bfloat16
     L = 2048
-    d = 1024 * 16
+    d = 1024 * 8
     
     X = torch.randn((L, d), device=device, dtype=dtype)
     
