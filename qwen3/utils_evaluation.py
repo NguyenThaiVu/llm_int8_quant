@@ -121,62 +121,70 @@ def compute_ppl_single_text(model, tokenizer, text, context_size, device="cuda",
     return math.exp(total_nll / total_tok)
 
 
-import torch
-import torch.nn.functional as F
-from datasets import load_dataset
 
+# def arc_prompt(example):
+#     lines = [f"Question: {example['question']}"]
 
+#     for label, text in zip(
+#         example["choices"]["label"],
+#         example["choices"]["text"],
+#     ):
+#         lines.append(f"{label}. {text}")
+
+#     lines.append("Answer:")
+#     return "\n".join(lines)
+"""
+We replace the previous arc_prompt,  which includes all answer choices in the prompt. 
+The standard ARC likelihood-based evaluation does not.
+"""
 def arc_prompt(example):
-    lines = [f"Question: {example['question']}"]
-
-    for label, text in zip(
-        example["choices"]["label"],
-        example["choices"]["text"],
-    ):
-        lines.append(f"{label}. {text}")
-
-    lines.append("Answer:")
-    return "\n".join(lines)
+    return f"Question: {example['question']}\nAnswer:"
 
 
 @torch.inference_mode()
 def score_choice(model, tokenizer, prompt, choice, device):
+
+    # Encode context and full sequence
     prompt_ids = tokenizer.encode(prompt)
     full_ids = tokenizer.encode(prompt + " " + choice)
 
     answer_start = len(prompt_ids)
 
+    assert answer_start > 0
+    assert answer_start < len(full_ids)
+    assert len(choice) > 0
+
     input_ids = torch.tensor(
-        full_ids,
-        dtype=torch.long,
-        device=device,
+        full_ids, dtype=torch.long, device=device
     )
 
-    # logits shape: [sequence_length, vocab_size]
-    logits = model(input_ids)
-
-    # logits[t] predicts input_ids[t + 1]
-    log_probs = F.log_softmax(
-        logits[:-1].float(),
-        dim=-1,
+    outputs = model(input_ids)
+    logits = (
+        outputs.logits
+        if hasattr(outputs, "logits")
+        else outputs
     )
 
-    # Targets have shape [sequence_length - 1]
-    targets = input_ids[1:]
+    if logits.ndim == 3:
+        assert logits.size(0) == 1
+        logits = logits[0]
 
-    # Select the log-probability assigned to each true next token.
-    token_log_probs = log_probs.gather(
-        dim=-1,
-        index=targets.unsqueeze(-1),
-    ).squeeze(-1)
+    # logits[t] predicts token[t + 1]
+    answer_logits = logits[answer_start - 1:-1].float()
+    answer_targets = input_ids[answer_start:]
 
-    # The first answer token is predicted at position answer_start - 1.
-    answer_log_probs = token_log_probs[answer_start - 1:]
+    # Sum log-likelihood over candidate tokens
+    total_score = -F.cross_entropy(
+        answer_logits,
+        answer_targets,
+        reduction="sum"
+    ).item()
 
-    total_score = answer_log_probs.sum().item()
-    normalized_score = answer_log_probs.mean().item()
+    # Character-length normalization
+    normalized_score = total_score / len(choice)
 
     return total_score, normalized_score
+
 
 
 @torch.inference_mode()

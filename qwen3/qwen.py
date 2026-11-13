@@ -1,10 +1,6 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # select GPU "0", "1", "2",...
 from pathlib import Path
-import zipfile
-import math
-from datasets import load_dataset
-import re
 import torch
 torch.manual_seed(123)
 import torch.nn as nn
@@ -12,22 +8,27 @@ from torch.nn import functional as F
 
 import json
 from safetensors.torch import load_file
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import hf_hub_download
 
 from utils_tokenizer import Qwen3Tokenizer
 from config import get_model_config, load_weights_into_qwen
 from utils_model import *
 from utils_generation import *
-from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text,\
-                            evaluate_arc, evaluate_piqa
+from utils_evaluation import *
 from utils_power import measure_power
     
 # Select which model to use via the following flag; only one can be True
 USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
-USE_INSTRUCT_MODEL = True
+USE_INSTRUCT_MODEL = False
+if (USE_BASE_MODEL + USE_REASONING_MODEL + USE_INSTRUCT_MODEL) != 1:
+    raise AttributeError("Only one of the options above can be True.")
 
 CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
+MAX_NEW_TOKENS = PPL_CONTEXT_TOKENS = 2048  # Options: 2048, 4096, 8192
+EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
+PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
+
 
 if __name__ == "__main__":
     
@@ -38,11 +39,9 @@ if __name__ == "__main__":
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
-    print(f"Using device: {device}")
-    model.to(device);
+    print(f"[INFO] Using device: {device}")
 
-
-    if USE_REASONING_MODEL or USE_INSTRUCT_MODEL:
+    if (USE_REASONING_MODEL == True) or (USE_INSTRUCT_MODEL == True):
         repo_id = f"Qwen/Qwen3-{CHOOSE_MODEL}"
     else:
         repo_id = f"Qwen/Qwen3-{CHOOSE_MODEL}-Base"
@@ -95,29 +94,31 @@ if __name__ == "__main__":
             weights_dict.update(shard)
 
     load_weights_into_qwen(model, QWEN3_CONFIG, weights_dict)
-    model.to(device)
+    model = model.to(device=device, dtype=torch.bfloat16)
+    model.eval()
+    
     print(f"[INFO] Model weights loaded successfully. \n")
     del weights_dict
 
     # ================================================================
     # 2. Load tokenizer
     # ================================================================
-    if USE_REASONING_MODEL:
+    if (USE_REASONING_MODEL == True) or (USE_INSTRUCT_MODEL == True):
         tokenizer_file_path = f"Qwen3-{CHOOSE_MODEL}/tokenizer.json"
     else:
         tokenizer_file_path = f"Qwen3-{CHOOSE_MODEL}-Base/tokenizer.json"
-
-    tokenizer_file_path = os.path.join(MODEL_HUD_FOLDER, f"Qwen3-{CHOOSE_MODEL}-Base/tokenizer.json")
+    tokenizer_file_path = os.path.join(MODEL_HUD_FOLDER, tokenizer_file_path)
 
     hf_hub_download(repo_id=repo_id, filename="tokenizer.json", local_dir=local_dir)
 
-    if USE_REASONING_MODEL or USE_INSTRUCT_MODEL:
+    if (USE_REASONING_MODEL == True) or (USE_INSTRUCT_MODEL == True):
         tokenizer = Qwen3Tokenizer(
             tokenizer_file_path=tokenizer_file_path,
             repo_id=repo_id,
             apply_chat_template=True,
             add_generation_prompt=True,
             add_thinking=USE_REASONING_MODEL)
+        evaluation_tokenizer = tokenizer
     else:
         tokenizer = Qwen3Tokenizer(
             tokenizer_file_path=tokenizer_file_path,
@@ -125,14 +126,26 @@ if __name__ == "__main__":
             apply_chat_template=False,
             add_generation_prompt=False,
             add_thinking=False)
+        evaluation_tokenizer = Qwen3Tokenizer(
+                    tokenizer_file_path=tokenizer_file_path,
+                    repo_id=repo_id,
+                    apply_chat_template=False,
+                    add_generation_prompt=False,
+                    add_thinking=False
+            )
+        print(f"\n[INFO] To avoid chat template and generation prompt,\
+            we use a separate tokenizer for evaluation. \n")
 
     # ================================================================
     # 3. Text generation
     # ================================================================
-    MAX_NEW_TOKENS = 2048
-    PPL_CONTEXT_TOKENS = 2048
-    EVALUATION_DATASET = "wikitext-2"  # Options: "wikitext-2", "wikitext-103"
-    PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
+    model.eval()
+    model = torch.compile(model)
+    
+    dtypes = {p.dtype for p in model.parameters()}
+    assert dtypes == {torch.bfloat16}
+    print("\n[INFO] BF16 model loaded successfully.")
+    print(f"[INFO] Model compiled successfully. Start evaluation... \n")
 
     # list_prompts = ["What is the capital of VietNam?"]
     list_prompts = ["Describe the Vietnames culture in few sentences."]
@@ -154,12 +167,10 @@ if __name__ == "__main__":
     # ================================================================
     # 3. Measure latency
     # ================================================================
-    model.eval()
-    model = torch.compile(model)
-    print(f"\n[INFO] Model compiled successfully. Start evaluation... \n")
-
-    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
-    samples = tokenizer.encode(samples)
+    print(f"[INFO] Start Evaluation... ")
+    
+    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET, split="test")
+    samples = evaluation_tokenizer.encode(samples)
     chunk_tokens = samples[0:PPL_CONTEXT_TOKENS]
     input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
     print(f"[INFO] Input tokens: {input_ids.shape}")
@@ -201,61 +212,59 @@ if __name__ == "__main__":
     # Measure power consumption
     measure_power(model, input_ids, n_iterations=10)
     
-    # # ================================================================
-    # # 4. Perplexity evaluation on Wikitext-103
-    # # ================================================================
-    # print(f"[INFO] Start Evaluation... \n")
+    # ================================================================
+    # 4. Perplexity evaluation on Wikitext-103
+    # ================================================================
+    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET, split="test")
 
-    # samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
-
-    # ppl = compute_ppl_single_text(model,
-    #                             tokenizer, 
-    #                             samples,
-    #                             context_size=PPL_CONTEXT_TOKENS,
-    #                             stride=PPL_STRIDE)
-    # print(f"\nPPL (BF16): {ppl} \n")
-    # print(f"Model Information: ")
-    # print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    # print(f"Context size: {PPL_CONTEXT_TOKENS}")
-    # print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")
+    ppl = compute_ppl_single_text(model,
+                                evaluation_tokenizer, 
+                                samples,
+                                context_size=PPL_CONTEXT_TOKENS,
+                                stride=PPL_STRIDE)
+    print(f"\nPPL (BF16): {ppl} \n")
+    print(f"Model Information: ")
+    print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")
     
-    # # ================================================================
-    # # 5. ARC-Easy evaluation
-    # # ================================================================
-    # NUM_ARC_SAMPLES = None  # Use None for the complete test set
-    # # DATASET_ARC = "ARC-Easy"  # Options: "ARC-Easy", "ARC-Challenge"
-    # list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
-    # for DATASET_ARC in list_data_set_arc:
-    #     print(f"[INFO] Start {DATASET_ARC} Evaluation... \n")
+    # ================================================================
+    # 5. ARC-Easy evaluation
+    # ================================================================
+    NUM_ARC_SAMPLES = None  # Use None for the complete test set
+    # DATASET_ARC = "ARC-Easy"  # Options: "ARC-Easy", "ARC-Challenge"
+    list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
+    for DATASET_ARC in list_data_set_arc:
+        print(f"[INFO] Start {DATASET_ARC} Evaluation... \n")
         
-    #     arc_result = evaluate_arc(
-    #         model=model,
-    #         tokenizer=tokenizer,
-    #         device=device,
-    #         subset=DATASET_ARC,
-    #         max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
-    #     )
-    #     print(f"\n{DATASET_ARC} results")
-    #     print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    #     print(f"Number of questions: {arc_result['num_samples']}")
-    #     print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
-    #     print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}%")
+        arc_result = evaluate_arc(
+            model=model,
+            tokenizer=evaluation_tokenizer,
+            device=device,
+            subset=DATASET_ARC,
+            max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
+        )
+        print(f"\n{DATASET_ARC} results")
+        print(f"Model: Qwen3-{CHOOSE_MODEL}")
+        print(f"Number of questions: {arc_result['num_samples']}")
+        print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
+        print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}%")
     
-    # # ================================================================
-    # # 7. PIQA evaluation
-    # # ================================================================
-    # NUM_PIQA_SAMPLES = None  # None uses the complete validation set
-    # print("[INFO] Start PIQA Evaluation...\n")
+    # ================================================================
+    # 7. PIQA evaluation
+    # ================================================================
+    NUM_PIQA_SAMPLES = None  # None uses the complete validation set
+    print("[INFO] Start PIQA Evaluation...\n")
 
-    # piqa_result = evaluate_piqa(
-    #     model=model,
-    #     tokenizer=tokenizer,
-    #     device=device,
-    #     max_samples=NUM_PIQA_SAMPLES,
-    # )
+    piqa_result = evaluate_piqa(
+        model=model,
+        tokenizer=evaluation_tokenizer,
+        device=device,
+        max_samples=NUM_PIQA_SAMPLES,
+    )
 
-    # print("\nPIQA results")
-    # print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    # print(f"Number of questions: {piqa_result['num_samples']}")
-    # print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
-    # print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")
+    print("\nPIQA results")
+    print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    print(f"Number of questions: {piqa_result['num_samples']}")
+    print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
+    print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")

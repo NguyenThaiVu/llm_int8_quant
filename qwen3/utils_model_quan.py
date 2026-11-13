@@ -413,10 +413,8 @@ class Custom_Linear(nn.Module):
         
         # Delete weight and out_observer to save memory
         del self.weight
-        # del self.out_observer
         del self.in_observer
         self.weight = None
-        # self.out_observer = None
         self.in_observer = None
 
 class Custom_Silu(nn.Module):
@@ -669,6 +667,7 @@ class Custom_FeedForward(nn.Module):
 #         self.context_layer.finish_calibration()
         
 #         self.is_quantized = True
+        
         
 class Custom_GroupedQueryAttention_Hybrid(nn.Module):
     def __init__(

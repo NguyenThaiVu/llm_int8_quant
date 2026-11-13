@@ -17,11 +17,18 @@ from utils_model_quan import TransformerBlock_Quant
 from utils_power import *
     
 # Select which model to use via the following flag; only one can be True
-USE_BASE_MODEL = True
+USE_BASE_MODEL = False
 USE_REASONING_MODEL = False
 USE_INSTRUCT_MODEL = True
+if (USE_BASE_MODEL + USE_REASONING_MODEL + USE_INSTRUCT_MODEL) != 1:
+    raise AttributeError("Only one of the options above can be True.")
 
 CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
+
+MAX_NEW_TOKENS = PPL_CONTEXT_TOKENS = 2048  # Options: 2048, 4096, 8192
+EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
+PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
+
 
 class Qwen3Model_Quant(nn.Module):
     def __init__(self, cfg):
@@ -81,10 +88,12 @@ if __name__ == "__main__":
     else:
         raise ValueError("Please update the MODEL_HUD_FOLDER.")
     
-    if USE_REASONING_MODEL or USE_INSTRUCT_MODEL:
+    if (USE_REASONING_MODEL == True) or (USE_INSTRUCT_MODEL == True):
         repo_id = f"Qwen3-{CHOOSE_MODEL}"
     else:
         repo_id = f"Qwen3-{CHOOSE_MODEL}-Base"
+    print(f"[INFO] Loading model weights from repo: {repo_id} \n")
+        
     local_dir = os.path.join(MODEL_HUD_FOLDER, repo_id)
     if not os.path.isdir(local_dir):
         raise FileNotFoundError(f"Model folder does not exist: {local_dir}")
@@ -126,7 +135,7 @@ if __name__ == "__main__":
     # ================================================================
     # 2. Load tokenizer
     # ================================================================
-    if USE_REASONING_MODEL or USE_INSTRUCT_MODEL:
+    if (USE_REASONING_MODEL == True) or (USE_INSTRUCT_MODEL == True):
         tokenizer_file_path = f"Qwen3-{CHOOSE_MODEL}/tokenizer.json"
     else:
         tokenizer_file_path = f"Qwen3-{CHOOSE_MODEL}-Base/tokenizer.json"
@@ -135,13 +144,22 @@ if __name__ == "__main__":
 
     hf_hub_download(repo_id=repo_id, filename="tokenizer.json", local_dir=local_dir)
 
-    if USE_REASONING_MODEL or USE_INSTRUCT_MODEL:
+    if (USE_REASONING_MODEL == True) or (USE_INSTRUCT_MODEL == True):
         tokenizer = Qwen3Tokenizer(
             tokenizer_file_path=tokenizer_file_path,
             repo_id=repo_id,
             apply_chat_template=True,
             add_generation_prompt=True,
             add_thinking=USE_REASONING_MODEL)
+        
+        evaluation_tokenizer = Qwen3Tokenizer(
+                tokenizer_file_path=tokenizer_file_path,
+                repo_id=repo_id,
+                apply_chat_template=False,
+                add_generation_prompt=False,
+                add_thinking=False
+            )
+        print(f"[INFO] To avoid chat template, we have a separate tokenizer for evaluation PPL, ARC, PIQA.\n")
     else:
         tokenizer = Qwen3Tokenizer(
             tokenizer_file_path=tokenizer_file_path,
@@ -149,42 +167,17 @@ if __name__ == "__main__":
             apply_chat_template=False,
             add_generation_prompt=False,
             add_thinking=False)
+        evaluation_tokenizer = tokenizer
 
     # ================================================================
-    # 3. Text generation
-    # ================================================================
-    MAX_NEW_TOKENS = 2048
-    PPL_CONTEXT_TOKENS = 2048
-    EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
-    PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-
-    # list_prompts = ["What is the capital of VietNam?",\
-                    # "What is the Dragon Ball story?"]
-    # list_prompts = ["What is the capital of VietNam?"]
-    list_prompts = ["Describe the Vietnames culture in few sentences."]
-    
-
-    for idx, prompt in enumerate(list_prompts):
-        input_token_ids = tokenizer.encode(prompt)
-        input_token_ids_tensor = torch.tensor(input_token_ids, device=device)
-
-        generated_text = func_generate_text(
-            model=model,
-            token_ids=input_token_ids_tensor,
-            max_new_tokens=MAX_NEW_TOKENS,
-            eos_token_id=tokenizer.eos_token_id
-        )
-
-        response = get_clean_generated_text(generated_text, tokenizer)
-        print(f"{idx}. Generated response: {response} \n")
-        
-    # ================================================================
-    # 4. Quantization
+    # 3. Quantization Calibration
     # ================================================================
     print("\nCollecting calibration for quantization...")
-    calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=10_000)
-    calibrate_tokens = tokenizer.encode(calibrate_samples)
+    calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET, split="train", n=10_000)
+    
+    # calibrate_tokens = tokenizer.encode(calibrate_samples)
+    calibrate_tokens = evaluation_tokenizer.encode(calibrate_samples)
+    
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             
     for i in tqdm(range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE)):
@@ -202,12 +195,28 @@ if __name__ == "__main__":
     model = torch.compile(model)
     print(f"\n[INFO] Model compiled successfully. Start evaluation... \n")
 
-
     # ========================================================================
-    # Quantization mode
+    # 4. Quantization Generation
+    # ========================================================================
     print("\n===== Generated text after quantization: =====\n")
-    # list_prompts = ["What is the capital of VietNam?"]
-    list_prompts = ["Describe the Vietnames culture in few sentences."]
+    
+    en = """
+    Last summer, my family visited a small village near the mountains. 
+    We spent three days exploring the area, trying local food, and meeting friendly people. 
+    Although the weather was sometimes rainy, we really enjoyed our trip.
+    """
+    
+    input_article = """
+    In 2025, the city of Paris introduced 50 kilometers of new bicycle lanes to encourage sustainable transportation.
+    Following the expansion, bicycle usage increased by 30%, while car traffic in the city center decreased by 12%.
+    However, some residents expressed concerns about reduced parking spaces.
+    """
+    
+    list_prompts = [f"Translate the following English text to French: {en}", \
+            "Which country has a capital city named Paris?",\
+            f"Summarize the article {input_article} in 1 sentence and extract important information into JSON format.",\
+            "Describe the Vietnames culture in detail."]
+    # list_prompts = ["Describe the Vietnames culture in detail."]
 
     for idx, prompt in enumerate(list_prompts):
         input_token_ids = tokenizer.encode(prompt)
@@ -224,10 +233,10 @@ if __name__ == "__main__":
         print(f"{idx}. Generated response: {response} \n")
         
     # ================================================================
-    # 3. Measure latency
+    # 5. Measure latency
     # ================================================================
-    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
-    samples = tokenizer.encode(samples)
+    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET, split="test")
+    samples = evaluation_tokenizer.encode(samples)
     chunk_tokens = samples[0:PPL_CONTEXT_TOKENS]
     input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
     print(f"[INFO] Input tokens: {input_ids.shape}")
@@ -272,10 +281,9 @@ if __name__ == "__main__":
     # # ================================================================
     # # 5. PPL evaluation
     # # ================================================================
-    print(f"[INFO] ...Start Evaluation...")
-    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET, split="test")
     ppl = compute_ppl_single_text(model,
-                                tokenizer,
+                                evaluation_tokenizer,
                                 samples,
                                 context_size=PPL_CONTEXT_TOKENS,
                                 stride=PPL_STRIDE)
@@ -285,70 +293,42 @@ if __name__ == "__main__":
     print(f"Context size: {PPL_CONTEXT_TOKENS}")
     print(f"Dataset evaluation: {EVALUATION_DATASET}")
     
-    # # ================================================================
-    # # 6. ARC-Easy evaluation
-    # # ================================================================
-    # NUM_ARC_SAMPLES = None  # Use None for the complete test set
-    # list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
-    # for DATASET_ARC in list_data_set_arc:
-    #     print(f"\n[INFO] Start {DATASET_ARC} Evaluation...")
+    # ================================================================
+    # 6. ARC-Easy evaluation
+    # ================================================================
+    NUM_ARC_SAMPLES = None  # Use None for the complete test set
+    list_data_set_arc = ["ARC-Easy", "ARC-Challenge"]
+    for DATASET_ARC in list_data_set_arc:
+        print(f"\n[INFO] Start {DATASET_ARC} Evaluation...")
         
-    #     arc_result = evaluate_arc(
-    #         model=model,
-    #         tokenizer=tokenizer,
-    #         device=device,
-    #         subset=DATASET_ARC,
-    #         max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
-    #     )
-    #     print(f"{DATASET_ARC} results")
-    #     print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    #     print(f"Number of questions: {arc_result['num_samples']}")
-    #     print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
-    #     print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}% \n")
-    #     arc_result = evaluate_arc(
-    #         model=model,
-    #         tokenizer=tokenizer,
-    #         device=device,
-    #         subset=DATASET_ARC,
-    #         max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
-    #     )
-    #     print(f"{DATASET_ARC} results")
-    #     print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    #     print(f"Number of questions: {arc_result['num_samples']}")
-    #     print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
-    #     print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}% \n")
+        arc_result = evaluate_arc(
+            model=model,
+            tokenizer=evaluation_tokenizer,
+            device=device,
+            subset=DATASET_ARC,
+            max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
+        )
+        print(f"{DATASET_ARC} results")
+        print(f"Model: Qwen3-{CHOOSE_MODEL}")
+        print(f"Number of questions: {arc_result['num_samples']}")
+        print(f"Accuracy:            {arc_result['acc'] * 100:.2f}%")
+        print(f"Normalized accuracy: {arc_result['acc_norm'] * 100:.2f}% \n")
     
-    # # ================================================================
-    # # 7. PIQA evaluation
-    # # ================================================================
-    # NUM_PIQA_SAMPLES = None  # None uses the complete validation set
-    # print("[INFO] Start PIQA Evaluation...\n")
-    # # ================================================================
-    # # 7. PIQA evaluation
-    # # ================================================================
-    # NUM_PIQA_SAMPLES = None  # None uses the complete validation set
-    # print("[INFO] Start PIQA Evaluation...\n")
+    # ================================================================
+    # 7. PIQA evaluation
+    # ================================================================
+    NUM_PIQA_SAMPLES = None  # None uses the complete validation set
+    print("[INFO] Start PIQA Evaluation...\n")
 
-    # piqa_result = evaluate_piqa(
-    #     model=model,
-    #     tokenizer=tokenizer,
-    #     device=device,
-    #     max_samples=NUM_PIQA_SAMPLES,
-    # )
-    # piqa_result = evaluate_piqa(
-    #     model=model,
-    #     tokenizer=tokenizer,
-    #     device=device,
-    #     max_samples=NUM_PIQA_SAMPLES,
-    # )
+    piqa_result = evaluate_piqa(
+        model=model,
+        tokenizer=evaluation_tokenizer,
+        device=device,
+        max_samples=NUM_PIQA_SAMPLES,
+    )
 
-    # print("\nPIQA results")
-    # print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    # print(f"Number of questions: {piqa_result['num_samples']}")
-    # print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
-    # print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")
-    # print("\nPIQA results")
-    # print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    # print(f"Number of questions: {piqa_result['num_samples']}")
-    # print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
-    # print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")
+    print("\nPIQA results")
+    print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    print(f"Number of questions: {piqa_result['num_samples']}")
+    print(f"Accuracy:            {piqa_result['acc'] * 100:.2f}%")
+    print(f"Normalized accuracy: {piqa_result['acc_norm'] * 100:.2f}%")
