@@ -27,7 +27,6 @@ __device__ __forceinline__ int8_t quantize_int8(float value) {
     return static_cast<int8_t>(q);
 }
 
-
 inline __device__ float warp_reduce_max(float v) {
     unsigned mask = 0xffffffffu;
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -64,36 +63,48 @@ __device__ __forceinline__ float block_reduce_max(float v) {
 }
 
 
-/*
-The function block_reduce_max_neg_inf is similar to block_reduce_max,
-but initializes the reduction with -FLT_MAX instead of 0. 
-This is important for max reductions to ensure that any valid value will be greater than the initial value.
-*/
-inline __device__ float block_reduce_max_neg_inf(float v) {
-    __shared__ float smem[32];
+template <int THREADS>
+__device__ __forceinline__
+float block_reduce_max_fast(float v) {
+
+    static_assert(THREADS >= 32 &&
+                  THREADS <= 1024 &&
+                  THREADS % 32 == 0);
+
+    constexpr int NUM_WARPS = THREADS / 32;
 
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
 
     v = warp_reduce_max(v);
 
-    if (lane == 0) smem[warp] = v;
-    __syncthreads();
-
-    float out = -FLT_MAX;
-
-    if (warp == 0) {
-        int nw = (blockDim.x + 31) >> 5;
-        out = (lane < nw) ? smem[lane] : -FLT_MAX;
-        out = warp_reduce_max(out);
+    if constexpr (NUM_WARPS == 1) {
+        return __shfl_sync(0xffffffffu, v, 0);
     }
+    else {
+        __shared__ float smem[NUM_WARPS];
 
-    if (threadIdx.x == 0) smem[0] = out;
-    __syncthreads();
+        if (lane == 0)
+            smem[warp] = v;
 
-    return smem[0];
+        __syncthreads();
+
+        if (warp == 0) {
+            float out = (lane < NUM_WARPS)
+                      ? smem[lane]
+                      : -FLT_MAX;
+
+            out = warp_reduce_max(out);
+
+            if (lane == 0)
+                smem[0] = out;
+        }
+
+        __syncthreads();
+
+        return smem[0];
+    }
 }
-
 
 inline __device__ float warp_reduce_sum(float val) {
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -170,32 +181,6 @@ __inline__ __device__ float warp_reduce_max_float(float val) {
     }
     return val;
 }
-
-__inline__ __device__ float block_reduce_max_float(float val) {
-    static __shared__ float shared[32];
-
-    int lane = threadIdx.x & 31;
-    int warp_id = threadIdx.x >> 5;
-
-    val = warp_reduce_max_float(val);
-
-    if (lane == 0) {
-        shared[warp_id] = val;
-    }
-
-    __syncthreads();
-
-    int num_warps = (blockDim.x + 31) >> 5;
-
-    val = 0.0f;
-    if (warp_id == 0) {
-        val = (lane < num_warps) ? shared[lane] : 0.0f;
-        val = warp_reduce_max_float(val);
-    }
-
-    return val;
-}
-
 
 struct SumMax {
     float sum;

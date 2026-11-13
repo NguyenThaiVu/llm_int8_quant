@@ -619,7 +619,7 @@ __global__ void softmax_lastdim_int8_masking_kernel(
         local_max = fmaxf(local_max, v);
     }
 
-    float max_val = block_reduce_max_neg_inf(local_max);
+    float max_val = block_reduce_max_fast<BLOCK_SIZE>(local_max);
 
     // ============================================================
     // 2) sum over unmasked positions

@@ -239,8 +239,7 @@ torch::Tensor int8_matmul_host(
 
 
 /*
-Description: fusion of int8 matmul with 
-            per-row and per-column scale in the epilogue, output bf16
+Description: fusion of int8 matmul with  per-row and per-column scale in the epilogue, output bf16
 
 Input:
 - A: int8, (M, K), row-major
@@ -674,8 +673,7 @@ torch::Tensor matmul_w8a8_batched_host(
 
 
 /*
-Description: fusion of int8 matmul with
-             per-row and per-column scale in the epilogue, output int8
+Description: fusion of int8 matmul with per-row and per-column scale in the epilogue, output int8
 
 Input:
 - A: int8, (M, K), row-major
@@ -689,44 +687,99 @@ Output:
 
 template <typename TileShape, typename WarpShape, int kStages>
 torch::Tensor matmul_w8a8o8_kernel(
-    const torch::Tensor &A,         // int8 [M, K]
-    const torch::Tensor &B,         // int8 [N, K]
-    const torch::Tensor &alphaRow,  // float [M]
-    const torch::Tensor &alphaCol   // float [N]
+    const torch::Tensor &A,
+    const torch::Tensor &B,
+    const torch::Tensor &alphaRow,
+    const torch::Tensor &alphaCol
 ) {
     TORCH_CHECK(A.is_cuda() && B.is_cuda() &&
                 alphaRow.is_cuda() && alphaCol.is_cuda(),
                 "All tensors must be CUDA tensors");
 
+    TORCH_CHECK(A.device() == B.device() &&
+                A.device() == alphaRow.device() &&
+                A.device() == alphaCol.device(),
+                "All tensors must be on the same CUDA device");
+
     TORCH_CHECK(A.scalar_type() == torch::kInt8, "A must be int8");
     TORCH_CHECK(B.scalar_type() == torch::kInt8, "B must be int8");
-    TORCH_CHECK(alphaRow.scalar_type() == torch::kFloat32, "alphaRow must be float32");
-    TORCH_CHECK(alphaCol.scalar_type() == torch::kFloat32, "alphaCol must be float32");
+    TORCH_CHECK(alphaRow.scalar_type() == torch::kFloat32,
+                "alphaRow must be float32");
+    TORCH_CHECK(alphaCol.scalar_type() == torch::kFloat32,
+                "alphaCol must be float32");
 
-    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "A and B must be 2D");
-    TORCH_CHECK(alphaRow.dim() == 1 || (alphaRow.dim() == 2 && alphaRow.size(1) == 1),
-                "alphaRow must have shape [M] or [M,1]");
-    TORCH_CHECK(alphaCol.dim() == 1 || (alphaCol.dim() == 2 && alphaCol.size(0) == 1),
-                "alphaCol must have shape [N] or [1,N]");
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2,
+                "A and B must be 2D");
+    TORCH_CHECK(alphaRow.dim() == 1 ||
+                (alphaRow.dim() == 2 && alphaRow.size(1) == 1),
+                "alphaRow must be [M] or [M,1]");
+    TORCH_CHECK(alphaCol.dim() == 1 ||
+                (alphaCol.dim() == 2 && alphaCol.size(0) == 1),
+                "alphaCol must be [N] or [1,N]");
 
     int32_t M = static_cast<int32_t>(A.size(0));
     int32_t K = static_cast<int32_t>(A.size(1));
     int32_t N = static_cast<int32_t>(B.size(0));
 
-    TORCH_CHECK(B.size(1) == K, "B must have shape (N, K)");
-    TORCH_CHECK(alphaRow.numel() == M, "alphaRow must have M elements");
-    TORCH_CHECK(alphaCol.numel() == N, "alphaCol must have N elements");
-    TORCH_CHECK(K % 16 == 0, "K must be multiple of 16");
+    TORCH_CHECK(M > 0 && N > 0 && K > 0,
+                "M, N, K must be positive");
+    TORCH_CHECK(B.size(1) == K, "B must have shape [N,K]");
+    TORCH_CHECK(alphaRow.numel() == M, "alphaRow size mismatch");
+    TORCH_CHECK(alphaCol.numel() == N, "alphaCol size mismatch");
 
-    auto tensor_a  = A.contiguous();
-    auto tensor_b  = B.contiguous();
+    // ========================================================
+    // 1. Padding
+    // ========================================================
+    const int32_t K_gemm = ((K + 31) / 32) * 32;
+    const int32_t N_gemm = ((N + 15) / 16) * 16;
+
+    const bool padK = (K_gemm != K);
+    const bool padN = (N_gemm != N);
+
+    auto tensor_a = A.contiguous();
+    auto tensor_b = B.contiguous();
+
     auto tensor_v1 = alphaRow.contiguous().view({M});
     auto tensor_v2 = alphaCol.contiguous().view({N});
 
-    auto D = torch::empty(
-        {M, N},
-        torch::TensorOptions().device(A.device()).dtype(torch::kChar));
+    // Pad A: [M,K] -> [M,K_gemm]
+    if (padK) {
+        auto A_pad = torch::zeros({M, K_gemm}, A.options());
+        A_pad.narrow(1, 0, K).copy_(tensor_a);
+        tensor_a = A_pad;
+    }
 
+    // Pad B: [N,K] -> [N_gemm,K_gemm]
+    if (padN || padK) {
+        auto B_pad = torch::zeros(
+            {N_gemm, K_gemm}, B.options()
+        );
+        B_pad.narrow(0, 0, N)
+             .narrow(1, 0, K)
+             .copy_(tensor_b);
+        tensor_b = B_pad;
+    }
+
+    // Pad column scales: [N] -> [N_gemm]
+    if (padN) {
+        auto V2_pad = torch::zeros(
+            {N_gemm}, tensor_v2.options()
+        );
+        V2_pad.narrow(0, 0, N).copy_(tensor_v2);
+        tensor_v2 = V2_pad;
+    }
+
+    // Output is initially padded
+    auto D_full = torch::empty(
+        {M, N_gemm},
+        torch::TensorOptions()
+            .device(A.device())
+            .dtype(torch::kInt8)
+    );
+
+    // ========================================================
+    // 2. CUTLASS types
+    // ========================================================
     using ElementA = int8_t;
     using ElementB = int8_t;
     using ElementScale = float;
@@ -739,17 +792,17 @@ torch::Tensor matmul_w8a8o8_kernel(
     using LayoutB = cutlass::layout::ColumnMajor;
     using LayoutC = cutlass::layout::RowMajor;
 
-    constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
-    constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
-    constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
-
+    constexpr int AlignmentA = 16;
+    constexpr int AlignmentB = 16;
+    constexpr int AlignmentC = 16;
     constexpr int EVTEpilogueStages = 1;
 
     using namespace cute;
 
     using OutputTileThreadMap =
         cutlass::epilogue::threadblock::OutputTileThreadLayout<
-            TileShape, WarpShape, ElementC, AlignmentC, EVTEpilogueStages>;
+            TileShape, WarpShape, ElementC,
+            AlignmentC, EVTEpilogueStages>;
 
     using Accum =
         cutlass::epilogue::threadblock::VisitorAccFetch;
@@ -775,9 +828,7 @@ torch::Tensor matmul_w8a8o8_kernel(
 
     using EVTCompute0 =
         cutlass::epilogue::threadblock::Sm80EVT<
-            Compute0,
-            Accum,
-            V1Broadcast>;
+            Compute0, Accum, V1Broadcast>;
 
     using Compute1 =
         cutlass::epilogue::threadblock::VisitorCompute<
@@ -788,9 +839,7 @@ torch::Tensor matmul_w8a8o8_kernel(
 
     using EVTCompute1 =
         cutlass::epilogue::threadblock::Sm80EVT<
-            Compute1,
-            EVTCompute0,
-            V2Broadcast>;
+            Compute1, EVTCompute0, V2Broadcast>;
 
     using StoreD =
         cutlass::epilogue::threadblock::VisitorAuxStore<
@@ -801,22 +850,15 @@ torch::Tensor matmul_w8a8o8_kernel(
 
     using EVTD =
         cutlass::epilogue::threadblock::Sm80EVT<
-            StoreD,
-            EVTCompute1>;
+            StoreD, EVTCompute1>;
 
     using Kernel =
         typename cutlass::gemm::kernel::DefaultGemmWithVisitor<
-            ElementA,
-            LayoutA,
-            cutlass::ComplexTransform::kNone,
-            AlignmentA,
-            ElementB,
-            LayoutB,
-            cutlass::ComplexTransform::kNone,
-            AlignmentB,
-            ElementC,
-            LayoutC,
-            AlignmentC,
+            ElementA, LayoutA,
+            cutlass::ComplexTransform::kNone, AlignmentA,
+            ElementB, LayoutB,
+            cutlass::ComplexTransform::kNone, AlignmentB,
+            ElementC, LayoutC, AlignmentC,
             ElementAccumulator,
             ElementCompute,
             cutlass::arch::OpClassTensorOp,
@@ -833,6 +875,9 @@ torch::Tensor matmul_w8a8o8_kernel(
     using DeviceGemm =
         cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 
+    // ========================================================
+    // 3. Epilogue callback arguments
+    // ========================================================
     typename EVTD::Arguments callback_args{
         {
             {
@@ -847,52 +892,80 @@ torch::Tensor matmul_w8a8o8_kernel(
             {
                 tensor_v2.data_ptr<float>(),
                 ElementScale(0),
-                {_0{}, _1{}, int32_t(N)}
+                {_0{}, _1{}, int32_t(N_gemm)}
             },
             {}
         },
         {
-            reinterpret_cast<ElementOutput*>(D.data_ptr<int8_t>()),
-            {int64_t{N}, _1{}, int64_t{M * N}}
+            reinterpret_cast<ElementOutput*>(
+                D_full.data_ptr<int8_t>()
+            ),
+            {
+                int64_t{N_gemm},
+                _1{},
+                int64_t(M) * N_gemm
+            }
         }
     };
 
+    // ========================================================
+    // 4. GEMM arguments (padded dimensions)
+    // ========================================================
     typename DeviceGemm::Arguments arguments(
         cutlass::gemm::GemmUniversalMode::kGemm,
-        {M, N, K},
-        1,                          // batch count
+        {M, N_gemm, K_gemm},
+        1,
         callback_args,
         tensor_a.data_ptr<ElementA>(),
         tensor_b.data_ptr<ElementB>(),
-        nullptr,                    // C
-        nullptr,                    // D (not used directly; stored via EVT)
-        int64_t(M) * K,             // batch stride A
-        int64_t(N) * K,             // batch stride B
-        0,                          // batch stride C
-        0,                          // batch stride D
-        tensor_a.stride(0),         // lda
-        tensor_b.stride(0),         // ldb
-        0,                          // ldc
-        0                           // ldd
+        nullptr,
+        nullptr,
+        int64_t(M) * K_gemm,
+        int64_t(N_gemm) * K_gemm,
+        0,
+        0,
+        tensor_a.stride(0),
+        tensor_b.stride(0),
+        0,
+        0
     );
 
+    // ========================================================
+    // 5. Launch CUTLASS GEMM
+    // ========================================================
     DeviceGemm gemm_op;
     auto stream = at::cuda::getCurrentCUDAStream(A.get_device());
 
-    size_t workspace_size = DeviceGemm::get_workspace_size(arguments);
-    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+    size_t workspace_size =
+        DeviceGemm::get_workspace_size(arguments);
+
+    cutlass::device_memory::allocation<uint8_t>
+        workspace(workspace_size);
 
     auto status = gemm_op.can_implement(arguments);
-    TORCH_CHECK(status == cutlass::Status::kSuccess, "can_implement failed");
+    TORCH_CHECK(status == cutlass::Status::kSuccess,
+                "CUTLASS can_implement failed");
 
-    status = gemm_op.initialize(arguments, workspace.get(), stream.stream());
-    TORCH_CHECK(status == cutlass::Status::kSuccess, "initialize failed");
+    status = gemm_op.initialize(
+        arguments, workspace.get(), stream.stream()
+    );
+    TORCH_CHECK(status == cutlass::Status::kSuccess,
+                "CUTLASS initialize failed");
 
     status = gemm_op(stream.stream());
-    TORCH_CHECK(status == cutlass::Status::kSuccess, "run failed");
+    TORCH_CHECK(status == cutlass::Status::kSuccess,
+                "CUTLASS run failed");
 
-    return D;
+    // ========================================================
+    // 6. Return original output shape
+    // ========================================================
+    if (padN) {
+        return D_full.narrow(1, 0, N).contiguous();
+    }
+
+    return D_full;
 }
+
 
 torch::Tensor matmul_w8a8o8_2D_host(
     const torch::Tensor &A,          // int8 [M, K]
