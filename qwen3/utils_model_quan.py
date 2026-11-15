@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 import gemm_cutlass
 from utils_quant import *
+import custom_ops
 
 MAX_SEQ_LEN = 8320 # 576 or 1040 or 2112 or 4224 or 8320
 BATCH_SIZE = 1 # 1, 2, 16, 64, 128
@@ -51,7 +52,8 @@ class Custom_RMSNorm(torch.nn.Module):
         else:
             assert x.dtype == torch.int8, "Expected int8 input in quantization mode"
             assert scale_x.dtype == torch.float32, f"Expected float32 scale, got {scale_x.dtype}"
-            x_int8, scale_x = gemm_cutlass.func_rmsnorm_int8(x, scale_x, self.weight, self.eps)
+            # x_int8, scale_x = gemm_cutlass.func_rmsnorm_int8(x, scale_x, self.weight, self.eps)
+            x_int8, scale_x = custom_ops.rmsnorm_int8(x, scale_x, self.weight, self.eps)
             return x_int8, scale_x
     
     def finish_calibration(self):
@@ -98,10 +100,14 @@ class RMSNorm_Fuse_Quant(nn.Module):
             if self.is_smooth_scale == False:
                 fake_smooth_scale = torch.ones(self.emb_dim,\
                                     dtype=torch.float32, device=x.device)
-                Y_int8, scale_Y = gemm_cutlass.func_rmsnorm_quant(x, self.weight,\
+                # Y_int8, scale_Y = gemm_cutlass.func_rmsnorm_quant(x, self.weight,\
+                #                         fake_smooth_scale, self.eps)
+                Y_int8, scale_Y = custom_ops.rmsnorm_quant(x, self.weight,\
                                         fake_smooth_scale, self.eps)
             else:
-                Y_int8, scale_Y = gemm_cutlass.func_rmsnorm_quant(x, self.weight,\
+                # Y_int8, scale_Y = gemm_cutlass.func_rmsnorm_quant(x, self.weight,\
+                #                         self.smooth_scale, self.eps)
+                Y_int8, scale_Y = custom_ops.rmsnorm_quant(x, self.weight,\
                                         self.smooth_scale, self.eps)
             return Y_int8, scale_Y
     
@@ -167,9 +173,11 @@ class Custom_RoPE(nn.Module):
             cos = cos[:seq_len, :]
             sin = sin[:seq_len, :]
 
-            Y_int8, scale_out = gemm_cutlass.func_apply_rope_int8(x, scale_x, \
-                            cos, scale_cos,
-                            sin, scale_sin)
+            # Y_int8, scale_out = gemm_cutlass.func_apply_rope_int8(x, scale_x, \
+            #                 cos, scale_cos,
+            #                 sin, scale_sin)
+            Y_int8, scale_out = custom_ops.rope_int8(x, scale_x, \
+                            cos, scale_cos, sin, scale_sin)
             Y_int8 = Y_int8.view(origin_shape)
             scale_out = scale_out.view(origin_shape[:-1])
             return Y_int8, scale_out
@@ -245,7 +253,8 @@ class Custom_Matmul(nn.Module):
         else:
             if (A.dim() == 2) or (A.dim() == 3) or (A.dim() == 4):
                 if self.is_return_float:
-                    C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)
+                    # C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)
+                    C = custom_ops.w8a8_matmul(A, B, scale_A, scale_B)
                     return C, 1.0
                 else:
                     # C_i8, scale_C = gemm_cutlass.func_w8a8o8_matmul(A, B, scale_A, scale_B)
@@ -265,7 +274,8 @@ class Custom_Matmul(nn.Module):
                     row_scale = scale_A / scale_C
                     col_scale = scale_B
                     
-                    C_i8 = gemm_cutlass.func_w8a8o8_matmul_fusion(A, B, row_scale, col_scale)
+                    # C_i8 = gemm_cutlass.func_w8a8o8_matmul_fusion(A, B, row_scale, col_scale)
+                    C_i8 = custom_ops.w8a8o8_matmul_fusion(A, B, row_scale, col_scale)
                     return C_i8, scale_C
             else:
                 raise ValueError(f"Unsupported input dimensions: {A.dim()}")
@@ -481,9 +491,12 @@ class Custom_Linear(nn.Module):
             sx = scale_x.reshape(-1).contiguous()
 
             if self.is_return_float:
-                out = gemm_cutlass.func_w8a8_matmul(
+                # out = gemm_cutlass.func_w8a8_matmul(
+                #     x_2d, self.weight_q, sx, self.scale_w
+                # )
+                out = custom_ops.w8a8_matmul(
                     x_2d, self.weight_q, sx, self.scale_w
-                )
+                )   
                 return out.reshape(*original_shape, self.out_features), 1.0
 
             else:
@@ -511,7 +524,10 @@ class Custom_Linear(nn.Module):
                     print(f"sx shape: {sx.shape}, sy shape: {sy.shape}, scale_w shape: {self.scale_w.shape}")
                     raise
 
-                out_i8 = gemm_cutlass.func_w8a8o8_matmul_fusion(
+                # out_i8 = gemm_cutlass.func_w8a8o8_matmul_fusion(
+                #     x_2d, self.weight_q, row_scale, col_scale
+                # )
+                out_i8 = custom_ops.w8a8o8_matmul_fusion(
                     x_2d, self.weight_q, row_scale, col_scale
                 )
 
@@ -564,9 +580,14 @@ class Custom_Silu(nn.Module):
             assert x1.dtype == torch.int8 and x2.dtype == torch.int8,\
                 "Expected int8 inputs in quantized mode"
 
-            x_int8, x_scale = gemm_cutlass.func_silu_mul_int8(\
-                x1, scale_x1,\
-                x2, scale_x2, self.smooth_alpha, True)
+            # x_int8, x_scale = gemm_cutlass.func_silu_mul_int8(\
+            #     x1, scale_x1,\
+            #     x2, scale_x2, self.smooth_alpha, True)
+            x_int8, x_scale = custom_ops.silu_mul_int8(
+                x1, scale_x1,
+                x2, scale_x2,
+                self.smooth_alpha, True
+            )
             
             return x_int8, x_scale
 
@@ -623,7 +644,9 @@ class Custom_FeedForward(nn.Module):
             X_smooth_q, scale_x_smooth = self.silu_layer(x_fc1_int8, scale_fc1, 
                                                          x_fc2_int8, scale_fc2)
             
-            out = gemm_cutlass.func_w8a8_matmul(X_smooth_q, self.fc3.weight_q,\
+            # out = gemm_cutlass.func_w8a8_matmul(X_smooth_q, self.fc3.weight_q,\
+            #                 scale_x_smooth, self.fc3.scale_w)
+            out = custom_ops.w8a8_matmul(X_smooth_q, self.fc3.weight_q,\
                             scale_x_smooth, self.fc3.scale_w)
             
             return out, 1.0
@@ -923,11 +946,12 @@ class Custom_GroupedQueryAttention_Hybrid(nn.Module):
                 dropout_p=0.0,
                 is_causal=True,
                 enable_gqa=True
-            )
+            ).squeeze(0)
 
             # [1, Hq, S, D] -> [S, Hq * D]
-            context = context.squeeze(0)
             context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
+            
+            
 
             out, _ = self.out_proj(context, 1.0)
         
@@ -982,8 +1006,8 @@ class TransformerBlock_Quant(nn.Module):
         cos, sin = compute_rope_params(
             head_dim=head_dim,
             theta_base=cfg["rope_base"],
-            context_length=cfg["context_length"]
-            # context_length=MAX_SEQ_LEN
+            # context_length=cfg["context_length"]
+            context_length=MAX_SEQ_LEN
         )
         self.register_buffer("cos", cos.to(cfg["dtype"]))
         self.register_buffer("sin", sin.to(cfg["dtype"]))

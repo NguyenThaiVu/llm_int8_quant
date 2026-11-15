@@ -118,6 +118,126 @@ __global__ void rope_int8_kernel(
 }
 
 
+
+template<int WARPS_PER_BLOCK = 4>
+__global__ void rope_int8_warp_kernel(
+    const int8_t* __restrict__ x,
+    const float* __restrict__ scale_x,
+    const int8_t* __restrict__ cos,
+    float scale_cos,
+    const int8_t* __restrict__ sin,
+    float scale_sin,
+    int outer_size,
+    int num_heads,
+    int seq_len,
+    int8_t* __restrict__ out,
+    float* __restrict__ scale_out,
+    int scale_mode
+) {
+    constexpr int HEAD_DIM = 128;
+    constexpr int HALF = HEAD_DIM / 2;
+    constexpr unsigned FULL_MASK = 0xffffffffu;
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    // Each warp processes one complete row.
+    const int64_t row =
+        int64_t(blockIdx.x) * WARPS_PER_BLOCK + warp;
+
+    const int64_t total_rows =
+        int64_t(outer_size) * seq_len;
+
+    if (row >= total_rows) return;
+
+    const int outer = int(row / seq_len);
+    const int pos = int(row % seq_len);
+
+    const int64_t row_base = row * HEAD_DIM;
+    const int64_t trig_base = int64_t(pos) * HEAD_DIM;
+
+    // Input scale
+    float sx;
+
+    if (scale_mode == 0) {
+        sx = scale_x[row];
+    }
+    else if (scale_mode == 1) {
+        int batch = outer / num_heads;
+        sx = scale_x[int64_t(batch) * seq_len + pos];
+    }
+    else {
+        sx = scale_x[pos];
+    }
+
+    // Four cached output values per thread.
+    float y1[2];
+    float y2[2];
+
+    float local_max = 0.0f;
+
+    // Pass 1: compute RoPE once and cache results.
+    #pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        int col = lane + k * 32;
+
+        float x1 = float(x[row_base + col]) * sx;
+        float x2 = float(x[row_base + col + HALF]) * sx;
+
+        float c =
+            float(cos[trig_base + col]) * scale_cos;
+
+        float s =
+            float(sin[trig_base + col]) * scale_sin;
+
+        y1[k] = x1 * c - x2 * s;
+        y2[k] = x1 * s + x2 * c;
+
+        local_max = fmaxf(local_max, fabsf(y1[k]));
+        local_max = fmaxf(local_max, fabsf(y2[k]));
+    }
+
+    // Warp-level maximum reduction.
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other =
+            __shfl_down_sync(FULL_MASK, local_max, offset);
+
+        local_max = fmaxf(local_max, other);
+    }
+
+    // Broadcast maximum from lane 0 to entire warp.
+    float row_max =
+        __shfl_sync(FULL_MASK, local_max, 0);
+
+    float s_out = fmaxf(row_max / 127.0f, 1e-8f);
+    float inv_out = 1.0f / s_out;
+
+    // One output scale per row.
+    if (lane == 0) {
+        scale_out[row] = s_out;
+    }
+
+    // Pass 2: quantize cached values.
+    #pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        int col = lane + k * 32;
+
+        int q1 = __float2int_rn(y1[k] * inv_out);
+        int q2 = __float2int_rn(y2[k] * inv_out);
+
+        q1 = max(-128, min(127, q1));
+        q2 = max(-128, min(127, q2));
+
+        out[row_base + col] =
+            static_cast<int8_t>(q1);
+
+        out[row_base + col + HALF] =
+            static_cast<int8_t>(q2);
+    }
+}
+
+
+
 std::tuple<torch::Tensor, torch::Tensor> rope_int8_host(
     torch::Tensor x,          // int8 [H, seq_len, D] or [B, H, seq_len, D]
     torch::Tensor scale_x,    // float32 [H, seq_len], [B, H, seq_len], or [seq_len]
@@ -235,30 +355,63 @@ std::tuple<torch::Tensor, torch::Tensor> rope_int8_host(
             x.options().dtype(torch::kFloat)
         );
     }
-
-    dim3 block(256);
-    dim3 grid(1, (unsigned)seq_len, (unsigned)outer_size);
-
+    
     auto stream = at::cuda::getCurrentCUDAStream();
-    size_t shared_mem_size = 0;
 
-    rope_int8_kernel<<<grid, block, shared_mem_size, stream>>>(
-        xq.data_ptr<int8_t>(),
-        sx.data_ptr<float>(),
-        cosq.data_ptr<int8_t>(),
-        scale_cos,
-        sinq.data_ptr<int8_t>(),
-        scale_sin,
-        outer_size,
-        num_heads,
-        head_dim,
-        seq_len,
-        out.data_ptr<int8_t>(),
-        scale_out.data_ptr<float>(),
-        scale_mode
-    );
+    if (head_dim == 128) {
+        constexpr int WARPS_PER_BLOCK = 4;
+        constexpr int THREADS = WARPS_PER_BLOCK * 32;
+
+        const int64_t total_rows = int64_t(outer_size) * seq_len;
+        const int64_t blocks = (total_rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+
+        dim3 grid(static_cast<unsigned int>(blocks));
+        dim3 block(THREADS);
+
+        rope_int8_warp_kernel<WARPS_PER_BLOCK>
+            <<<grid, block, 0, stream>>>(
+                xq.data_ptr<int8_t>(),
+                sx.data_ptr<float>(),
+                cosq.data_ptr<int8_t>(),
+                scale_cos,
+                sinq.data_ptr<int8_t>(),
+                scale_sin,
+                outer_size,
+                num_heads,
+                seq_len,
+                out.data_ptr<int8_t>(),
+                scale_out.data_ptr<float>(),
+                scale_mode
+            );
+    }
+    else {
+        // Original kernel for other head dimensions.
+        dim3 grid(
+            1,
+            static_cast<unsigned int>(seq_len),
+            static_cast<unsigned int>(outer_size)
+        );
+        dim3 block(256);
+
+        rope_int8_kernel<<<grid, block, 0, stream>>>(
+            xq.data_ptr<int8_t>(),
+            sx.data_ptr<float>(),
+            cosq.data_ptr<int8_t>(),
+            scale_cos,
+            sinq.data_ptr<int8_t>(),
+            scale_sin,
+            outer_size,
+            num_heads,
+            head_dim,
+            seq_len,
+            out.data_ptr<int8_t>(),
+            scale_out.data_ptr<float>(),
+            scale_mode
+        );
+    }
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+
 
     return std::make_tuple(out, scale_out);
 }

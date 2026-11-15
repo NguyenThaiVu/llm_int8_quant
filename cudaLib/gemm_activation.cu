@@ -209,10 +209,7 @@ __global__ void silu_mul_int8_kernel_warp_reduction(
     __shared__ float shared_scale_out;
 
     if (tid == 0) {
-        float scale_out = (row_max > 0.0f && isfinite(row_max))
-                              ? row_max / 127.0f
-                              : 1.0f;
-
+        float scale_out = (row_max > 0.0f) ? row_max / 127.0f : 1.0f;
         shared_scale_out = scale_out;
         out_scales[row] = scale_out;
     }
@@ -242,6 +239,95 @@ __global__ void silu_mul_int8_kernel_warp_reduction(
         out_int8[idx] = static_cast<int8_t>(q);
     }
 }
+
+
+template<int BLOCK_THREADS, int ITEMS_PER_THREAD>
+__global__ void silu_mul_int8_register_kernel(
+    const int8_t* __restrict__ x1_int8,
+    const int8_t* __restrict__ x2_int8,
+    const float* __restrict__ scale_x1,
+    const float* __restrict__ scale_x2,
+    int8_t* __restrict__ out_int8,
+    float* __restrict__ out_scales,
+    const float* __restrict__ smooth_scale,
+    int rows,
+    int cols
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const int tid = threadIdx.x;
+    const int row_offset = row * cols;
+
+    const float sx1 = scale_x1[row];
+    const float sx2 = scale_x2[row];
+
+    // Cache intermediate results in registers.
+    float values[ITEMS_PER_THREAD];
+
+    float local_max = 0.0f;
+
+    #pragma unroll
+    for (int k = 0; k < ITEMS_PER_THREAD; ++k) {
+        int col = tid + k * BLOCK_THREADS;
+
+        float y = 0.0f;
+
+        if (col < cols) {
+            int idx = row_offset + col;
+
+            float x1 = float(x1_int8[idx]) * sx1;
+            float x2 = float(x2_int8[idx]) * sx2;
+
+            float silu = x1 / (1.0f + __expf(-x1));
+            y = silu * x2;
+
+            if (smooth_scale != nullptr)
+                y /= smooth_scale[col];
+
+            local_max = fmaxf(local_max, fabsf(y));
+        }
+
+        values[k] = y;
+    }
+
+    // Reduction
+    const float row_max = block_reduce_max(local_max);
+
+    __shared__ float shared_scale_out;
+
+    if (tid == 0) {
+        float scale = (row_max > 0.0f)
+                    ? row_max / 127.0f
+                    : 1.0f;
+
+        shared_scale_out = scale;
+        out_scales[row] = scale;
+    }
+
+    __syncthreads();
+
+    const float inv_scale = 1.0f / shared_scale_out;
+
+    // Quantize using cached values
+    #pragma unroll
+    for (int k = 0; k < ITEMS_PER_THREAD; ++k) {
+        int col = tid + k * BLOCK_THREADS;
+
+        if (col < cols) {
+            float qf = values[k] * inv_scale;
+
+            if (!isfinite(qf))
+                qf = 0.0f;
+
+            int q = __float2int_rn(qf);
+            q = max(-127, min(127, q));
+
+            out_int8[row_offset + col] = int8_t(q);
+        }
+    }
+}
+
 
 std::tuple<torch::Tensor, torch::Tensor> silu_mul_int8_cuda(
     torch::Tensor x1_int8, 
@@ -372,16 +458,7 @@ std::tuple<torch::Tensor, torch::Tensor> silu_mul_int8_cuda(
         torch::dtype(torch::kFloat32).device(x1_int8.device())
     );
 
-    int threads = static_cast<int>(std::min<int64_t>(cols, 512));
-
-    if (threads & (threads - 1)) {
-        int p = 1;
-        while ((p << 1) <= threads) p <<= 1;
-        threads = p;
-    }
-
-    threads = std::max(threads, 32);
-
+    int threads = BLOCK_SIZE;
     dim3 block(threads);
     dim3 grid(rows);
 
@@ -389,7 +466,6 @@ std::tuple<torch::Tensor, torch::Tensor> silu_mul_int8_cuda(
 
     if (use_warp_reduction == false) {
         size_t shared_mem_size = threads * sizeof(float);
-
         silu_mul_int8_kernel<<<grid, block, shared_mem_size, stream>>>(
             x1_2d.data_ptr<int8_t>(),
             x2_2d.data_ptr<int8_t>(),
@@ -402,17 +478,60 @@ std::tuple<torch::Tensor, torch::Tensor> silu_mul_int8_cuda(
             static_cast<int>(cols)
         );
     } else {
-        silu_mul_int8_kernel_warp_reduction<<<grid, block, 0, stream>>>(
-            x1_2d.data_ptr<int8_t>(),
-            x2_2d.data_ptr<int8_t>(),
-            scale_x1_1d.data_ptr<float>(),
-            scale_x2_1d.data_ptr<float>(),
-            out_int8_2d.data_ptr<int8_t>(),
-            out_scales_1d.data_ptr<float>(),
-            smooth_scale_contig.data_ptr<float>(),
-            static_cast<int>(rows),
-            static_cast<int>(cols)
-        );
+        // silu_mul_int8_kernel_warp_reduction<<<grid, block, 0, stream>>>(
+        //     x1_2d.data_ptr<int8_t>(),
+        //     x2_2d.data_ptr<int8_t>(),
+        //     scale_x1_1d.data_ptr<float>(),
+        //     scale_x2_1d.data_ptr<float>(),
+        //     out_int8_2d.data_ptr<int8_t>(),
+        //     out_scales_1d.data_ptr<float>(),
+        //     smooth_scale_contig.data_ptr<float>(),
+        //     static_cast<int>(rows),
+        //     static_cast<int>(cols)
+        // );
+        #define LAUNCH_SILU_REGISTER(THREADS, ITEMS) \
+            silu_mul_int8_register_kernel<THREADS, ITEMS> \
+                <<<grid, THREADS, 0, stream>>>( \
+                    x1_2d.data_ptr<int8_t>(), \
+                    x2_2d.data_ptr<int8_t>(), \
+                    scale_x1_1d.data_ptr<float>(), \
+                    scale_x2_1d.data_ptr<float>(), \
+                    out_int8_2d.data_ptr<int8_t>(), \
+                    out_scales_1d.data_ptr<float>(), \
+                    smooth_scale_contig.data_ptr<float>(), \
+                    static_cast<int>(rows), \
+                    static_cast<int>(cols) \
+                )
+
+        if (cols <= 256 * 4) {
+            LAUNCH_SILU_REGISTER(256, 4);
+        }
+        else if (cols <= 256 * 8) {
+            LAUNCH_SILU_REGISTER(256, 8);
+        }
+        else if (cols <= 256 * 16) {
+            LAUNCH_SILU_REGISTER(256, 16);
+        }
+        else if (cols <= 256 * 32) {
+            LAUNCH_SILU_REGISTER(256, 32);
+        }
+        else if (cols <= 512 * 24) {
+            // Qwen3-8B: hidden_dim = 12288
+            LAUNCH_SILU_REGISTER(512, 24);
+        }
+        else if (cols <= 512 * 34) {
+            // Qwen3-14B: hidden_dim = 17408
+            LAUNCH_SILU_REGISTER(512, 34);
+        }
+        else if (cols <= 512 * 48) {
+            // Support dimensions up to 24576
+            LAUNCH_SILU_REGISTER(512, 48);
+        }
+        else {
+            TORCH_CHECK(false, "Unsupported cols: ", cols);
+        }
+
+        #undef LAUNCH_SILU_REGISTER
     }
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();

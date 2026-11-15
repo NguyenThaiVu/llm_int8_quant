@@ -3,14 +3,14 @@ In this script, we verify the correctness and latency of the RMSNorm implementat
 - PyTorch.
 - Our Kernel.
 """
-
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import torch 
 from torch import nn
 
 from utils_quant import quantize_row_int8_symmetric_nd, measure_time
 
-import gemm_cutlass
+import custom_ops
 
 
 
@@ -36,10 +36,12 @@ if __name__ == "__main__":
     # 2. Our Kernel RMSNorm
     X_i8, scale_X = quantize_row_int8_symmetric_nd(X)
     
-    our_time = measure_time(gemm_cutlass.func_rmsnorm_int8, X_i8, scale_X, gamma, 1e-6)
+    # our_time = measure_time(gemm_cutlass.func_rmsnorm_int8, X_i8, scale_X, gamma, 1e-6)
+    our_time = measure_time(custom_ops.rmsnorm_int8, X_i8, scale_X, gamma, 1e-6)
     print(f"Our Kernel RMSNorm time: {our_time:.6f} seconds")
     
-    Y_i8, scale_Y = gemm_cutlass.func_rmsnorm_int8(X_i8, scale_X, gamma, 1e-6)
+    # Y_i8, scale_Y = gemm_cutlass.func_rmsnorm_int8(X_i8, scale_X, gamma, 1e-6)
+    Y_i8, scale_Y = custom_ops.rmsnorm_int8(X_i8, scale_X, gamma, 1e-6)
     Y_deq = Y_i8.to(torch.float32) * scale_Y.unsqueeze(-1)
     
     max_diff = (Y - Y_deq).abs().max()
