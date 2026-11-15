@@ -153,7 +153,6 @@ class SmoothQuant_GroupedQueryAttention(nn.Module):
             # 6. Output
             context = attn_weights @ values  # Shape: (num_heads, num_tokens, head_dim)
         
-        
         context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
         return self.out_proj(context)
     

@@ -1,9 +1,7 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # select GPU "0", "1", "2",...
 from tqdm import tqdm
 import json
 import torch
-torch.manual_seed(123)
 import torch.nn as nn
 from safetensors.torch import load_file
 from huggingface_hub import hf_hub_download
@@ -17,13 +15,13 @@ from utils_model_quan import TransformerBlock_Quant
 from utils_power import *
     
 # Select which model to use via the following flag; only one can be True
-USE_BASE_MODEL = False
+USE_BASE_MODEL = True
 USE_REASONING_MODEL = False
-USE_INSTRUCT_MODEL = True
+USE_INSTRUCT_MODEL = False
 if (USE_BASE_MODEL + USE_REASONING_MODEL + USE_INSTRUCT_MODEL) != 1:
     raise AttributeError("Only one of the options above can be True.")
 
-CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
 
 MAX_NEW_TOKENS = PPL_CONTEXT_TOKENS = 2048  # Options: 2048, 4096, 8192
 EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
@@ -36,7 +34,7 @@ class Qwen3Model_Quant(nn.Module):
 
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
 
-        self.trf_blocks = nn.ModuleList(  
+        self.trf_blocks = nn.ModuleList(
             [TransformerBlock_Quant(cfg) for i in range(cfg["n_layers"])]
         )
         
@@ -173,7 +171,8 @@ if __name__ == "__main__":
     # 3. Quantization Calibration
     # ================================================================
     print("\nCollecting calibration for quantization...")
-    calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET, split="train", n=10_000)
+    calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,\
+                                            split="train", n=1_000)
     
     # calibrate_tokens = tokenizer.encode(calibrate_samples)
     calibrate_tokens = evaluation_tokenizer.encode(calibrate_samples)
@@ -192,7 +191,7 @@ if __name__ == "__main__":
     print(f"[INFO] Finished calibration.")
     
     model.eval()
-    # model = torch.compile(model)
+    model = torch.compile(model)
     print(f"\n[INFO] Model compiled successfully. Start evaluation... \n")
 
     # ========================================================================
@@ -200,23 +199,23 @@ if __name__ == "__main__":
     # ========================================================================
     print("\n===== Generated text after quantization: =====\n")
     
-    en = """
-    Last summer, my family visited a small village near the mountains. 
-    We spent three days exploring the area, trying local food, and meeting friendly people. 
-    Although the weather was sometimes rainy, we really enjoyed our trip.
-    """
+    # en = """
+    # Last summer, my family visited a small village near the mountains. 
+    # We spent three days exploring the area, trying local food, and meeting friendly people. 
+    # Although the weather was sometimes rainy, we really enjoyed our trip.
+    # """
     
-    input_article = """
-    In 2025, the city of Paris introduced 50 kilometers of new bicycle lanes to encourage sustainable transportation.
-    Following the expansion, bicycle usage increased by 30%, while car traffic in the city center decreased by 12%.
-    However, some residents expressed concerns about reduced parking spaces.
-    """
+    # input_article = """
+    # In 2025, the city of Paris introduced 50 kilometers of new bicycle lanes to encourage sustainable transportation.
+    # Following the expansion, bicycle usage increased by 30%, while car traffic in the city center decreased by 12%.
+    # However, some residents expressed concerns about reduced parking spaces.
+    # """
     
-    list_prompts = [f"Translate the following English text to French: {en}", \
-            "Which country has a capital city named Paris?",\
-            f"Summarize the article {input_article} in 1 sentence and extract important information into JSON format.",\
-            "Describe the Vietnames culture in detail."]
-    # list_prompts = ["Briefly describe the Vietnames culture."]
+    # list_prompts = [f"Translate the following English text to French: {en}", \
+    #         "Which country has a capital city named Paris?",\
+    #         f"Summarize the article {input_article} in 1 sentence and extract important information into JSON format.",\
+    #         "Describe the Vietnames culture in detail."]
+    list_prompts = ["What is the capital of France?"]
 
     for idx, prompt in enumerate(list_prompts):
         input_token_ids = tokenizer.encode(prompt)
@@ -235,7 +234,7 @@ if __name__ == "__main__":
     # ================================================================
     # 5. Measure latency
     # ================================================================
-    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET, split="test")
+    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET, split="train")
     samples = evaluation_tokenizer.encode(samples)
     chunk_tokens = samples[0:PPL_CONTEXT_TOKENS]
     input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
@@ -246,20 +245,6 @@ if __name__ == "__main__":
         out_ids = model(input_ids)
     torch.cuda.synchronize()
     print(f"[INFO] Output tokens: {out_ids.shape}")
-    
-    # Measure latency 
-    n_iter = 10
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    with torch.no_grad():
-        for _ in range(n_iter):
-            out_ids = model(input_ids)
-    end_event.record()
-    torch.cuda.synchronize()
-    elapsed_time_ms = start_event.elapsed_time(end_event)
-    avg_latency_ms = elapsed_time_ms / n_iter
-    print(f"[INFO] Average model latency over {n_iter} iterations: {avg_latency_ms:.4f} ms.")
     
     # Profiler to measure latency and memory usage
     with torch.profiler.profile(
@@ -276,12 +261,13 @@ if __name__ == "__main__":
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
     
     # Measure power consumption
-    measure_power(model, input_ids, n_iterations=10)
+    n_iter = 50
+    measure_power(model, input_ids, n_iterations=n_iter)
 
     # # ================================================================
     # # 5. PPL evaluation
     # # ================================================================
-    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET, split="test")
+    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET, split="validation")
     ppl = compute_ppl_single_text(model,
                                 evaluation_tokenizer,
                                 samples,
@@ -306,7 +292,7 @@ if __name__ == "__main__":
     #         tokenizer=evaluation_tokenizer,
     #         device=device,
     #         subset=DATASET_ARC,
-    #         max_samples=NUM_ARC_SAMPLES,  # Use None for the complete test set
+    #         max_samples=NUM_ARC_SAMPLES
     #     )
     #     print(f"{DATASET_ARC} results")
     #     print(f"Model: Qwen3-{CHOOSE_MODEL}")

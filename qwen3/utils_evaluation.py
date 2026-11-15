@@ -54,7 +54,7 @@ def load_wikitext_single_text(dataset_name="wikitext-2", split="validation", n=N
     
     if n is not None:
         if n < len(dataset):
-            dataset = dataset.select(range(n))
+            dataset = dataset.shuffle().select(range(n))
 
     text = "\n".join(x["text"] for x in dataset if x["text"].strip() != "")
     return text
@@ -186,24 +186,19 @@ def score_choice(model, tokenizer, prompt, choice, device):
     return total_score, normalized_score
 
 
-
 @torch.inference_mode()
 def evaluate_arc(
     model,
     tokenizer,
     device,
     subset="ARC-Easy",
-    split="test",
+    split="validation",
     max_samples=None,
 ):
     if subset not in {"ARC-Easy", "ARC-Challenge"}:
         raise ValueError("subset must be 'ARC-Easy' or 'ARC-Challenge'")
 
-    dataset = load_dataset(
-        "allenai/ai2_arc",
-        subset,
-        split=split,
-    )
+    dataset = load_dataset("allenai/ai2_arc", subset, split=split)
 
     if max_samples is not None:
         dataset = dataset.select(range(min(max_samples, len(dataset))))
@@ -289,10 +284,7 @@ def evaluate_piqa(
     """
 
     # This is the dataset path currently used by lm-evaluation-harness.
-    dataset = load_dataset(
-        "baber/piqa",
-        split=split,
-    )
+    dataset = load_dataset("baber/piqa", split=split)
 
     if max_samples is not None:
         dataset = dataset.select(
