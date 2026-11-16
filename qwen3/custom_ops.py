@@ -277,3 +277,49 @@ def _(
     )
 
     return C
+
+
+
+import torch
+from torch import Tensor
+import gemm_cutlass
+
+
+@torch.library.custom_op(
+    "int8_ops::quantize_i8_smooth",
+    mutates_args=(),
+    device_types="cuda",
+)
+def quantize_i8_smooth(
+    x: Tensor,
+    smooth: Tensor,
+) -> tuple[Tensor, Tensor]:
+
+    return gemm_cutlass.func_quantize_row_int8_with_smooth_cuda(
+        x,
+        smooth,
+    )
+
+
+@quantize_i8_smooth.register_fake
+def _(
+    x: Tensor,
+    smooth: Tensor,
+) -> tuple[Tensor, Tensor]:
+
+    # x: [M, K], BF16
+    # smooth: [K], FP32
+
+    y = torch.empty(
+        x.shape,
+        device=x.device,
+        dtype=torch.int8,
+    )
+
+    scale_y = torch.empty(
+        x.shape[:-1],
+        device=x.device,
+        dtype=torch.float32,
+    )
+
+    return y, scale_y

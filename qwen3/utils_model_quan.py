@@ -1,3 +1,4 @@
+from multiprocessing import context
 import os 
 import torch
 import torch.nn as nn
@@ -844,7 +845,7 @@ class Custom_GroupedQueryAttention_Hybrid(nn.Module):
         self.W_query = Custom_Linear(d_in, self.d_out).to(dtype)
         self.W_key = Custom_Linear(d_in, num_kv_groups * head_dim).to(dtype)
         self.W_value = Custom_Linear(d_in, num_kv_groups * head_dim).to(dtype)
-        self.out_proj = Custom_Linear(self.d_out, d_in).to(dtype)
+        self.out_proj = Custom_Linear(self.d_out, d_in, is_return_float=True).to(dtype)
 
         self.query_rope = Custom_RoPE(num_heads, head_dim=head_dim).to(dtype)
         self.key_rope = Custom_RoPE(num_kv_groups, head_dim=head_dim).to(dtype)
@@ -951,10 +952,11 @@ class Custom_GroupedQueryAttention_Hybrid(nn.Module):
             # [1, Hq, S, D] -> [S, Hq * D]
             context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
             
+            # Apply inverse SmoothQuant transformation
+            context_i8, context_scale = custom_ops.quantize_i8_smooth(context, self.out_proj.smooth_alpha)
+            out, _ = self.out_proj(context_i8, context_scale)
             
-
-            out, _ = self.out_proj(context, 1.0)
-        
+            # out, _ = self.out_proj(context, 1.0)
         return out
     
     def finish_calibration(self):
@@ -971,8 +973,10 @@ class Custom_GroupedQueryAttention_Hybrid(nn.Module):
         self.softmax_layer.finish_calibration()
         self.qk_score_layer.finish_calibration()
         self.context_layer.finish_calibration()
+        self.out_proj.finish_calibration()
         
         self.is_quantized = True
+        
 
 
 
