@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file
 from huggingface_hub import hf_hub_download
+import time
 
 from utils_tokenizer import Qwen3Tokenizer
 from config import get_model_config, load_weights_into_qwen
@@ -22,13 +23,13 @@ USE_INSTRUCT_MODEL = False
 if (USE_BASE_MODEL + USE_REASONING_MODEL + USE_INSTRUCT_MODEL) != 1:
     raise AttributeError("Only one of the options above can be True.")
 
-CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B"
 
 MAX_NEW_TOKENS = PPL_CONTEXT_TOKENS = 2048  # Options: 2048, 4096, 8192
 EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 USE_COMPILE = True  # Use torch.compile to speed up inference
-USE_FLASH_ATTENTION = True  # Use flash attention for faster inference
+USE_FLASH_ATTENTION = False  # Use flash attention for faster inference
 
 print(f"[INFO] Using model: Qwen3-{CHOOSE_MODEL}. With Context size: {PPL_CONTEXT_TOKENS}.\
     Compile: {USE_COMPILE}. Flash attention: {USE_FLASH_ATTENTION}.\n")
@@ -265,6 +266,16 @@ if __name__ == "__main__":
         with torch.no_grad():
             out_ids = model(input_ids)
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
+    
+    n_iter = 100
+    start_time = time.perf_counter()
+    for _ in range(n_iter):
+        with torch.no_grad():
+            out_ids = model(input_ids)
+    torch.cuda.synchronize()
+    end_time = time.perf_counter()
+    avg_time = (end_time - start_time) / n_iter
+    print(f"[INFO] Average inference time: {avg_time:.6f} seconds")
     
     # Measure power consumption
     measure_power(model, input_ids, n_iterations=200)

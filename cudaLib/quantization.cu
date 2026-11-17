@@ -26,8 +26,8 @@ __global__ void row_quant_int8_vec_kernel(
     int8_t* __restrict__ output,
     float* __restrict__ scales,
     int rows,
-    int K)
-{
+    int K
+) {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
 

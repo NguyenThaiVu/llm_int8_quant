@@ -36,7 +36,6 @@ if __name__ == "__main__":
     # 2. Our Kernel RMSNorm
     X_i8, scale_X = quantize_row_int8_symmetric_nd(X)
     
-    # our_time = measure_time(gemm_cutlass.func_rmsnorm_int8, X_i8, scale_X, gamma, 1e-6)
     our_time = measure_time(custom_ops.rmsnorm_int8, X_i8, scale_X, gamma, 1e-6)
     print(f"Our Kernel RMSNorm time: {our_time:.6f} seconds")
     

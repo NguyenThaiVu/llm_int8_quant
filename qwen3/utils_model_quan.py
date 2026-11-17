@@ -263,13 +263,9 @@ class Custom_Matmul(nn.Module):
         else:
             if (A.dim() == 2) or (A.dim() == 3) or (A.dim() == 4):
                 if self.is_return_float:
-                    # C = gemm_cutlass.func_w8a8_matmul(A, B, scale_A, scale_B)
                     C = custom_ops.w8a8_matmul(A, B, scale_A, scale_B)
                     return C, 1.0
                 else:
-                    # C_i8, scale_C = gemm_cutlass.func_w8a8o8_matmul(A, B, scale_A, scale_B)
-                    # return C_i8, scale_C
-                    
                     M = A.shape[-2]
                     if M > self.scale_out.shape[-1]:
                         raise ValueError("Output row position not calibrated")
@@ -284,7 +280,6 @@ class Custom_Matmul(nn.Module):
                     row_scale = scale_A / scale_C
                     col_scale = scale_B
                     
-                    # C_i8 = gemm_cutlass.func_w8a8o8_matmul_fusion(A, B, row_scale, col_scale)
                     C_i8 = custom_ops.w8a8o8_matmul_fusion(A, B, row_scale, col_scale)
                     return C_i8, scale_C
             else:
@@ -395,64 +390,6 @@ def compute_smooth_alpha(input_observer, weight, lambd=0.5):
     return alpha
 
 
-# class Custom_Linear(nn.Module):
-#     def __init__(self, in_features, out_features, max_seq_len=MAX_SEQ_LEN, is_return_float=False):
-#         super(Custom_Linear, self).__init__()
-        
-#         self.weight = nn.Parameter(torch.empty(out_features, in_features))
-#         self.in_features = in_features
-#         self.out_features = out_features
-        
-#         # Weight quantization
-#         self.weight_q = torch.empty(out_features, in_features, dtype=torch.int8)
-#         self.scale_w = torch.ones(out_features, dtype=torch.float32, device='cuda')
-        
-#         # SmoothQuant scaling factor
-#         self.smooth_alpha = torch.ones(in_features, dtype=torch.float32)
-#         self.in_observer = PerChannelAbsMaxObserver(in_features)
-        
-#         # Output scale quantization
-#         # self.out_observer = MinMaxObserverPerLastDim(max_seq_len=max_seq_len)
-#         # self.scale_y = torch.ones(max_seq_len, dtype=torch.float32, device='cuda')
-#         self.is_quantized = False
-
-#         self.is_return_float = is_return_float
-        
-#     def forward(self, x, scale_x):
-#         if self.is_quantized == False:  
-#             self.in_observer(x) # Calibrate input for SmoothQuant
-             
-#             out = torch.matmul(x, self.weight.t())  
-#             # self.out_observer(out)
-#             return out, 1.0
-#         else:
-#             assert x.dtype == torch.int8, "Expect int8 input in quantization"
-#             if self.is_return_float:
-#                 out = gemm_cutlass.func_w8a8_matmul(x, self.weight_q, scale_x, self.scale_w)
-#                 return out, 1.0
-#             else:
-#                 out_i8, scale_out = gemm_cutlass.func_w8a8o8_matmul(x, self.weight_q, scale_x, self.scale_w)
-#                 return out_i8, scale_out
-             
-#     def finish_calibration(self, alpha=None):
-#         if alpha is None:
-#             alpha = compute_smooth_alpha(self.in_observer, self.weight)
-#         self.smooth_alpha = alpha
-        
-#         # Quantize the smoothed weight
-#         w_smooth = self.weight * alpha.unsqueeze(0) 
-#         self.weight_q, self.scale_w = quantize_row_int8_symmetric_nd(w_smooth)
-
-#         # self.scale_y = self.out_observer.get_scale().to(self.scale_w.device)
-#         self.is_quantized = True  
-        
-#         # Delete weight and out_observer to save memory
-#         del self.weight
-#         del self.in_observer
-#         self.weight = None
-#         self.in_observer = None
-
-
 class Custom_Linear(nn.Module):
     def __init__(self, in_features, out_features, max_seq_len=MAX_SEQ_LEN, is_return_float=False):
         super().__init__()
@@ -485,7 +422,6 @@ class Custom_Linear(nn.Module):
             out = torch.matmul(x, self.weight.t())
 
             if self.collect_stats:
-                # Calibrate output scales
                 self.out_observer(out.reshape(-1, out.shape[-2], out.shape[-1]))
 
             return out, 1.0
@@ -527,7 +463,6 @@ class Custom_Linear(nn.Module):
                     print(f"sx shape: {sx.shape}, sy shape: {sy.shape}, scale_w shape: {self.scale_w.shape}")
                     raise
 
-                # out_i8 = gemm_cutlass.func_w8a8o8_matmul_fusion(x_2d, self.weight_q, row_scale, col_scale)
                 out_i8 = custom_ops.w8a8o8_matmul_fusion(x_2d, self.weight_q, row_scale, col_scale)
 
                 out_i8 = out_i8.reshape(*original_shape, self.out_features)
@@ -579,9 +514,6 @@ class Custom_Silu(nn.Module):
             assert x1.dtype == torch.int8 and x2.dtype == torch.int8,\
                 "Expected int8 inputs in quantized mode"
 
-            # x_int8, x_scale = gemm_cutlass.func_silu_mul_int8(\
-            #     x1, scale_x1,\
-            #     x2, scale_x2, self.smooth_alpha, True)
             x_int8, x_scale = custom_ops.silu_mul_int8(
                 x1, scale_x1,
                 x2, scale_x2,
@@ -765,13 +697,6 @@ class Custom_GroupedQueryAttention(nn.Module):
             # Normalize Q and K
             queries_int8, queries_scale = self.q_norm(queries_int8, queries_scale)
             keys_int8, keys_scale = self.k_norm(keys_int8, keys_scale)
-            
-            # # Apply RoPE to quantized Q and K
-            # queries_int8, queries_scale = self.query_rope(queries_int8, queries_scale,\
-            #                             cos, scale_cos, sin, scale_sin)
-            
-            # keys_int8, keys_scale = self.key_rope(keys_int8, keys_scale,\
-            #                             cos, scale_cos, sin, scale_sin)
             
             if self.use_flash_attention:
                 # INT8 RoPE input -> BF16 output

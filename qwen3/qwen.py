@@ -21,7 +21,7 @@ USE_INSTRUCT_MODEL = False
 if (USE_BASE_MODEL + USE_REASONING_MODEL + USE_INSTRUCT_MODEL) != 1:
     raise AttributeError("Only one of the options above can be True.")
 
-CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
 MAX_NEW_TOKENS = PPL_CONTEXT_TOKENS = 2048  # Options: 2048, 4096, 8192
 EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2

@@ -220,6 +220,7 @@ from torch import Tensor
 import gemm_cutlass
 
 
+
 @torch.library.custom_op(
     "int8_ops::quantize_i8_smooth",
     mutates_args=(),
@@ -234,7 +235,6 @@ def quantize_i8_smooth(
         x,
         smooth,
     )
-
 
 @quantize_i8_smooth.register_fake
 def _(
@@ -394,4 +394,34 @@ def _(
         dtype=torch.float32,
     )
     # With return_bf16=True the real CUDA kernel writes scale_y == 1.
+    return y, scale_y
+
+
+# gemm.func_quantize_i8
+@torch.library.custom_op(
+    "int8_ops::quantize_i8",
+    mutates_args=(),
+    device_types="cuda",
+)
+def quantize_i8(
+    x: Tensor,
+) -> tuple[Tensor, Tensor]:
+
+    return gemm_cutlass.func_quantize_i8(x)
+
+
+@quantize_i8.register_fake
+def _(
+    x: Tensor,
+) -> tuple[Tensor, Tensor]:
+    y = torch.empty(
+        x.shape,
+        device=x.device,
+        dtype=torch.int8,
+    )
+    scale_y = torch.empty(
+        x.shape[:-1],
+        device=x.device,
+        dtype=torch.float32,
+    )
     return y, scale_y

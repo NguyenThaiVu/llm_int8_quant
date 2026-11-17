@@ -198,3 +198,18 @@ def compute_smooth_alpha(input_observer, weight, lambd=0.5):
     return alpha  
 
 
+def quantize_i8_torch(x, smooth_alpha=None):
+    x = x.float()
+
+    if smooth_alpha is not None:
+        x = x / smooth_alpha
+
+    scale = x.abs().amax(dim=-1, keepdim=True)
+    scale = (scale / 127.0).clamp_min(1e-8)
+
+    x_q = torch.round(x / scale)
+    x_q = x_q.clamp(-127, 127).to(torch.int8)
+
+    return x_q, scale.squeeze(-1)
+
+quantize_i8_compiled = torch.compile(quantize_i8_torch)
