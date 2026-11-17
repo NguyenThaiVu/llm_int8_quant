@@ -1,5 +1,5 @@
 import os 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import torch
 from utils_quant import *
 
@@ -51,7 +51,7 @@ if __name__ == "__main__":
     dtype = torch.bfloat16
     device = "cuda"
     
-    n_heads = 40
+    n_heads = 32
     head_dim = 128
     context_length = 2048
     
@@ -62,8 +62,7 @@ if __name__ == "__main__":
     x = torch.randn(n_heads, context_length, head_dim, dtype=dtype, device=device)
 
     # ============== 1. Torch RoPE ==============
-    func_apply_rope = apply_rope
-    func_apply_rope = torch.compile(func_apply_rope)  
+    func_apply_rope = torch.compile(apply_rope, fullgraph=True)  
     x_rotated = func_apply_rope(x, cos, sin)
     print("Input shape:", x.shape)
     print("Rotated shape:", x_rotated.shape)
@@ -87,3 +86,16 @@ if __name__ == "__main__":
     print(f"Max difference: {max_diff:.6f}")
     mse = torch.mean((y_deq - x_rotated) ** 2).item()
     print(f"MSE: {mse:.6f}")
+    
+    # ============= 3. INT8 RoPE with bf16 output ==============
+    y_i8_bf16, scale_y_bf16 = custom_ops.rope_int8(x_i8, scale_x, cos_i8, scale_cos, sin_i8, scale_sin, return_bf16=True)
+    y_i8_bf16 = y_i8_bf16.to(torch.bfloat16) * scale_y_bf16.unsqueeze(-1)
+    
+    rope_bf16_time = measure_time(custom_ops.rope_int8, x_i8, scale_x, cos_i8, scale_cos, sin_i8, scale_sin, True)
+    print(f"Time INT8 RoPE with bf16 output: {rope_bf16_time:.6f} ms")
+    
+    max_diff_bf16 = torch.max(torch.abs(y_i8_bf16 - x_rotated))
+    print(f"Max difference (bf16 output): {max_diff_bf16:.6f}")
+    mse_bf16 = torch.mean((y_i8_bf16 - x_rotated) ** 2).item()
+    print(f"MSE (bf16 output): {mse_bf16:.6f}")
+    

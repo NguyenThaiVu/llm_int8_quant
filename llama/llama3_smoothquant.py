@@ -27,8 +27,15 @@ from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text,
 from utils_power import measure_power
 
 
-LLAMA_SIZE_STR = "1B" # "1B" or "3B"
+LLAMA_SIZE_STR = "3B" # "1B" or "3B"
 IS_INSTRUCT = True # True or False
+MAX_GENERATED_TOKENS = PPL_CONTEXT_TOKENS = 4096
+PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
+EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
+
+USE_COMPILE = True # True or False. If True, use torch.compile to optimize the model for inference.
+print(f"[INFO] Using model: LLaMA 3.2 {LLAMA_SIZE_STR} Instruct. With Context size: {PPL_CONTEXT_TOKENS}. Compile: {USE_COMPILE}.")
+
 
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
 
@@ -151,13 +158,19 @@ class SmoothQuant_RMSNorm(nn.Module):
         else:
             if self.is_smooth_scale == False:
                 dummy_scale = torch.ones(self.emb_dim, dtype=torch.float32, device=x.device)
-                y_int8, scale_y = gemm_cutlass.func_rmsnorm_bf16_to_int8(x, self.weight,\
-                                                dummy_scale, self.eps)
+                # y_int8, scale_y = gemm_cutlass.func_rmsnorm_bf16_to_int8(x, self.weight,\
+                #                                 dummy_scale, self.eps)
+                y = F.rms_norm(x, normalized_shape=self.normalized_shape,\
+                                weight=self.weight, eps=self.eps)
+                y_i8, scale_y = gemm_cutlass.func_quantize_i8(y)
             else:
-                y_int8, scale_y = gemm_cutlass.func_rmsnorm_bf16_to_int8(x, self.weight,\
-                                                self.smooth_scale, self.eps)
-            return y_int8, scale_y
-    
+                # y_int8, scale_y = gemm_cutlass.func_rmsnorm_bf16_to_int8(x, self.weight,\
+                                                # self.smooth_scale, self.eps)
+                y = F.rms_norm(x, normalized_shape=self.normalized_shape,\
+                                weight=self.weight, eps=self.eps)
+                y_smooth = y / self.smooth_scale
+                y_i8, scale_y = gemm_cutlass.func_quantize_i8(y_smooth)
+            return y_i8, scale_y
     
     def finish_calibration(self):
         self.is_quantized = True
@@ -188,9 +201,14 @@ class SmoothQuant_Silu_Mul(nn.Module):
         else:
             if self.is_smooth_scale == False:
                 dummy_smooth_scale = torch.ones(self.embed_dim, dtype=torch.float32, device=x1.device)
-                y_i8, scale_y = gemm_cutlass.func_silu_mul_quant(x1, x2, dummy_smooth_scale)
+                # y_i8, scale_y = gemm_cutlass.func_silu_mul_quant(x1, x2, dummy_smooth_scale)
+                y = F.silu(x1) * x2
+                y_i8, scale_y = gemm_cutlass.func_quantize_i8(y)
             else:
-                y_i8, scale_y = gemm_cutlass.func_silu_mul_quant(x1, x2, self.smooth_scale)
+                # y_i8, scale_y = gemm_cutlass.func_silu_mul_quant(x1, x2, self.smooth_scale)
+                y = F.silu(x1) * x2
+                y_smooth = y / self.smooth_scale
+                y_i8, scale_y = gemm_cutlass.func_quantize_i8(y_smooth)
             return y_i8, scale_y
     
     def finish_calibration(self):
@@ -336,22 +354,26 @@ class SmoothQuant_GroupedQueryAttention(nn.Module):
             keys = keys.repeat_interleave(self.group_size, dim=0)  
             values = values.repeat_interleave(self.group_size, dim=0)
 
-            # Compute attention scores
-            attn_scores = queries @ keys.transpose(1, 2)
-            attn_scores = attn_scores.masked_fill(mask, -torch.inf)
+            # # 5. Attention
+            # attn_scores = queries @ keys.transpose(1, 2)
+            # attn_scores = attn_scores.masked_fill(mask, -torch.inf)
+            # attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
 
-            attn_weights = torch.softmax(attn_scores / keys.shape[-1]**0.5, dim=-1)
-            assert keys.shape[-1] == self.head_dim
-
-            # Shape: (num_tokens, num_heads, head_dim)
-            context_vec = (attn_weights @ values).transpose(0, 1).contiguous()
-
-            # Combine heads, where self.d_out = self.num_heads * self.head_dim
-            context_vec = context_vec.reshape(num_tokens, self.d_out)
+            # # 6. Context computation
+            # context = attn_weights @ values  # Shape: (num_heads, num_tokens, head_dim)
+            # context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
+            
+            context = F.scaled_dot_product_attention(
+                        queries.unsqueeze(0),
+                        keys.unsqueeze(0),
+                        values.unsqueeze(0),
+                            is_causal=True,
+                            enable_gqa=True).squeeze(0)
             
             # Smooth quantization for output activation of attention
-            context_i8, scale_context = gemm_cutlass.func_quantize_row_int8_with_smooth_cuda(\
-                                                context_vec, self.out_proj.smooth_alpha)
+            context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
+            context_smooth = context / self.out_proj.smooth_alpha
+            context_i8, scale_context = gemm_cutlass.func_quantize_i8(context_smooth)
 
             context_vec = self.out_proj(context_i8, scale_context)  
             return context_vec
@@ -515,12 +537,7 @@ print(f"[INFO] Weights loaded successfully.\n")
 # ===============================================
 # 4. Generate Text
 # ===============================================
-MAX_GENERATED_TOKENS = 2048
-PPL_CONTEXT_TOKENS = 2048
-PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
-
-list_prompts = ["What is Dragon Ball story?"]
+list_prompts = ["What is the capital of France?"]
 
 for prompt in list_prompts:
     token_ids = generate(
@@ -539,7 +556,7 @@ for prompt in list_prompts:
 # # =================================================
 print("\nCollecting calibration for quantization...")
 calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                split="train", n=10_000)
+                                                split="train", n=2_000)
 calibrate_tokens = tokenizer.encode(calibrate_samples)
 print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
         
@@ -553,27 +570,30 @@ for i in tqdm(range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRID
         _ = model(input_ids)
         
 model.finish_calibration()
-print(f"[INFO] Finished SmoothQuant calibration.")
 model.eval()
+if USE_COMPILE == True:
+    model = torch.compile(model)
+    print(f"\n[INFO] Model compiled successfully. Start evaluation... \n")
+else:
+    print(f"\n[INFO] Start evaluation without compilation... \n")
     
 # # ================================================
 # # Evaluation
 # # ===============================================
+# samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
 
-samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+# ppl = compute_ppl_single_text(model,
+#                             tokenizer, 
+#                             samples,
+#                             context_size=PPL_CONTEXT_TOKENS,
+#                             stride=PPL_STRIDE)
 
-ppl = compute_ppl_single_text(model,
-                            tokenizer, 
-                            samples,
-                            context_size=PPL_CONTEXT_TOKENS,
-                            stride=PPL_STRIDE)
-
-print()
-print(f"\nPPL (SmoothQuant technique): {ppl} \n")
-print(f"Evaluation Information:")
-print(f"Model: LLaMA 3.2 {LLAMA_SIZE_STR} {'Instruct' if IS_INSTRUCT else 'Base'}")
-print(f"Context size for evaluation: {PPL_CONTEXT_TOKENS}")
-print(f"Dataset: {EVALUATION_DATASET}")
+# print()
+# print(f"\nPPL (SmoothQuant technique): {ppl} \n")
+# print(f"Evaluation Information:")
+# print(f"Model: LLaMA 3.2 {LLAMA_SIZE_STR} {'Instruct' if IS_INSTRUCT else 'Base'}")
+# print(f"Context size for evaluation: {PPL_CONTEXT_TOKENS}")
+# print(f"Dataset: {EVALUATION_DATASET}")
 
 # ===============================================
 # Measure Latency
@@ -590,20 +610,6 @@ for _ in range(5):
         _ = model(input_ids)
 torch.cuda.synchronize()    
 
-# Measure latency 
-n_iter = 10
-start_event = torch.cuda.Event(enable_timing=True)
-end_event = torch.cuda.Event(enable_timing=True)
-start_event.record()
-with torch.no_grad():
-    for _ in range(n_iter):
-        out_ids = model(input_ids)
-end_event.record()
-torch.cuda.synchronize()
-elapsed_time_ms = start_event.elapsed_time(end_event)
-avg_latency_ms = elapsed_time_ms / n_iter
-print(f"[INFO] Average model latency over {n_iter} iterations: {avg_latency_ms:.4f} ms.")
-
 # Profiler to measure latency and memory usage
 with torch.profiler.profile(
     activities=[
@@ -619,7 +625,7 @@ with torch.profiler.profile(
 print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
 
 # Measure power consumption
-measure_power(model, input_ids, n_iterations=10)
+measure_power(model, input_ids, n_iterations=100)
 
 
 # # ===============================================

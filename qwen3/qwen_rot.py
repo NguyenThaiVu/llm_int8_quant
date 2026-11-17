@@ -507,7 +507,7 @@ if __name__ == "__main__":
 
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
     
-    measure_power(model, input_ids, n_iterations=10)
+    measure_power(model, input_ids, n_iterations=200)
         
         
     # # # ================================================================

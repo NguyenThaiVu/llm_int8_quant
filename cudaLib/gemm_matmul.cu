@@ -1023,7 +1023,7 @@ torch::Tensor matmul_w8a8o8_2D_host(
         constexpr int kStages = 3;
         return matmul_w8a8o8_kernel<TileShape, WarpShape, kStages>(A, B, alphaRow, alphaCol);
     } else {
-        using TileShape = cutlass::gemm::GemmShape<256, 128, 64>;
+        using TileShape = cutlass::gemm::GemmShape<128, 128, 64>;
         using WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
         constexpr int kStages = 3;
         return matmul_w8a8o8_kernel<TileShape, WarpShape, kStages>(A, B, alphaRow, alphaCol);

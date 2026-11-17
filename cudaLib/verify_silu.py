@@ -1,5 +1,5 @@
 import os 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import torch 
 from torch import nn
 from utils_quant import *
@@ -14,11 +14,43 @@ class SiLU(nn.Module):
         if smooth_scale is not None:
             y = y / smooth_scale
         return y
+    
+    
+def quantize_i8_torch(x, smooth_alpha=None):
+    x = x.float()
+
+    if smooth_alpha is not None:
+        x = x / smooth_alpha
+
+    scale = x.abs().amax(dim=-1, keepdim=True)
+    scale = (scale / 127.0).clamp_min(1e-8)
+
+    x_q = torch.round(x / scale)
+    x_q = x_q.clamp(-127, 127).to(torch.int8)
+
+    return x_q, scale.squeeze(-1)
+
+quantize_i8_compiled = torch.compile(quantize_i8_torch)
+    
+    
+class I8_SiLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x1_i8, scale_x1, x2_i8, scale_x2, smooth_scale=None):
+        x1 = x1_i8.to(torch.float32) * scale_x1.unsqueeze(-1)
+        x2 = x2_i8.to(torch.float32) * scale_x2.unsqueeze(-1)
+        y = torch.nn.functional.silu(x1) * x2
+        if smooth_scale is not None:
+            y = y / smooth_scale
+        y_i8, scale_y = quantize_i8_compiled(y)
+        return y_i8, scale_y
+
 
 if __name__ == "__main__":
     
     d_type = torch.bfloat16
-    d = 1024 * 8
+    d =  4096
     
     X1 = torch.randn((d, d), dtype=d_type, device="cuda")
     X2 = torch.randn((d, d), dtype=d_type, device="cuda")
@@ -52,5 +84,13 @@ if __name__ == "__main__":
     
     print(f"Y: {Y[:5, :5]}")
     print(f"Y_deq: {y_deq[:5, :5]}")
+    
+    # 3. Torch int8 SiLU
+    i8_silu_func = I8_SiLU().to(device="cuda", dtype=d_type)
+    i8_silu_func = torch.compile(i8_silu_func, fullgraph=True)
+    
+    Y_i8, scale_Y_i8 = i8_silu_func(x1_i8, scale_x1, x2_i8, scale_x2, smooth_scale)
+    torch_compile_i8_silu_time = measure_time(i8_silu_func, x1_i8, scale_x1, x2_i8, scale_x2, smooth_scale)
+    print(f"Torch compile int8 SiLU time: {torch_compile_i8_silu_time:.6f} ms")
     
     

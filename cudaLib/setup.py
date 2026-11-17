@@ -4,12 +4,14 @@ import pathlib
 # Check CUDA HOME can be /usr/local/cuda-12.4 or /usr/local/cuda-12.3
 
 # if not os.environ.get("CUDA_HOME"):
-if pathlib.Path("/usr/local/cuda-12.4").exists():
+if pathlib.Path("/home/tnguyen10/cuda-12.8").exists():
+    os.environ["CUDA_HOME"] = "/home/tnguyen10/cuda-12.8"
+elif pathlib.Path("/sciclone/home/tnguyen10/cuda-12.8").exists():
+    os.environ["CUDA_HOME"] = "/sciclone/home/tnguyen10/cuda-12.8"
+elif pathlib.Path("/usr/local/cuda-12.4").exists():
     os.environ["CUDA_HOME"] = "/usr/local/cuda-12.4"
 elif pathlib.Path("/usr/local/cuda-12.3").exists():
     os.environ["CUDA_HOME"] = "/usr/local/cuda-12.3"
-elif pathlib.Path("/home/tnguyen10/cuda-12.8").exists():
-    os.environ["CUDA_HOME"] = "/home/tnguyen10/cuda-12.8"
 elif pathlib.Path("/home/tnguyen10/cuda-12.1").exists():
     os.environ["CUDA_HOME"] = "/home/tnguyen10/cuda-12.1"
 else:
@@ -54,7 +56,7 @@ setup(
                     "-gencode=arch=compute_86,code=sm_86",
                     "-gencode=arch=compute_89,code=sm_89",
                     "-gencode=arch=compute_90,code=sm_90",
-                    "-gencode=arch=compute_120,code=sm_120",
+                    # "-gencode=arch=compute_120,code=sm_120",
                 ],
             },
         )

@@ -202,10 +202,14 @@ std::tuple<torch::Tensor, torch::Tensor> func_apply_rope_int8(
     torch::Tensor cos,       // int8, shape [seq_len, head_dim]
     float scale_cos,
     torch::Tensor sin,       // int8, shape [seq_len, head_dim]
-    float scale_sin) 
+    float scale_sin, 
+    bool return_bf16) 
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    return rope_int8_host(x, scale_x, cos, scale_cos, sin, scale_sin);
+    if (return_bf16 == true) {
+        return rope_int8_host(x, scale_x, cos, scale_cos, sin, scale_sin, true);
+    }
+    return rope_int8_host(x, scale_x, cos, scale_cos, sin, scale_sin, false);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> func_silu_mul_quant(

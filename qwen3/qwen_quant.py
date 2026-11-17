@@ -22,14 +22,16 @@ USE_INSTRUCT_MODEL = False
 if (USE_BASE_MODEL + USE_REASONING_MODEL + USE_INSTRUCT_MODEL) != 1:
     raise AttributeError("Only one of the options above can be True.")
 
-CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
 
 MAX_NEW_TOKENS = PPL_CONTEXT_TOKENS = 2048  # Options: 2048, 4096, 8192
 EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 USE_COMPILE = True  # Use torch.compile to speed up inference
+USE_FLASH_ATTENTION = True  # Use flash attention for faster inference
 
-print(f"[INFO] Using model: Qwen3-{CHOOSE_MODEL}. With Context size: {PPL_CONTEXT_TOKENS}. Compile: {USE_COMPILE}.")
+print(f"[INFO] Using model: Qwen3-{CHOOSE_MODEL}. With Context size: {PPL_CONTEXT_TOKENS}.\
+    Compile: {USE_COMPILE}. Flash attention: {USE_FLASH_ATTENTION}.\n")
 
 class Qwen3Model_Quant(nn.Module):
     def __init__(self, cfg):
@@ -38,7 +40,7 @@ class Qwen3Model_Quant(nn.Module):
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
 
         self.trf_blocks = nn.ModuleList(
-            [TransformerBlock_Quant(cfg) for i in range(cfg["n_layers"])]
+            [TransformerBlock_Quant(cfg, use_flash_attention=USE_FLASH_ATTENTION) for i in range(cfg["n_layers"])]
         )
         
         self.final_norm = RMSNorm(cfg["emb_dim"])
@@ -265,8 +267,7 @@ if __name__ == "__main__":
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
     
     # Measure power consumption
-    n_iter = 100
-    measure_power(model, input_ids, n_iterations=n_iter)
+    measure_power(model, input_ids, n_iterations=200)
 
     # # # ================================================================
     # # # 5. PPL evaluation

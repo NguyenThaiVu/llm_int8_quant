@@ -21,7 +21,16 @@ from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text,
 
 from utils_power import *
 
-LLAMA_SIZE_STR = "1B" # "1B" or "3B"
+LLAMA_SIZE_STR = "3B" # "1B" or "3B"
+MAX_GENERATED_TOKENS = PPL_CONTEXT_TOKENS = 2048
+PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
+EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
+USE_COMPILE = True  # use torch.compile() to speed up inference
+USE_FLASH_ATTENTION = True  # use flash attention for faster inference
+
+print(f"[INFO] Using model: LLaMA 3.2 {LLAMA_SIZE_STR} Instruct. With Context size: {PPL_CONTEXT_TOKENS}. Compile: {USE_COMPILE}.")
+
+
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
 
 MODEL_FOLDER = f"Llama-3.2-{LLAMA_SIZE_STR}-Instruct"
@@ -304,8 +313,9 @@ class Custom_GroupedQueryAttention_Hybrid(nn.Module):
             context = context.squeeze(0)
             context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
 
-            # Output projection
-            out, _ = self.out_proj(context, 1.0)
+            # Apply inverse SmoothQuant transformation
+            context_i8, context_scale = custom_ops.quantize_i8_smooth(context, self.out_proj.smooth_alpha)
+            out, _ = self.out_proj(context_i8, context_scale)
         
         return out
     
@@ -321,6 +331,8 @@ class Custom_GroupedQueryAttention_Hybrid(nn.Module):
         self.softmax_layer.finish_calibration()
         self.qk_score_layer.finish_calibration()
         self.context_layer.finish_calibration()
+        self.out_proj.finish_calibration()
+        
         self.is_quantized = True
 
     
@@ -345,8 +357,8 @@ class TransformerBlock(nn.Module):
         cos, sin = compute_rope_params(
             head_dim=cfg["emb_dim"] // cfg["n_heads"],
             theta_base=cfg["rope_base"],
-            # context_length=cfg["context_length"],
-            context_length=MAX_SEQ_LEN,
+            context_length=cfg["context_length"],
+            # context_length=MAX_SEQ_LEN,
             # freq_config=cfg["rope_freq"]
         )
         self.register_buffer("cos", cos.to(cfg["dtype"]))
@@ -497,50 +509,31 @@ if __name__ == "__main__":
     del combined_weights  # free up memory
 
     # ===============================================
-    # 4. Generate Text 
-    # ===============================================
-    MAX_GENERATED_TOKENS = 2048
-    PPL_CONTEXT_TOKENS = 2048
-    PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-    EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
-
-    list_prompts = ["What is the capital of VietNam?"]
-
-    # for prompt in list_prompts:
-    #     token_ids = generate(
-    #         model=model,
-    #         idx=text_to_token_ids(prompt, tokenizer).to(device),
-    #         max_new_tokens=MAX_GENERATED_TOKENS,
-    #         context_size=LLAMA32_CONFIG["context_length"],
-    #         top_k=1)
-
-    #     output_text = token_ids_to_text(token_ids, tokenizer)
-    #     print("\nResponse:\n", clean_text(output_text))
-        
-    # ===============================================
     # 5. Calibration for quantization
     # ===============================================
 
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
-                                                    split="train", n=5_000)
+                                                    split="train", n=1_000)
     calibrate_tokens = tokenizer.encode(calibrate_samples)
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
             
     for i in tqdm(range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE)):
         chunk_tokens = calibrate_tokens[i:i + PPL_CONTEXT_TOKENS]
-
         input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
-
         with torch.no_grad():
             _ = model(input_ids)
             
     model.finish_calibration()
     print(f"[INFO] Finished calibration.")
+    
     model.to(device)
     model.eval()
-    model = torch.compile(model)
-    print(f"\n[INFO] Model compiled successfully. Start evaluation... \n")
+    if USE_COMPILE == True:
+        model = torch.compile(model)
+        print(f"\n[INFO] Model compiled successfully. Start evaluation... \n")
+    else:
+        print(f"\n[INFO] Start evaluation without compilation... \n")
     
     # ===============================================
     # Measure Latency
@@ -551,26 +544,11 @@ if __name__ == "__main__":
     input_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
     print(f"[INFO] Input tokens: {input_ids.shape}")
     
-    
     # Warm-up 
     for _ in range(5):
         with torch.no_grad():
             _ = model(input_ids)
     torch.cuda.synchronize()    
-    
-    # Measure latency 
-    n_iter = 10
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    with torch.no_grad():
-        for _ in range(n_iter):
-            out_ids = model(input_ids)
-    end_event.record()
-    torch.cuda.synchronize()
-    elapsed_time_ms = start_event.elapsed_time(end_event)
-    avg_latency_ms = elapsed_time_ms / n_iter
-    print(f"[INFO] Average model latency over {n_iter} iterations: {avg_latency_ms:.4f} ms.")
     
     # Profiler to measure latency and memory usage
     with torch.profiler.profile(
@@ -587,7 +565,7 @@ if __name__ == "__main__":
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
     
     # Measure power consumption
-    measure_power(model, input_ids, n_iterations=10)
+    measure_power(model, input_ids, n_iterations=100)
     
     # ========================================================================
     # Quantization text generation
@@ -607,22 +585,22 @@ if __name__ == "__main__":
         output_text = token_ids_to_text(token_ids, tokenizer)
         print("\nResponse:\n", clean_text(output_text)) 
     
-    # # ===============================================
-    # # PPL evaluation after quantization
-    # # ===============================================
-    # samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+    # ===============================================
+    # PPL evaluation after quantization
+    # ===============================================
+    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
 
-    # ppl = compute_ppl_single_text(model,
-    #                             tokenizer, 
-    #                             samples,
-    #                             context_size=PPL_CONTEXT_TOKENS,
-    #                             stride=PPL_STRIDE)
-    # print("PPL (after quantization):", ppl)   
+    ppl = compute_ppl_single_text(model,
+                                tokenizer, 
+                                samples,
+                                context_size=PPL_CONTEXT_TOKENS,
+                                stride=PPL_STRIDE)
+    print("PPL (after quantization):", ppl)   
     
-    # print("\nModel information:")
-    # print(f" - Model: LLaMA-3.2-{LLAMA_SIZE_STR}-Instruct")
-    # print(f"Context size: {PPL_CONTEXT_TOKENS}")
-    # print(f"Dataset evaluation: {EVALUATION_DATASET}")
+    print("\nModel information:")
+    print(f" - Model: LLaMA-3.2-{LLAMA_SIZE_STR}-Instruct")
+    print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    print(f"Dataset evaluation: {EVALUATION_DATASET}")
     
     # # ===============================================
     # # 5. ARC-Easy evaluation

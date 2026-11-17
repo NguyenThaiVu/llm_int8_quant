@@ -678,79 +678,183 @@ __global__ void softmax_lastdim_int8_masking_kernel(
     }
 }
 
-std::tuple<torch::Tensor, torch::Tensor> softmax_lastdim_int8_masking_cuda(
-    torch::Tensor x_q,          // int8, shape [..., C]
-    torch::Tensor scale_x,      // float shape [...]
-    torch::Tensor mask          // uint8, shape [..., C] or [C, C] (broadcast)
+
+__global__ void softmax_lastdim_int8_masking_kernel_opt(
+    const int8_t* __restrict__ x_q,
+    int8_t* __restrict__ y_q,
+    const float* __restrict__ scale_x,
+    float* __restrict__ scale_y,
+    const uint8_t* __restrict__ mask,
+    int64_t num_vecs,
+    int64_t dim2,
+    int64_t mask_rows
 ) {
-    TORCH_CHECK(x_q.is_cuda(), "x_q must be CUDA");
-    TORCH_CHECK(x_q.scalar_type() == at::kChar, "x_q must be int8");
-    TORCH_CHECK(x_q.dim() >= 1, "x_q must be at least 1D");
+    const int64_t vec = blockIdx.x;
+    if (vec >= num_vecs) return;
 
-    TORCH_CHECK(scale_x.is_cuda(), "scale_x must be CUDA");
-    TORCH_CHECK(scale_x.scalar_type() == at::kFloat, "scale_x must be float32");
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const float sx = scale_x[vec];
 
-    TORCH_CHECK(mask.is_cuda(), "mask must be CUDA");
-    TORCH_CHECK(mask.scalar_type() == at::kByte, "mask must be uint8");
+    const int8_t* xq = x_q + vec * dim2;
+    int8_t* yq = y_q + vec * dim2;
 
-    auto xq = x_q.contiguous();
+    // Broadcast a contiguous mask over leading dimensions.
+    const uint8_t* mask_vec =
+        mask + (vec % mask_rows) * dim2;
 
-    int64_t dim2 = xq.size(-1);
-    TORCH_CHECK(dim2 > 0, "last dimension must be > 0");
+    // --------------------------------------------------
+    // Pass 1: Maximum over unmasked positions
+    // --------------------------------------------------
+    float local_max = -FLT_MAX;
 
-    int64_t num_vecs = xq.numel() / dim2;
-
-    // Expected scale shape = leading dims of x_q
-    std::vector<int64_t> expected_scale_shape;
-    expected_scale_shape.reserve(xq.dim() - 1);
-    for (int i = 0; i < xq.dim() - 1; ++i) {
-        expected_scale_shape.push_back(xq.size(i));
+    for (int64_t j = tid; j < dim2; j += stride) {
+        if (mask_vec[j]) {
+            float v = float(xq[j]) * sx;
+            local_max = fmaxf(local_max, v);
+        }
     }
 
-    TORCH_CHECK(
-        scale_x.dim() == xq.dim() - 1,
-        "scale_x must have shape equal to x_q.shape[:-1]"
-    );
+    // block_reduce_max returns the maximum to all threads
+    const float row_max = block_reduce_max(local_max);
 
+    // --------------------------------------------------
+    // Pass 2: Exponential + INT8 output + sum
+    // --------------------------------------------------
+    float local_sum = 0.0f;
+
+    for (int64_t j = tid; j < dim2; j += stride) {
+        if (!mask_vec[j]) {
+            yq[j] = 0;
+            continue;
+        }
+
+        float v = float(xq[j]) * sx;
+        float e = __expf(v - row_max);
+
+        // Quantization without Softmax denominator
+        int q = __float2int_rn(e * 127.0f);
+        q = max(0, min(127, q));
+
+        yq[j] = static_cast<int8_t>(q);
+
+        // Accumulate for output scale
+        local_sum += e;
+    }
+
+    // --------------------------------------------------
+    // Final sum reduction
+    // --------------------------------------------------
+    // Your block_reduce_sum returns the final sum
+    // to thread 0.
+    float S = block_reduce_sum(local_sum);
+
+    if (tid == 0) {
+        // Fully masked row: S = 0, output is all zeros.
+        scale_y[vec] = (S > 0.0f)
+            ? 1.0f / (127.0f * S)
+            : 1.0f;
+    }
+}
+
+
+std::tuple<torch::Tensor, torch::Tensor>
+softmax_lastdim_int8_masking_cuda(
+    torch::Tensor x_q,
+    torch::Tensor scale_x,
+    torch::Tensor mask
+) {
+    TORCH_CHECK(x_q.is_cuda() && x_q.scalar_type() == at::kChar,
+                "x_q must be CUDA int8");
+    TORCH_CHECK(scale_x.is_cuda() &&
+                scale_x.scalar_type() == at::kFloat,
+                "scale_x must be CUDA float32");
+    TORCH_CHECK(mask.is_cuda() &&
+                mask.scalar_type() == at::kByte,
+                "mask must be CUDA uint8");
+    TORCH_CHECK(x_q.dim() >= 1, "x_q must be at least 1D");
+    TORCH_CHECK(x_q.device() == scale_x.device() &&
+                x_q.device() == mask.device(),
+                "All tensors must be on the same GPU");
+
+    const c10::cuda::CUDAGuard device_guard(x_q.device());
+
+    auto xq = x_q.contiguous();
+    auto sx = scale_x.contiguous();
+    auto masking = mask.contiguous();
+
+    const int64_t dim2 = xq.size(-1);
+    TORCH_CHECK(dim2 > 0, "Last dimension must be positive");
+
+    const int64_t num_vecs = xq.numel() / dim2;
+
+    // Validate per-row input scales
+    std::vector<int64_t> scale_shape;
     for (int i = 0; i < xq.dim() - 1; ++i) {
+        scale_shape.push_back(xq.size(i));
+    }
+
+    TORCH_CHECK(sx.sizes() == c10::IntArrayRef(scale_shape),
+                "scale_x must have shape x_q.shape[:-1]");
+
+    sx = sx.view({num_vecs});
+
+    // Validate contiguous trailing-dimension broadcasting.
+    // Examples:
+    // x=[B,H,Q,K], mask=[Q,K] or [H,Q,K]
+    // x=[B,H,Q,K], mask=[1,1,Q,K]
+    // x=[B,H,Q,K], mask=[B,H,Q,K]
+    TORCH_CHECK(masking.dim() >= 1 &&
+                masking.dim() <= xq.dim(),
+                "Unsupported mask rank");
+    TORCH_CHECK(masking.size(-1) == dim2,
+                "Mask last dimension must match input");
+
+    int64_t first = 0;
+    while (first < masking.dim() - 1 &&
+           masking.size(first) == 1) {
+        ++first;
+    }
+
+    const int64_t tail_rank = masking.dim() - first;
+
+    for (int64_t i = 0; i < tail_rank; ++i) {
         TORCH_CHECK(
-            scale_x.size(i) == xq.size(i),
-            "scale_x shape must equal x_q.shape[:-1]"
+            masking.size(first + i) ==
+            xq.size(xq.dim() - tail_rank + i),
+            "Mask must match trailing input dimensions, "
+            "with broadcasting only across leading dimensions"
         );
     }
 
-    TORCH_CHECK(
-        scale_x.numel() == num_vecs,
-        "scale_x numel must equal product of leading dims of x_q"
-    );
-
-    auto sx = scale_x.contiguous().view({num_vecs});
-
-    bool broadcast_first_dim = false;
-    torch::Tensor masking;
-
-    if (mask.sizes() == xq.sizes()) {
-        masking = mask.contiguous();
-    } else if (check_broadcastable(xq, mask)) {
-        broadcast_first_dim = true;
-        masking = mask.contiguous();
-    } else {
-        TORCH_CHECK(false, "mask shape must be either same as x_q or broadcastable to x_q");
-    }
+    const int64_t mask_rows = masking.numel() / dim2;
 
     auto y_q = torch::empty_like(xq);
-    auto sy = torch::empty({num_vecs}, sx.options().dtype(torch::kFloat));
+    auto sy = torch::empty(
+        {num_vecs}, sx.options().dtype(torch::kFloat)
+    );
 
-    int threads = (int)std::min<int64_t>(dim2, 512);
-    threads = std::max(threads, 32);
+    if (num_vecs == 0) {
+        return {y_q, sy.view(scale_shape)};
+    }
+
+    TORCH_CHECK(mask_rows > 0, "Mask must not be empty");
+    TORCH_CHECK(num_vecs <= INT_MAX,
+                "Too many rows for the CUDA grid");
+
+    // Always launch full warps
+    int threads = 32;
+    while (threads < dim2 && threads < 256) {
+        threads *= 2;
+    }
 
     dim3 block(threads);
-    dim3 grid((unsigned)num_vecs);
+    dim3 grid(static_cast<unsigned>(num_vecs));
 
-    size_t shared_mem_size = (size_t)dim2 * sizeof(int8_t);
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    softmax_lastdim_int8_masking_kernel<<<grid, block, shared_mem_size, stream>>>(
+    softmax_lastdim_int8_masking_kernel_opt
+        <<<grid, block, 0, stream>>>(
             xq.data_ptr<int8_t>(),
             y_q.data_ptr<int8_t>(),
             sx.data_ptr<float>(),
@@ -758,9 +862,97 @@ std::tuple<torch::Tensor, torch::Tensor> softmax_lastdim_int8_masking_cuda(
             masking.data_ptr<uint8_t>(),
             num_vecs,
             dim2,
-            broadcast_first_dim
-    );
+            mask_rows
+        );
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return std::make_tuple(y_q, sy.view(expected_scale_shape));
+
+    return {y_q, sy.view(scale_shape)};
 }
+
+
+
+
+// std::tuple<torch::Tensor, torch::Tensor> softmax_lastdim_int8_masking_cuda(
+//     torch::Tensor x_q,          // int8, shape [..., C]
+//     torch::Tensor scale_x,      // float shape [...]
+//     torch::Tensor mask          // uint8, shape [..., C] or [C, C] (broadcast)
+// ) {
+//     TORCH_CHECK(x_q.is_cuda(), "x_q must be CUDA");
+//     TORCH_CHECK(x_q.scalar_type() == at::kChar, "x_q must be int8");
+//     TORCH_CHECK(x_q.dim() >= 1, "x_q must be at least 1D");
+
+//     TORCH_CHECK(scale_x.is_cuda(), "scale_x must be CUDA");
+//     TORCH_CHECK(scale_x.scalar_type() == at::kFloat, "scale_x must be float32");
+
+//     TORCH_CHECK(mask.is_cuda(), "mask must be CUDA");
+//     TORCH_CHECK(mask.scalar_type() == at::kByte, "mask must be uint8");
+
+//     auto xq = x_q.contiguous();
+
+//     int64_t dim2 = xq.size(-1);
+//     TORCH_CHECK(dim2 > 0, "last dimension must be > 0");
+
+//     int64_t num_vecs = xq.numel() / dim2;
+
+//     // Expected scale shape = leading dims of x_q
+//     std::vector<int64_t> expected_scale_shape;
+//     expected_scale_shape.reserve(xq.dim() - 1);
+//     for (int i = 0; i < xq.dim() - 1; ++i) {
+//         expected_scale_shape.push_back(xq.size(i));
+//     }
+
+//     TORCH_CHECK(
+//         scale_x.dim() == xq.dim() - 1,
+//         "scale_x must have shape equal to x_q.shape[:-1]"
+//     );
+
+//     for (int i = 0; i < xq.dim() - 1; ++i) {
+//         TORCH_CHECK(
+//             scale_x.size(i) == xq.size(i),
+//             "scale_x shape must equal x_q.shape[:-1]"
+//         );
+//     }
+
+//     TORCH_CHECK(
+//         scale_x.numel() == num_vecs,
+//         "scale_x numel must equal product of leading dims of x_q"
+//     );
+
+//     auto sx = scale_x.contiguous().view({num_vecs});
+
+//     bool broadcast_first_dim = false;
+//     torch::Tensor masking;
+
+//     if (mask.sizes() == xq.sizes()) {
+//         masking = mask.contiguous();
+//     } else if (check_broadcastable(xq, mask)) {
+//         broadcast_first_dim = true;
+//         masking = mask.contiguous();
+//     } else {
+//         TORCH_CHECK(false, "mask shape must be either same as x_q or broadcastable to x_q");
+//     }
+
+//     auto y_q = torch::empty_like(xq);
+//     auto sy = torch::empty({num_vecs}, sx.options().dtype(torch::kFloat));
+
+//     dim3 block(BLOCK_SIZE);
+//     dim3 grid((unsigned)num_vecs);
+
+//     size_t shared_mem_size = (size_t)dim2 * sizeof(int8_t);
+//     auto stream = at::cuda::getCurrentCUDAStream();
+
+//     softmax_lastdim_int8_masking_kernel<<<grid, block, shared_mem_size, stream>>>(
+//             xq.data_ptr<int8_t>(),
+//             y_q.data_ptr<int8_t>(),
+//             sx.data_ptr<float>(),
+//             sy.data_ptr<float>(),
+//             masking.data_ptr<uint8_t>(),
+//             num_vecs,
+//             dim2,
+//             broadcast_first_dim
+//     );
+
+//     C10_CUDA_KERNEL_LAUNCH_CHECK();
+//     return std::make_tuple(y_q, sy.view(expected_scale_shape));
+// }

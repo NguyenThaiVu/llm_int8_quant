@@ -238,18 +238,126 @@ __global__ void rope_int8_warp_kernel(
 
 
 
+// BF16 output: a single pass, no max reduction or requantization.
+// Optimized for head_dim == 128: each warp computes one row.
+template<int WARPS_PER_BLOCK = 4>
+__global__ void rope_int8_to_bf16_warp_kernel(
+    const int8_t* __restrict__ x,
+    const float* __restrict__ scale_x,
+    const int8_t* __restrict__ cos,
+    float scale_cos,
+    const int8_t* __restrict__ sin,
+    float scale_sin,
+    int outer_size,
+    int num_heads,
+    int seq_len,
+    __nv_bfloat16* __restrict__ out,
+    float* __restrict__ scale_out,
+    int scale_mode
+) {
+    constexpr int HEAD_DIM = 128;
+    constexpr int HALF = HEAD_DIM / 2;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int64_t row = int64_t(blockIdx.x) * WARPS_PER_BLOCK + warp;
+    if (row >= int64_t(outer_size) * seq_len) return;
+
+    const int outer = int(row / seq_len);
+    const int pos = int(row % seq_len);
+    const int64_t row_base = row * HEAD_DIM;
+    const int64_t trig_base = int64_t(pos) * HEAD_DIM;
+
+    float sx;
+    if (scale_mode == 0) {
+        sx = scale_x[row];
+    } else if (scale_mode == 1) {
+        sx = scale_x[int64_t(outer / num_heads) * seq_len + pos];
+    } else {
+        sx = scale_x[pos];
+    }
+
+    if (lane == 0) scale_out[row] = 1.0f;
+
+    #pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        const int col = lane + 32 * k;
+        const float x1 = float(x[row_base + col]) * sx;
+        const float x2 = float(x[row_base + col + HALF]) * sx;
+        const float c = float(cos[trig_base + col]) * scale_cos;
+        const float s = float(sin[trig_base + col]) * scale_sin;
+        const float y1 = x1 * c - x2 * s;
+        const float y2 = x1 * s + x2 * c;
+        out[row_base + col] = __float2bfloat16_rn(y1);
+        out[row_base + col + HALF] = __float2bfloat16_rn(y2);
+    }
+}
+
+// Generic BF16 path for any even head_dim.
+__global__ void rope_int8_to_bf16_kernel(
+    const int8_t* __restrict__ x,
+    const float* __restrict__ scale_x,
+    const int8_t* __restrict__ cos,
+    float scale_cos,
+    const int8_t* __restrict__ sin,
+    float scale_sin,
+    int outer_size,
+    int num_heads,
+    int head_dim,
+    int seq_len,
+    __nv_bfloat16* __restrict__ out,
+    float* __restrict__ scale_out,
+    int scale_mode
+) {
+    const int64_t row = blockIdx.x;
+    if (row >= int64_t(outer_size) * seq_len) return;
+    const int outer = int(row / seq_len);
+    const int pos = int(row % seq_len);
+    const int half = head_dim / 2;
+    const int64_t row_base = row * head_dim;
+    const int64_t trig_base = int64_t(pos) * head_dim;
+
+    float sx;
+    if (scale_mode == 0) {
+        sx = scale_x[row];
+    } else if (scale_mode == 1) {
+        sx = scale_x[int64_t(outer / num_heads) * seq_len + pos];
+    } else {
+        sx = scale_x[pos];
+    }
+
+    if (threadIdx.x == 0) scale_out[row] = 1.0f;
+
+    for (int col = threadIdx.x; col < half; col += blockDim.x) {
+        const float x1 = float(x[row_base + col]) * sx;
+        const float x2 = float(x[row_base + col + half]) * sx;
+        const float c = float(cos[trig_base + col]) * scale_cos;
+        const float s = float(sin[trig_base + col]) * scale_sin;
+        const float y1 = x1 * c - x2 * s;
+        const float y2 = x1 * s + x2 * c;
+        out[row_base + col] = __float2bfloat16_rn(y1);
+        out[row_base + col + half] = __float2bfloat16_rn(y2);
+    }
+}
+
+
 std::tuple<torch::Tensor, torch::Tensor> rope_int8_host(
     torch::Tensor x,          // int8 [H, seq_len, D] or [B, H, seq_len, D]
     torch::Tensor scale_x,    // float32 [H, seq_len], [B, H, seq_len], or [seq_len]
     torch::Tensor cos,        // int8 [seq_len, D]
     float scale_cos,
     torch::Tensor sin,        // int8 [seq_len, D]
-    float scale_sin
+    float scale_sin,
+    bool return_bf16 = false  // Keep existing INT8 behavior by default
 ) {
     TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
     TORCH_CHECK(cos.is_cuda(), "cos must be a CUDA tensor");
     TORCH_CHECK(sin.is_cuda(), "sin must be a CUDA tensor");
     TORCH_CHECK(scale_x.is_cuda(), "scale_x must be a CUDA tensor");
+    TORCH_CHECK(x.device() == scale_x.device() &&
+                x.device() == cos.device() &&
+                x.device() == sin.device(),
+                "All inputs must be on the same CUDA device");
+    const c10::cuda::CUDAGuard device_guard(x.device());
 
     TORCH_CHECK(x.dtype() == torch::kChar, "x must be int8");
     TORCH_CHECK(cos.dtype() == torch::kChar, "cos must be int8");
@@ -340,7 +448,10 @@ std::tuple<torch::Tensor, torch::Tensor> rope_int8_host(
     auto cosq = cos.contiguous();
     auto sinq = sin.contiguous();
 
-    auto out = torch::empty_like(xq);
+    auto out = torch::empty(
+        xq.sizes(),
+        x.options().dtype(return_bf16 ? torch::kBFloat16 : torch::kChar)
+    );
 
     torch::Tensor scale_out;
 
@@ -358,7 +469,48 @@ std::tuple<torch::Tensor, torch::Tensor> rope_int8_host(
     
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    if (head_dim == 128) {
+    if (return_bf16) {
+        const int64_t total_rows = int64_t(outer_size) * seq_len;
+        if (head_dim == 128) {
+            constexpr int WARPS_PER_BLOCK = 4;
+            constexpr int THREADS = WARPS_PER_BLOCK * 32;
+            const int64_t blocks = (total_rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+            rope_int8_to_bf16_warp_kernel<WARPS_PER_BLOCK>
+                <<<static_cast<unsigned int>(blocks), THREADS, 0, stream>>>(
+                    xq.data_ptr<int8_t>(),
+                    sx.data_ptr<float>(),
+                    cosq.data_ptr<int8_t>(),
+                    scale_cos,
+                    sinq.data_ptr<int8_t>(),
+                    scale_sin,
+                    outer_size,
+                    num_heads,
+                    seq_len,
+                    reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+                    scale_out.data_ptr<float>(),
+                    scale_mode
+                );
+        } else {
+            constexpr int THREADS = 128;
+            rope_int8_to_bf16_kernel
+                <<<static_cast<unsigned int>(total_rows), THREADS, 0, stream>>>(
+                    xq.data_ptr<int8_t>(),
+                    sx.data_ptr<float>(),
+                    cosq.data_ptr<int8_t>(),
+                    scale_cos,
+                    sinq.data_ptr<int8_t>(),
+                    scale_sin,
+                    outer_size,
+                    num_heads,
+                    head_dim,
+                    seq_len,
+                    reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+                    scale_out.data_ptr<float>(),
+                    scale_mode
+                );
+        }
+    }
+    else if (head_dim == 128) {
         constexpr int WARPS_PER_BLOCK = 4;
         constexpr int THREADS = WARPS_PER_BLOCK * 32;
 

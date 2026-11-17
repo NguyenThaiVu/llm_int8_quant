@@ -90,56 +90,6 @@ def _(
 
 
 
-@torch.library.custom_op(
-    "int8_ops::rope_int8",
-    mutates_args=(),
-    device_types="cuda",
-)
-def rope_int8(
-    x: Tensor,
-    scale_x: Tensor,
-    cos: Tensor,
-    scale_cos: Tensor,
-    sin: Tensor,
-    scale_sin: Tensor,
-) -> tuple[Tensor, Tensor]:
-
-    return gemm_cutlass.func_apply_rope_int8(
-        x,
-        scale_x,
-        cos,
-        scale_cos,
-        sin,
-        scale_sin,
-    )
-
-
-@rope_int8.register_fake
-def _(
-    x: Tensor,
-    scale_x: Tensor,
-    cos: Tensor,
-    scale_cos: Tensor,
-    sin: Tensor,
-    scale_sin: Tensor,
-) -> tuple[Tensor, Tensor]:
-
-    y = torch.empty(
-        x.shape,
-        device=x.device,
-        dtype=torch.int8,
-    )
-
-    scale_y = torch.empty(
-        x.shape[:-1],
-        device=x.device,
-        dtype=torch.float32,
-    )
-
-    return y, scale_y
-
-
-
 # ============================================================
 # Fused W8A8O8 GEMM
 # ============================================================
@@ -189,11 +139,6 @@ def _(
 
 
 
-import torch
-from torch import Tensor
-import gemm_cutlass
-
-
 @torch.library.custom_op(
     "int8_ops::rmsnorm_quant",
     mutates_args=(),
@@ -236,4 +181,141 @@ def _(
         dtype=torch.float32,
     )
 
+    return y, scale_y
+
+
+@torch.library.custom_op(
+    "int8_ops::w8a8_matmul",
+    mutates_args=(),
+    device_types="cuda",
+)
+def w8a8_matmul(
+    A: Tensor,
+    B: Tensor,
+    scale_A: Tensor,
+    scale_B: Tensor,
+) -> Tensor:
+
+    return gemm_cutlass.func_w8a8_matmul(
+        A,
+        B,
+        scale_A,
+        scale_B,
+    )
+
+
+@w8a8_matmul.register_fake
+def _(
+    A: Tensor,
+    B: Tensor,
+    scale_A: Tensor,
+    scale_B: Tensor,
+) -> Tensor:
+
+    # A: [M, K] INT8
+    # B: [N, K] INT8
+    # C = A @ B.T -> [M, N]
+
+    M = A.shape[0]
+    N = B.shape[0]
+
+    # Assuming the CUDA kernel returns BF16
+    C = torch.empty(
+        (M, N),
+        device=A.device,
+        dtype=torch.bfloat16,
+    )
+
+    return C
+
+
+@torch.library.custom_op(
+    "int8_ops::quantize_i8_smooth",
+    mutates_args=(),
+    device_types="cuda",
+)
+def quantize_i8_smooth(
+    x: Tensor,
+    smooth: Tensor,
+) -> tuple[Tensor, Tensor]:
+
+    return gemm_cutlass.func_quantize_row_int8_with_smooth_cuda(
+        x,
+        smooth,
+    )
+
+
+@quantize_i8_smooth.register_fake
+def _(
+    x: Tensor,
+    smooth: Tensor,
+) -> tuple[Tensor, Tensor]:
+
+    # x: [M, K], BF16
+    # smooth: [K], FP32
+
+    y = torch.empty(
+        x.shape,
+        device=x.device,
+        dtype=torch.int8,
+    )
+
+    scale_y = torch.empty(
+        x.shape[:-1],
+        device=x.device,
+        dtype=torch.float32,
+    )
+
+    return y, scale_y
+
+
+# Replace your existing rope_int8 definition and its register_fake in custom_ops.py
+# Requires the updated gemm_cutlass.func_apply_rope_int8 binding that accepts
+# a final bool argument return_bf16 (default False).
+
+import torch
+from torch import Tensor
+import gemm_cutlass
+
+
+@torch.library.custom_op(
+    "int8_ops::rope_int8",
+    mutates_args=(),
+    device_types="cuda",
+)
+def rope_int8(
+    x: Tensor,
+    scale_x: Tensor,
+    cos: Tensor,
+    scale_cos: Tensor,
+    sin: Tensor,
+    scale_sin: Tensor,
+    return_bf16: bool = False,
+) -> tuple[Tensor, Tensor]:
+    return gemm_cutlass.func_apply_rope_int8(
+        x, scale_x, cos, scale_cos, sin, scale_sin, return_bf16
+    )
+
+
+@rope_int8.register_fake
+def _(
+    x: Tensor,
+    scale_x: Tensor,
+    cos: Tensor,
+    scale_cos: Tensor,
+    sin: Tensor,
+    scale_sin: Tensor,
+    return_bf16: bool = False,
+) -> tuple[Tensor, Tensor]:
+    y = torch.empty(
+        x.shape,
+        device=x.device,
+        dtype=torch.bfloat16 if return_bf16 else torch.int8,
+    )
+    scale_y = torch.empty(
+        x.shape[:-1],
+        device=x.device,
+        dtype=torch.float32,
+    )
+    # With return_bf16=True the real CUDA kernel writes scale_y == 1.
     return y, scale_y

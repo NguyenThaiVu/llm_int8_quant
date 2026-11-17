@@ -89,57 +89,6 @@ def _(
     return y, scale_y
 
 
-
-@torch.library.custom_op(
-    "int8_ops::rope_int8",
-    mutates_args=(),
-    device_types="cuda",
-)
-def rope_int8(
-    x: Tensor,
-    scale_x: Tensor,
-    cos: Tensor,
-    scale_cos: Tensor,
-    sin: Tensor,
-    scale_sin: Tensor,
-) -> tuple[Tensor, Tensor]:
-
-    return gemm_cutlass.func_apply_rope_int8(
-        x,
-        scale_x,
-        cos,
-        scale_cos,
-        sin,
-        scale_sin,
-    )
-
-
-@rope_int8.register_fake
-def _(
-    x: Tensor,
-    scale_x: Tensor,
-    cos: Tensor,
-    scale_cos: Tensor,
-    sin: Tensor,
-    scale_sin: Tensor,
-) -> tuple[Tensor, Tensor]:
-
-    y = torch.empty(
-        x.shape,
-        device=x.device,
-        dtype=torch.int8,
-    )
-
-    scale_y = torch.empty(
-        x.shape[:-1],
-        device=x.device,
-        dtype=torch.float32,
-    )
-
-    return y, scale_y
-
-
-
 # ============================================================
 # Fused W8A8O8 GEMM
 # ============================================================
@@ -163,29 +112,23 @@ def w8a8o8_matmul_fusion(
         col_scale,
     )
 
-
 @w8a8o8_matmul_fusion.register_fake
-def _(
-    x: Tensor,
-    weight: Tensor,
-    row_scale: Tensor,
-    col_scale: Tensor,
-) -> Tensor:
+def _(x, weight, row_scale, col_scale):
+    assert x.ndim in (2, 3, 4)
+    assert weight.ndim in (2, 3, 4)
+    assert x.shape[-1] == weight.shape[-1]
 
-    # x:      [M, K] INT8
-    # weight: [N, K] INT8
-    # y:      [M, N] INT8
+    batch_shape = torch.broadcast_shapes(
+        x.shape[:-2],
+        weight.shape[:-2]
+    )
 
-    M = x.shape[0]
-    N = weight.shape[0]
-
-    y = torch.empty(
-        (M, N),
+    return torch.empty(
+        (*batch_shape, x.shape[-2], weight.shape[-2]),
         device=x.device,
         dtype=torch.int8,
     )
 
-    return y
 
 
 
@@ -255,28 +198,20 @@ def w8a8_matmul(
 
 
 @w8a8_matmul.register_fake
-def _(
-    A: Tensor,
-    B: Tensor,
-    scale_A: Tensor,
-    scale_B: Tensor,
-) -> Tensor:
+def _(x, weight, scale_x, scale_w):
+    assert x.ndim in (2, 3, 4)
+    assert x.shape[-1] == weight.shape[-1]
 
-    # A: [M, K] INT8
-    # B: [N, K] INT8
-    # C = A @ B.T -> [M, N]
-
-    M = A.shape[0]
-    N = B.shape[0]
-
-    # Assuming the CUDA kernel returns BF16
-    C = torch.empty(
-        (M, N),
-        device=A.device,
-        dtype=torch.bfloat16,
+    batch_shape = torch.broadcast_shapes(
+        x.shape[:-2],
+        weight.shape[:-2]
     )
 
-    return C
+    return torch.empty(
+        (*batch_shape, x.shape[-2], weight.shape[-2]),
+        device=x.device,
+        dtype=torch.bfloat16  # Match actual CUDA output
+    )
 
 
 
@@ -322,4 +257,141 @@ def _(
         dtype=torch.float32,
     )
 
+    return y, scale_y
+
+
+
+@torch.library.custom_op(
+    "int8_ops::softmax_lastdim_int8_masking",
+    mutates_args=(),
+    device_types="cuda",
+)
+def softmax_lastdim_int8_masking(
+    x: Tensor,
+    scale_x: Tensor,
+    mask: Tensor,
+) -> tuple[Tensor, Tensor]:
+
+    return gemm_cutlass.func_softmax_lastdim_int8_masking(
+        x, scale_x, mask
+    )
+
+
+@softmax_lastdim_int8_masking.register_fake
+def _(
+    x: Tensor,
+    scale_x: Tensor,
+    mask: Tensor,
+) -> tuple[Tensor, Tensor]:
+
+    # x:       [..., S] INT8
+    # scale_x: [...] FP32
+    # mask:    broadcastable masking tensor
+    #
+    # y:       [..., S] INT8
+    # scale_y: [...] FP32
+
+    y = torch.empty(
+        x.shape,
+        device=x.device,
+        dtype=torch.int8,
+    )
+
+    scale_y = torch.empty(
+        x.shape[:-1],
+        device=x.device,
+        dtype=torch.float32,
+    )
+
+    return y, scale_y
+
+
+
+@torch.library.custom_op(
+    "int8_ops::dequant_transpose_requant",
+    mutates_args=(),
+    device_types="cuda",
+)
+def dequant_transpose_requant(
+    x: Tensor,
+    scale_x: Tensor,
+) -> tuple[Tensor, Tensor]:
+
+    return gemm_cutlass.func_dequant_transpose_requant(
+        x, scale_x
+    )
+
+
+@dequant_transpose_requant.register_fake
+def _(
+    x: Tensor,
+    scale_x: Tensor,
+) -> tuple[Tensor, Tensor]:
+
+    # x:       [H, T, D] INT8
+    # scale_x: [H, T] FP32
+    #
+    # y:       [H, D, T] INT8
+    # scale_y: [H, D] FP32
+
+    assert x.ndim == 3
+
+    H, T, D = x.shape
+
+    y = torch.empty(
+        (H, D, T),
+        device=x.device,
+        dtype=torch.int8,
+    )
+
+    scale_y = torch.empty(
+        (H, D),
+        device=x.device,
+        dtype=torch.float32,
+    )
+
+    return y, scale_y
+
+
+
+@torch.library.custom_op(
+    "int8_ops::rope_int8",
+    mutates_args=(),
+    device_types="cuda",
+)
+def rope_int8(
+    x: Tensor,
+    scale_x: Tensor,
+    cos: Tensor,
+    scale_cos: Tensor,
+    sin: Tensor,
+    scale_sin: Tensor,
+    return_bf16: bool = False,
+) -> tuple[Tensor, Tensor]:
+    return gemm_cutlass.func_apply_rope_int8(
+        x, scale_x, cos, scale_cos, sin, scale_sin, return_bf16
+    )
+
+
+@rope_int8.register_fake
+def _(
+    x: Tensor,
+    scale_x: Tensor,
+    cos: Tensor,
+    scale_cos: Tensor,
+    sin: Tensor,
+    scale_sin: Tensor,
+    return_bf16: bool = False,
+) -> tuple[Tensor, Tensor]:
+    y = torch.empty(
+        x.shape,
+        device=x.device,
+        dtype=torch.bfloat16 if return_bf16 else torch.int8,
+    )
+    scale_y = torch.empty(
+        x.shape[:-1],
+        device=x.device,
+        dtype=torch.float32,
+    )
+    # With return_bf16=True the real CUDA kernel writes scale_y == 1.
     return y, scale_y

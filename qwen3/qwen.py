@@ -21,15 +21,20 @@ USE_INSTRUCT_MODEL = False
 if (USE_BASE_MODEL + USE_REASONING_MODEL + USE_INSTRUCT_MODEL) != 1:
     raise AttributeError("Only one of the options above can be True.")
 
-CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
 MAX_NEW_TOKENS = PPL_CONTEXT_TOKENS = 2048  # Options: 2048, 4096, 8192
 EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
+USE_FLASH_ATTENTION = True  # Options: True, False
+USE_COMPILE = True  # Options: True, False
+print(f"[INFO] Using model: Qwen3-{CHOOSE_MODEL}. With Context size: {PPL_CONTEXT_TOKENS}.\
+    Compile: {USE_COMPILE}. Flash attention: {USE_FLASH_ATTENTION}.\n")
+
 if __name__ == "__main__":
     
     QWEN3_CONFIG = get_model_config(CHOOSE_MODEL)
-    model = Qwen3Model(QWEN3_CONFIG)
+    model = Qwen3Model(QWEN3_CONFIG, use_flash_attention=USE_FLASH_ATTENTION)
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -137,12 +142,12 @@ if __name__ == "__main__":
     # 3. Text generation
     # ================================================================
     model.eval()
-    model = torch.compile(model)
+    if USE_COMPILE:
+        model = torch.compile(model)
     
     dtypes = {p.dtype for p in model.parameters()}
     assert dtypes == {torch.bfloat16}
-    print("\n[INFO] BF16 model loaded successfully.")
-    print(f"[INFO] Model compiled successfully. Start evaluation... \n")
+    print("\n[INFO] BF16 model loaded successfully. Start evaluation... \n")
 
     # list_prompts = ["What is the capital of VietNam?"]
     list_prompts = ["Briefly describe the Vietnames culture."]
@@ -177,20 +182,6 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     print(f"[INFO] Output tokens: {out_ids.shape}")
     
-    # Measure latency
-    n_iter = 10
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    with torch.no_grad():
-        for _ in range(n_iter):
-            out_ids = model(input_ids)
-    end_event.record()
-    torch.cuda.synchronize()
-    elapsed_time_ms = start_event.elapsed_time(end_event)
-    avg_latency_ms = elapsed_time_ms / n_iter
-    print(f"[INFO] Average latency over {n_iter} iterations: {avg_latency_ms:.2f} ms")
-    
     # Profiler to check each kernel execution time
     with torch.profiler.profile(
         activities=[
@@ -206,23 +197,23 @@ if __name__ == "__main__":
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
     
     # Measure power consumption
-    measure_power(model, input_ids, n_iterations=10)
+    measure_power(model, input_ids, n_iterations=200)
     
     # ================================================================
     # 4. Perplexity evaluation on Wikitext-103
     # ================================================================
-    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET, split="validation")
+    # samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET, split="validation")
 
-    ppl = compute_ppl_single_text(model,
-                                evaluation_tokenizer, 
-                                samples,
-                                context_size=PPL_CONTEXT_TOKENS,
-                                stride=PPL_STRIDE)
-    print(f"\nPPL (BF16): {ppl} \n")
-    print(f"Model Information: ")
-    print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    print(f"Context size: {PPL_CONTEXT_TOKENS}")
-    print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")
+    # ppl = compute_ppl_single_text(model,
+    #                             evaluation_tokenizer, 
+    #                             samples,
+    #                             context_size=PPL_CONTEXT_TOKENS,
+    #                             stride=PPL_STRIDE)
+    # print(f"\nPPL (BF16): {ppl} \n")
+    # print(f"Model Information: ")
+    # print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    # print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    # print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")
     
     # # ================================================================
     # # 5. ARC-Easy evaluation

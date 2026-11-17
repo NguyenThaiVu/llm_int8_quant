@@ -23,6 +23,7 @@ from utils_model_quan import compute_smooth_alpha, PerChannelAbsMaxObserver
 from utils_power import measure_power
 
 import gemm_cutlass
+import custom_ops
     
 # Select which model to use via the following flag; only one can be True
 USE_BASE_MODEL = True
@@ -31,14 +32,16 @@ USE_INSTRUCT_MODEL = False
 if (USE_BASE_MODEL + USE_REASONING_MODEL + USE_INSTRUCT_MODEL) != 1:
     raise AttributeError("Only one of the options above can be True.")
 
-CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
     
 MAX_NEW_TOKENS = PPL_CONTEXT_TOKENS = 2048
 EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 USE_COMPILE = True  
+USE_FLASH_ATTENTION = True  
 
-print(f"[INFO] Using model: Qwen3-{CHOOSE_MODEL}. With Context size: {PPL_CONTEXT_TOKENS}. Compile: {USE_COMPILE}.")
+print(f"[INFO] Using model: Qwen3-{CHOOSE_MODEL}. With Context size: {PPL_CONTEXT_TOKENS}.\
+    Compile: {USE_COMPILE}. Flash attention: {USE_FLASH_ATTENTION}.\n")
 
 
 class SmoothQuant_Linear(nn.Module):
@@ -98,7 +101,8 @@ class SmoothQuant_Linear(nn.Module):
             row_scale = scale_x 
             col_scale = self.scale_w.expand(self.out_features)
             
-            out = gemm_cutlass.func_w8a8_matmul(x, self.weight_q, row_scale, col_scale)
+            # out = gemm_cutlass.func_w8a8_matmul(x, self.weight_q, row_scale, col_scale)
+            out = custom_ops.w8a8_matmul(x, self.weight_q, row_scale, col_scale)
             
             return out
         
@@ -138,13 +142,14 @@ class SmoothQuant_RMSNorm(nn.Module):
             return y.to(x.dtype)
         else:
             if self.is_smooth_scale == False:
-                dummy_scale = torch.ones(self.emb_dim, dtype=torch.float32, device=x.device)
-                y_int8, scale_y = gemm_cutlass.func_rmsnorm_bf16_to_int8(x, self.weight,\
-                                                dummy_scale, self.eps)
+                y = F.rms_norm(x, normalized_shape=self.normalized_shape,\
+                                weight=self.weight, eps=self.eps)
+                y_i8, scale_y = gemm_cutlass.func_quantize_i8(y)
             else:
-                y_int8, scale_y = gemm_cutlass.func_rmsnorm_bf16_to_int8(x, self.weight,\
-                                                self.smooth_scale, self.eps)
-            return y_int8, scale_y
+                y = F.rms_norm(x, normalized_shape=self.normalized_shape,\
+                                weight=self.weight, eps=self.eps)
+                y_i8, scale_y = gemm_cutlass.func_quantize_i8_smooth_cuda(y, self.smooth_scale)
+            return y_i8, scale_y
     
     
     def finish_calibration(self):
@@ -175,10 +180,8 @@ class SmoothQuant_Silu_Mul(nn.Module):
             return y
         else:
             if self.is_smooth_scale == False:
-                dummy_smooth_scale = torch.ones(self.embed_dim, dtype=torch.float32, device=x1.device)
                 y = F.silu(x1) * x2
-                y_smooth = y / dummy_smooth_scale
-                y_i8, scale_y = gemm_cutlass.func_quantize_i8(y_smooth)
+                y_i8, scale_y = gemm_cutlass.func_quantize_i8(y)
             else:
                 y = F.silu(x1) * x2
                 y_smooth = y / self.smooth_scale
@@ -331,11 +334,7 @@ class SmoothQuant_GroupedQueryAttention(nn.Module):
             # 3. Apply RoPE
             queries = apply_rope(queries, cos, sin)
             keys = apply_rope(keys, cos, sin)
-
-            # 4. Expand K and V to match number of heads
-            keys = keys.repeat_interleave(self.group_size, dim=0)
-            values = values.repeat_interleave(self.group_size, dim=0)
-
+        
             # # 5. Attention
             # attn_scores = queries @ keys.transpose(1, 2)
             # attn_scores = attn_scores.masked_fill(mask, -torch.inf)
@@ -345,17 +344,32 @@ class SmoothQuant_GroupedQueryAttention(nn.Module):
             # context = attn_weights @ values  # Shape: (num_heads, num_tokens, head_dim)
             # context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
             
-            context = F.scaled_dot_product_attention(
-                        queries.unsqueeze(0),
-                        keys.unsqueeze(0),
-                        values.unsqueeze(0),
-                            is_causal=True,
-                            enable_gqa=True).squeeze(0)
+            if USE_FLASH_ATTENTION:
+                context = F.scaled_dot_product_attention(
+                            queries.unsqueeze(0),
+                            keys.unsqueeze(0),
+                            values.unsqueeze(0),
+                                is_causal=True,
+                                enable_gqa=True).squeeze(0)
+            else:
+                keys = keys.repeat_interleave(self.group_size, dim=0)
+                values = values.repeat_interleave(self.group_size, dim=0)
+                
+                # attn_scores = queries @ keys.transpose(1, 2)
+                query_i8, scale_query = gemm_cutlass.func_quantize_i8(queries)
+                key_i8, scale_key = gemm_cutlass.func_quantize_i8(keys)
+                attn_scores = custom_ops.w8a8_matmul(query_i8, key_i8, scale_query, scale_key)
+                
+                attn_scores = attn_scores.masked_fill(mask, -torch.inf)
+                attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
+                
+                attn_weights_i8, scale_attn = gemm_cutlass.func_quantize_i8(attn_weights)
+                values_i8, scale_values = gemm_cutlass.func_quantize_i8(values)
+                context = custom_ops.w8a8_matmul(attn_weights_i8, values_i8, scale_attn, scale_values)
             
             # Smooth quantization for output activation of attention
             context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
-            context_smooth = context / self.out_proj.smooth_alpha
-            context_i8, scale_context = gemm_cutlass.func_quantize_i8(context_smooth)
+            context_i8, scale_context = gemm_cutlass.func_quantize_i8_smooth_cuda(context, self.out_proj.smooth_alpha)
             
             out = self.out_proj(context_i8, scale_context)
             return out
@@ -642,7 +656,7 @@ if __name__ == "__main__":
 
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=50))
     
-    measure_power(model, input_ids, n_iterations=100)
+    measure_power(model, input_ids, n_iterations=200)
     
     
     # # ================================================================

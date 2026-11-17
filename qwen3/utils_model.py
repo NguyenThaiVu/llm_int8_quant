@@ -82,7 +82,7 @@ def apply_rope(x, cos, sin):
 
 class SmoothQuant_GroupedQueryAttention(nn.Module):
     def __init__(
-        self, d_in, num_heads, num_kv_groups, head_dim=None, qk_norm=False, dtype=None
+        self, d_in, num_heads, num_kv_groups, head_dim=None, qk_norm=False, dtype=None, use_flash_attention=False
     ):
         super().__init__()
         assert num_heads % num_kv_groups == 0, "num_heads must be divisible by num_kv_groups"
@@ -109,6 +109,8 @@ class SmoothQuant_GroupedQueryAttention(nn.Module):
             self.k_norm = RMSNorm(head_dim, eps=1e-6)
         else:
             self.q_norm = self.k_norm = None
+        
+        self.use_flash_attention = use_flash_attention
 
     def forward(self, x, mask, cos, sin):
         num_tokens, _ = x.shape
@@ -132,7 +134,7 @@ class SmoothQuant_GroupedQueryAttention(nn.Module):
         queries = apply_rope(queries, cos, sin)
         keys = apply_rope(keys, cos, sin)
 
-        if 1:
+        if self.use_flash_attention:
             context = F.scaled_dot_product_attention(
                                     queries.unsqueeze(0),
                                     keys.unsqueeze(0),
@@ -157,7 +159,7 @@ class SmoothQuant_GroupedQueryAttention(nn.Module):
         return self.out_proj(context)
     
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, use_flash_attention=False):
         super().__init__()
         self.att = SmoothQuant_GroupedQueryAttention(
             d_in=cfg["emb_dim"],
@@ -165,7 +167,8 @@ class TransformerBlock(nn.Module):
             head_dim=cfg["head_dim"],
             num_kv_groups=cfg["n_kv_groups"],
             qk_norm=cfg["qk_norm"],
-            dtype=cfg["dtype"]
+            dtype=cfg["dtype"],
+            use_flash_attention=use_flash_attention
         )
         self.ff = FeedForward(cfg)
         self.norm1 = RMSNorm(cfg["emb_dim"], eps=1e-6)
@@ -187,13 +190,13 @@ class TransformerBlock(nn.Module):
         return x
     
 class Qwen3Model(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, use_flash_attention=True):
         super().__init__()
 
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
 
         self.trf_blocks = nn.ModuleList(  # ModuleList since Sequential can only accept one input, and we need `x, mask, cos, sin`
-            [TransformerBlock(cfg) for i in range(cfg["n_layers"])]
+            [TransformerBlock(cfg, use_flash_attention) for i in range(cfg["n_layers"])]
         )
         
         self.final_norm = RMSNorm(cfg["emb_dim"])

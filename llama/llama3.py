@@ -17,7 +17,7 @@ from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text,
 from utils_power import measure_power
 
 
-LLAMA_SIZE_STR = "1B" # "1B" or "3B"
+LLAMA_SIZE_STR = "3B" # "1B" or "3B"
 IS_INSTRUCT = True # True or False
 
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
@@ -104,7 +104,7 @@ print(f"[INFO] Weights loaded successfully.\n")
 MAX_GENERATED_TOKENS = 2048
 PPL_CONTEXT_TOKENS = 2048
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-EVALUATION_DATASET = 'wikitext-2' # "wikitext-2" or "wikitext-103"
+EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
 
 list_prompts = ["What is the capital of Vietnam?",]
 
@@ -151,20 +151,6 @@ for _ in range(5):
         _ = model(input_ids)
 torch.cuda.synchronize()    
 
-# Measure latency 
-n_iter = 10
-start_event = torch.cuda.Event(enable_timing=True)
-end_event = torch.cuda.Event(enable_timing=True)
-start_event.record()
-with torch.no_grad():
-    for _ in range(n_iter):
-        out_ids = model(input_ids)
-end_event.record()
-torch.cuda.synchronize()
-elapsed_time_ms = start_event.elapsed_time(end_event)
-avg_latency_ms = elapsed_time_ms / n_iter
-print(f"[INFO] Average model latency over {n_iter} iterations: {avg_latency_ms:.4f} ms.")
-
 # Profiler to measure latency and memory usage
 with torch.profiler.profile(
     activities=[
@@ -180,7 +166,7 @@ with torch.profiler.profile(
 print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
 
 # Measure power consumption
-measure_power(model, input_ids, n_iterations=10)
+measure_power(model, input_ids, n_iterations=100)
     
 # # ===============================================
 # # 5. ARC-Easy evaluation
