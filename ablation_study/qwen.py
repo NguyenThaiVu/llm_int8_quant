@@ -26,8 +26,8 @@ MAX_NEW_TOKENS = PPL_CONTEXT_TOKENS = 2048  # Options: 2048, 4096, 8192
 EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 
-USE_FLASH_ATTENTION = True  # Options: True, False
-USE_COMPILE = True  # Options: True, False
+USE_FLASH_ATTENTION = False  # Options: True, False
+USE_COMPILE = False  # Options: True, False
 print(f"[INFO] Using model: Qwen3-{CHOOSE_MODEL}. With Context size: {PPL_CONTEXT_TOKENS}.\
     Compile: {USE_COMPILE}. Flash attention: {USE_FLASH_ATTENTION}.\n")
 
@@ -150,7 +150,7 @@ if __name__ == "__main__":
     print("\n[INFO] BF16 model loaded successfully. Start evaluation... \n")
 
     # list_prompts = ["What is the capital of VietNam?"]
-    list_prompts = ["Briefly describe the Vietnames culture."]
+    list_prompts = ["Briefly describe the Eiffel Tower in Paris."]
 
     for idx, prompt in enumerate(list_prompts):
         input_token_ids = tokenizer.encode(prompt)

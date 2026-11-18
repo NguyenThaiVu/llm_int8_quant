@@ -22,6 +22,7 @@ from utils_quant import *
 from utils_model_quan import compute_smooth_alpha, PerChannelAbsMaxObserver
 from utils_model import compute_rope_params, apply_rope
 import gemm_cutlass
+import custom_ops
 
 from utils_evaluation import load_wikitext_single_text, compute_ppl_single_text, evaluate_arc, evaluate_piqa
 from utils_power import measure_power
@@ -29,12 +30,14 @@ from utils_power import measure_power
 
 LLAMA_SIZE_STR = "3B" # "1B" or "3B"
 IS_INSTRUCT = True # True or False
-MAX_GENERATED_TOKENS = PPL_CONTEXT_TOKENS = 4096
+MAX_GENERATED_TOKENS = PPL_CONTEXT_TOKENS = 2048
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
 
-USE_COMPILE = True # True or False. If True, use torch.compile to optimize the model for inference.
-print(f"[INFO] Using model: LLaMA 3.2 {LLAMA_SIZE_STR} Instruct. With Context size: {PPL_CONTEXT_TOKENS}. Compile: {USE_COMPILE}.")
+USE_COMPILE = True 
+USE_FLASH_ATTENTION = False
+print(f"[INFO] Using model: LLaMA 3.2 {LLAMA_SIZE_STR} Instruct. With Context size: {PPL_CONTEXT_TOKENS}.\
+    Compile: {USE_COMPILE}. Flash Attention: {USE_FLASH_ATTENTION}.")
 
 
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
@@ -349,34 +352,40 @@ class SmoothQuant_GroupedQueryAttention(nn.Module):
             keys = apply_rope(keys, cos, sin)
             queries = apply_rope(queries, cos, sin)
 
-            # Expand keys and values to match the number of heads
-            # Shape: (num_heads, num_tokens, head_dim)
-            keys = keys.repeat_interleave(self.group_size, dim=0)  
-            values = values.repeat_interleave(self.group_size, dim=0)
-
-            # # 5. Attention
-            # attn_scores = queries @ keys.transpose(1, 2)
-            # attn_scores = attn_scores.masked_fill(mask, -torch.inf)
-            # attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
-
-            # # 6. Context computation
-            # context = attn_weights @ values  # Shape: (num_heads, num_tokens, head_dim)
-            # context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
+            if USE_FLASH_ATTENTION:
+                context = F.scaled_dot_product_attention(
+                            queries.unsqueeze(0),
+                            keys.unsqueeze(0),
+                            values.unsqueeze(0),
+                                is_causal=True,
+                                enable_gqa=True).squeeze(0)
+            else:
+                keys = keys.repeat_interleave(self.group_size, dim=0)
+                values = values.repeat_interleave(self.group_size, dim=0)
+                
+                # attn_scores = queries @ keys.transpose(1, 2)
+                query_i8, scale_query = custom_ops.quantize_i8(queries)
+                key_i8, scale_key = custom_ops.quantize_i8(keys)
+                attn_scores = custom_ops.w8a8_matmul(query_i8, key_i8, scale_query, scale_key)
+                
+                attn_scores = attn_scores.masked_fill(mask, -torch.inf)
+                attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
+                
+                attn_weights_i8, scale_attn = custom_ops.quantize_i8(attn_weights)
+                values_t = values.transpose(1, 2).contiguous()
+                values_i8, scale_values = custom_ops.quantize_i8(values_t)
+                context = custom_ops.w8a8_matmul(attn_weights_i8, values_i8, scale_attn, scale_values)
             
-            context = F.scaled_dot_product_attention(
-                        queries.unsqueeze(0),
-                        keys.unsqueeze(0),
-                        values.unsqueeze(0),
-                            is_causal=True,
-                            enable_gqa=True).squeeze(0)
-            
-            # Smooth quantization for output activation of attention
+            # Output projection (shared by both paths)
             context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
+
+            # SmoothQuant
             context_smooth = context / self.out_proj.smooth_alpha
             context_i8, scale_context = gemm_cutlass.func_quantize_i8(context_smooth)
 
-            context_vec = self.out_proj(context_i8, scale_context)  
+            context_vec = self.out_proj(context_i8, scale_context)
             return context_vec
+
             
     def finish_calibration(self):
         self.W_query.finish_calibration()
@@ -537,19 +546,19 @@ print(f"[INFO] Weights loaded successfully.\n")
 # ===============================================
 # 4. Generate Text
 # ===============================================
-list_prompts = ["What is the capital of France?"]
+# list_prompts = ["What is the capital of France?"]
 
-for prompt in list_prompts:
-    token_ids = generate(
-        model=model,
-        idx=text_to_token_ids(prompt, tokenizer).to(device),
-        max_new_tokens=MAX_GENERATED_TOKENS,
-        context_size=LLAMA32_CONFIG["context_length"],
-        top_k=1,
-    )
+# for prompt in list_prompts:
+#     token_ids = generate(
+#         model=model,
+#         idx=text_to_token_ids(prompt, tokenizer).to(device),
+#         max_new_tokens=MAX_GENERATED_TOKENS,
+#         context_size=LLAMA32_CONFIG["context_length"],
+#         top_k=1,
+#     )
 
-    output_text = token_ids_to_text(token_ids, tokenizer)
-    print("\nResponse:\n", clean_text(output_text))
+#     output_text = token_ids_to_text(token_ids, tokenizer)
+#     print("\nResponse:\n", clean_text(output_text))
     
 # # =================================================
 # Quantization
@@ -560,7 +569,7 @@ calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,
 calibrate_tokens = tokenizer.encode(calibrate_samples)
 print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
         
-# for i in range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE):
+        
 for i in tqdm(range(0, len(calibrate_tokens) - PPL_CONTEXT_TOKENS + 1, PPL_STRIDE)):
     chunk_tokens = calibrate_tokens[i:i + PPL_CONTEXT_TOKENS]
 
@@ -580,20 +589,20 @@ else:
 # # ================================================
 # # Evaluation
 # # ===============================================
-# samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
+samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
 
-# ppl = compute_ppl_single_text(model,
-#                             tokenizer, 
-#                             samples,
-#                             context_size=PPL_CONTEXT_TOKENS,
-#                             stride=PPL_STRIDE)
+ppl = compute_ppl_single_text(model,
+                            tokenizer, 
+                            samples,
+                            context_size=PPL_CONTEXT_TOKENS,
+                            stride=PPL_STRIDE)
 
-# print()
-# print(f"\nPPL (SmoothQuant technique): {ppl} \n")
-# print(f"Evaluation Information:")
-# print(f"Model: LLaMA 3.2 {LLAMA_SIZE_STR} {'Instruct' if IS_INSTRUCT else 'Base'}")
-# print(f"Context size for evaluation: {PPL_CONTEXT_TOKENS}")
-# print(f"Dataset: {EVALUATION_DATASET}")
+print()
+print(f"\nPPL (SmoothQuant technique): {ppl} \n")
+print(f"Evaluation Information:")
+print(f"Model: LLaMA 3.2 {LLAMA_SIZE_STR} {'Instruct' if IS_INSTRUCT else 'Base'}")
+print(f"Context size for evaluation: {PPL_CONTEXT_TOKENS}")
+print(f"Dataset: {EVALUATION_DATASET}")
 
 # ===============================================
 # Measure Latency
@@ -624,8 +633,17 @@ with torch.profiler.profile(
         out_ids = model(input_ids)
 print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
 
-# Measure power consumption
-measure_power(model, input_ids, n_iterations=100)
+n_iter = 100
+start_time = time.perf_counter()
+for _ in range(n_iter):
+    with torch.no_grad():
+        out_ids = model(input_ids)
+torch.cuda.synchronize()
+end_time = time.perf_counter()
+avg_time = (end_time - start_time) / n_iter
+print(f"[INFO] Average inference time: {avg_time:.6f} seconds")
+
+measure_power(model, input_ids, n_iterations=n_iter)
 
 
 # # ===============================================

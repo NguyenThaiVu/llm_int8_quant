@@ -20,6 +20,18 @@ from utils_power import measure_power
 LLAMA_SIZE_STR = "3B" # "1B" or "3B"
 IS_INSTRUCT = True # True or False
 
+USE_COMPILE = True # True or False
+USE_FLASH_ATTENTION = False
+
+MAX_GENERATED_TOKENS = PPL_CONTEXT_TOKENS = 2048
+PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
+EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
+
+print(f"[INFO] Using model: LLaMA 3.2 {LLAMA_SIZE_STR} Instruct. With Context size: {PPL_CONTEXT_TOKENS}.\
+    Compile: {USE_COMPILE}. Flash Attention: {USE_FLASH_ATTENTION}.")
+
+
+
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
 
 if IS_INSTRUCT:
@@ -45,7 +57,7 @@ print(f"[INFO] Using model hub directory: {LOCAL_DIR}")
 # ===============================================
 # 1. Define Model Architecture
 # ===============================================
-model = Llama3Model(LLAMA32_CONFIG)
+model = Llama3Model(LLAMA32_CONFIG, use_flash_attention=USE_FLASH_ATTENTION)
 
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Total number of parameters: {total_params:,}")
@@ -101,29 +113,23 @@ print(f"[INFO] Weights loaded successfully.\n")
 # ===============================================
 # 4. Generate Text
 # ===============================================
-MAX_GENERATED_TOKENS = 2048
-PPL_CONTEXT_TOKENS = 2048
-PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
+# list_prompts = ["What is the capital of Vietnam?",]
 
-list_prompts = ["What is the capital of Vietnam?",]
+# for prompt in list_prompts:
+#     token_ids = generate(
+#         model=model,
+#         idx=text_to_token_ids(prompt, tokenizer).to(device),
+#         max_new_tokens=MAX_GENERATED_TOKENS,
+#         context_size=LLAMA32_CONFIG["context_length"],
+#         top_k=1,
+#     )
 
-for prompt in list_prompts:
-    token_ids = generate(
-        model=model,
-        idx=text_to_token_ids(prompt, tokenizer).to(device),
-        max_new_tokens=MAX_GENERATED_TOKENS,
-        context_size=LLAMA32_CONFIG["context_length"],
-        top_k=1,
-    )
-
-    output_text = token_ids_to_text(token_ids, tokenizer)
-    print("\nResponse:\n", clean_text(output_text))
+#     output_text = token_ids_to_text(token_ids, tokenizer)
+#     print("\nResponse:\n", clean_text(output_text))
     
 # ================================================
 # 5. Evaluation
 # ===============================================
-
 # samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
 
 # ppl = compute_ppl_single_text(model,
@@ -139,6 +145,13 @@ for prompt in list_prompts:
 # ===============================================
 # Measure Latency
 # ===============================================
+model.eval()
+if USE_COMPILE:
+    model = torch.compile(model)
+    print("[INFO] Model compiled successfully. Starting evaluation...")
+else:
+    print("[INFO] Starting evaluation without compilation...")
+    
 samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
 samples = tokenizer.encode(samples)
 chunk_tokens = samples[0:PPL_CONTEXT_TOKENS]
@@ -165,8 +178,18 @@ with torch.profiler.profile(
         out_ids = model(input_ids)
 print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
 
+n_iter = 100
+start_time = time.perf_counter()
+for _ in range(n_iter):
+    with torch.no_grad():
+        out_ids = model(input_ids)
+torch.cuda.synchronize()
+end_time = time.perf_counter()
+avg_time = (end_time - start_time) / n_iter
+print(f"[INFO] Average inference time: {avg_time:.6f} seconds")
+
 # Measure power consumption
-measure_power(model, input_ids, n_iterations=100)
+measure_power(model, input_ids, n_iterations=n_iter)
     
 # # ===============================================
 # # 5. ARC-Easy evaluation

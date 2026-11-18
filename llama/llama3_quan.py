@@ -25,10 +25,12 @@ LLAMA_SIZE_STR = "3B" # "1B" or "3B"
 MAX_GENERATED_TOKENS = PPL_CONTEXT_TOKENS = 2048
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
 EVALUATION_DATASET = 'wikitext-103' # "wikitext-2" or "wikitext-103"
-USE_COMPILE = True  # use torch.compile() to speed up inference
-USE_FLASH_ATTENTION = True  # use flash attention for faster inference
 
-print(f"[INFO] Using model: LLaMA 3.2 {LLAMA_SIZE_STR} Instruct. With Context size: {PPL_CONTEXT_TOKENS}. Compile: {USE_COMPILE}.")
+USE_COMPILE = True  # use torch.compile() to speed up inference
+USE_FLASH_ATTENTION = False  # use flash attention for faster inference
+
+print(f"\n[INFO] Using model: LLaMA 3.2 {LLAMA_SIZE_STR} Instruct. With Context size: {PPL_CONTEXT_TOKENS}.\
+    Compile: {USE_COMPILE}. FlashAttention: {USE_FLASH_ATTENTION}.\n")
 
 
 LLAMA32_CONFIG = get_llama_config(LLAMA_SIZE_STR)
@@ -51,146 +53,6 @@ print(f"[INFO] Path to model directory: {LOCAL_DIR}")
 # ===============================================
 # 1. Define Model Architecture
 # ===============================================
-# class Custom_GroupedQueryAttention(nn.Module):
-#     def __init__(
-#         self, d_in, num_heads, num_kv_groups, head_dim=None, dtype=None
-#     ):
-#         super().__init__()
-#         assert num_heads % num_kv_groups == 0, "num_heads must be divisible by num_kv_groups"
-
-#         self.num_heads = num_heads
-#         self.num_kv_groups = num_kv_groups
-#         self.group_size = num_heads // num_kv_groups
-
-#         if head_dim is None:
-#             assert d_in % num_heads == 0, "`d_in` must be divisible by `num_heads` if `head_dim` is not set"
-#             head_dim = d_in // num_heads
-
-#         self.head_dim = head_dim
-#         self.d_out = num_heads * head_dim
-#         self.inv_softmax_scale = 1 / (head_dim ** 0.5) 
-
-#         self.W_query = Custom_Linear(d_in, self.d_out).to(dtype)
-#         self.W_key = Custom_Linear(d_in, num_kv_groups * head_dim).to(dtype)
-#         self.W_value = Custom_Linear(d_in, num_kv_groups * head_dim).to(dtype)
-#         self.out_proj = Custom_Linear(self.d_out, d_in).to(dtype)
-
-#         self.query_rope = Custom_RoPE(num_heads, head_dim=head_dim).to(dtype)
-#         self.key_rope = Custom_RoPE(num_kv_groups, head_dim=head_dim).to(dtype)
-        
-#         self.softmax_layer = Custom_Softmax(num_heads=num_heads).to(dtype)    
-#         self.qk_score_layer = Custom_Matmul(num_heads=num_heads).to(dtype)
-#         self.context_layer = Custom_Matmul(num_heads=num_heads, is_return_float=True).to(dtype)
-    
-#         self.is_quantized = False
-
-#     def forward(self, x, scale_x, mask, cos, scale_cos, sin, scale_sin):
-#         num_tokens, _ = x.shape
-
-#         if self.is_quantized == False:  
-#             queries, _ = self.W_query(x, 1.0)
-#             keys, _ = self.W_key(x, 1.0)
-#             values, _ = self.W_value(x, 1.0)
-            
-#             # Reshape and transpose for multi-head attention
-#             queries = queries.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
-#             keys = keys.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
-#             values = values.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
-            
-#             # Apply RoPE to Q and K
-#             queries, _ = self.query_rope(queries, 1.0, cos, 1.0, sin, 1.0)
-#             keys, _ = self.key_rope(keys, 1.0, cos, 1.0, sin, 1.0)
-            
-#             keys = keys.repeat_interleave(self.group_size, dim=0)
-#             values = values.repeat_interleave(self.group_size, dim=0)
-            
-#             # Attention score 
-#             attn_scores, _ = self.qk_score_layer(queries, 1.0, keys, 1.0) 
-            
-#             # Softmax the attention scores
-#             attn_scores = attn_scores.masked_fill(mask, -torch.inf)
-#             attn_scores = attn_scores * self.inv_softmax_scale
-#             attn_weights, _ = self.softmax_layer(attn_scores, 1.0, 1.0)         
-            
-#             # Compute context
-#             values = values.transpose(1, 2)  # Shape: (num_heads, head_dim, num_tokens)
-#             context, _ = self.context_layer(attn_weights, 1.0, values, 1.0)
-            
-#             # Compute output
-#             context = context.transpose(0, 1).reshape(num_tokens, self.d_out) 
-#             out, _ = self.out_proj(context, 1.0)
-#         else: 
-#             # === Quantized computation ===
-#             x_int8 = x
-#             x_scale = scale_x
-            
-#             queries_int8, queries_scale = self.W_query(x_int8, x_scale)
-#             keys_int8, keys_scale = self.W_key(x_int8, x_scale)
-#             values_int8, values_scale = self.W_value(x_int8, x_scale)
-            
-#             # Reshape for multi-head 
-#             queries_int8 = queries_int8.view(num_tokens, self.num_heads, self.head_dim).transpose(0, 1)
-#             queries_scale = queries_scale.unsqueeze(0).expand(self.num_heads, -1)
-            
-#             keys_int8 = keys_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
-#             keys_scale = keys_scale.unsqueeze(0).expand(self.num_kv_groups, -1)
-
-#             values_int8 = values_int8.view(num_tokens, self.num_kv_groups, self.head_dim).transpose(0, 1)
-#             values_scale = values_scale.unsqueeze(0).expand(self.num_kv_groups, -1)
-            
-#             # Apply RoPE to quantized Q and K
-#             queries_int8, queries_scale = self.query_rope(queries_int8, queries_scale,\
-#                                         cos, scale_cos, sin, scale_sin)
-            
-#             keys_int8, keys_scale = self.key_rope(keys_int8, keys_scale,\
-#                                         cos, scale_cos, sin, scale_sin)
-            
-#             # Repeat K and V for grouped attention
-#             keys_int8 = keys_int8.repeat_interleave(self.group_size, dim=0)
-#             keys_scale = keys_scale.repeat_interleave(self.group_size, dim=0)
-#             values_int8 = values_int8.repeat_interleave(self.group_size, dim=0)
-#             values_scale = values_scale.repeat_interleave(self.group_size, dim=0)
-            
-#             # Attention score with quantization    
-#             attn_scores_int8, attn_scores_scale = self.qk_score_layer(queries_int8,\
-#                                                         queries_scale,\
-#                                                         keys_int8,\
-#                                                         keys_scale)
-            
-#             # Softmax the attention scores with quantization 
-#             attn_scores_scale = attn_scores_scale * self.inv_softmax_scale  # Adjust scale for softmax
-#             attn_weights_int8, attn_weights_scale = self.softmax_layer(attn_scores_int8,\
-#                                                     attn_scores_scale, mask)
-            
-#             # Compute context with quantization
-#             values_int8, values_scale = gemm_cutlass.func_dequant_transpose_requant(values_int8,\
-#                                                         values_scale)
-            
-#             context, _ = self.context_layer(attn_weights_int8,\
-#                                             attn_weights_scale,\
-#                                             values_int8,\
-#                                             values_scale)
-
-#             context = context.transpose(0, 1).reshape(num_tokens, self.d_out) 
-#             out, _ = self.out_proj(context, 1.0)  # Output float for better accuracy
-        
-#         return out
-    
-#     def finish_calibration(self):
-#         self.W_query.finish_calibration()
-#         # Key and Value use the same smooth alpha as Query
-#         smooth_query = self.W_query.smooth_alpha
-#         self.W_key.finish_calibration(alpha=smooth_query) 
-#         self.W_value.finish_calibration(alpha=smooth_query) 
-        
-#         self.query_rope.finish_calibration()
-#         self.key_rope.finish_calibration()
-#         self.softmax_layer.finish_calibration()
-#         self.qk_score_layer.finish_calibration()
-#         self.context_layer.finish_calibration()
-#         # self.out_proj.finish_calibration()
-#         self.is_quantized = True
-
 class Custom_GroupedQueryAttention_Hybrid(nn.Module):
     def __init__(
         self, d_in, num_heads, num_kv_groups, head_dim=None, dtype=None
@@ -214,7 +76,7 @@ class Custom_GroupedQueryAttention_Hybrid(nn.Module):
         self.W_query = Custom_Linear(d_in, self.d_out).to(dtype)
         self.W_key = Custom_Linear(d_in, num_kv_groups * head_dim).to(dtype)
         self.W_value = Custom_Linear(d_in, num_kv_groups * head_dim).to(dtype)
-        self.out_proj = Custom_Linear(self.d_out, d_in).to(dtype)
+        self.out_proj = Custom_Linear(self.d_out, d_in, is_return_float=True).to(dtype)
 
         self.query_rope = Custom_RoPE(num_heads, head_dim=head_dim).to(dtype)
         self.key_rope = Custom_RoPE(num_kv_groups, head_dim=head_dim).to(dtype)
@@ -286,31 +148,44 @@ class Custom_GroupedQueryAttention_Hybrid(nn.Module):
             keys_int8, keys_scale = self.key_rope(keys_int8, keys_scale,\
                                         cos, scale_cos, sin, scale_sin)
             
-            # --------------------------------------------------
-            # Hybrid boundary: INT8 -> BF16
-            # --------------------------------------------------
-            queries = (queries_int8.to(self.dtype) * queries_scale.unsqueeze(-1).to(self.dtype))
-            keys = (keys_int8.to(self.dtype) * keys_scale.unsqueeze(-1).to(self.dtype))
-            values = (values_int8.to(self.dtype) * values_scale.unsqueeze(-1).to(self.dtype))
+            if USE_FLASH_ATTENTION:
+                queries = (queries_int8.to(self.dtype) * queries_scale.unsqueeze(-1).to(self.dtype))
+                keys = (keys_int8.to(self.dtype) * keys_scale.unsqueeze(-1).to(self.dtype))
+                values = (values_int8.to(self.dtype) * values_scale.unsqueeze(-1).to(self.dtype))
 
-            queries = queries.unsqueeze(0)
-            keys = keys.unsqueeze(0)
-            values = values.unsqueeze(0)
+                queries = queries.unsqueeze(0)
+                keys = keys.unsqueeze(0)
+                values = values.unsqueeze(0)
 
-            # --------------------------------------------------
-            # FlashAttention / SDPA
-            # --------------------------------------------------
-            context = F.scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                dropout_p=0.0,
-                is_causal=True,
-                enable_gqa=True
-            )
+                context = F.scaled_dot_product_attention(
+                    queries,
+                    keys,
+                    values,
+                    dropout_p=0.0,
+                    is_causal=True,
+                    enable_gqa=True
+                ).squeeze(0)
+            else:
+                # Expand K/V heads
+                keys_int8 = keys_int8.repeat_interleave(self.group_size, dim=0)
+                keys_scale = keys_scale.repeat_interleave(self.group_size, dim=0)
+                values_int8 = values_int8.repeat_interleave(self.group_size, dim=0)
+                values_scale = values_scale.repeat_interleave(self.group_size, dim=0)
+
+                # QK^T
+                attn_scores_int8, attn_scores_scale = self.qk_score_layer(queries_int8, queries_scale,\
+                                                        keys_int8, keys_scale)
+                attn_scores_scale = attn_scores_scale * self.inv_softmax_scale
+
+                attn_weights_int8, attn_weights_scale = self.softmax_layer(attn_scores_int8,\
+                                                                            attn_scores_scale, mask)
+
+                values_int8, values_scale = gemm_cutlass.func_dequant_transpose_requant(values_int8, values_scale)
+
+                context, _ = self.context_layer(attn_weights_int8, attn_weights_scale,
+                    values_int8, values_scale)
 
             # [1, Hq, S, D] -> [S, Hq * D]
-            context = context.squeeze(0)
             context = context.transpose(0, 1).reshape(num_tokens, self.d_out)
 
             # Apply inverse SmoothQuant transformation
@@ -334,8 +209,6 @@ class Custom_GroupedQueryAttention_Hybrid(nn.Module):
         self.out_proj.finish_calibration()
         
         self.is_quantized = True
-
-    
 
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
@@ -564,26 +437,35 @@ if __name__ == "__main__":
             out_ids = model(input_ids)
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
     
-    # Measure power consumption
-    measure_power(model, input_ids, n_iterations=100)
+    n_iter = 100
+    start_time = time.perf_counter()
+    for _ in range(n_iter):
+        with torch.no_grad():
+            out_ids = model(input_ids)
+    torch.cuda.synchronize()
+    end_time = time.perf_counter()
+    avg_time = (end_time - start_time) / n_iter
+    print(f"[INFO] Average inference time: {avg_time:.6f} seconds")
+    
+    measure_power(model, input_ids, n_iterations=n_iter)
     
     # ========================================================================
     # Quantization text generation
     # ========================================================================
-    print("\n===== Generated text after quantization: =====\n")
-    list_prompts = ["What is the capital of VietNam?"]
+    # print("\n===== Generated text after quantization: =====\n")
+    # list_prompts = ["What is the capital of VietNam?"]
 
-    for prompt in list_prompts:
-        token_ids = generate(
-            model=model,
-            idx=text_to_token_ids(prompt, tokenizer).to(device),
-            max_new_tokens=MAX_GENERATED_TOKENS,
-            # context_size=LLAMA32_CONFIG["context_length"],
-            context_size=MAX_SEQ_LEN,
-            top_k=1)
+    # for prompt in list_prompts:
+    #     token_ids = generate(
+    #         model=model,
+    #         idx=text_to_token_ids(prompt, tokenizer).to(device),
+    #         max_new_tokens=MAX_GENERATED_TOKENS,
+    #         # context_size=LLAMA32_CONFIG["context_length"],
+    #         context_size=MAX_SEQ_LEN,
+    #         top_k=1)
 
-        output_text = token_ids_to_text(token_ids, tokenizer)
-        print("\nResponse:\n", clean_text(output_text)) 
+    #     output_text = token_ids_to_text(token_ids, tokenizer)
+    #     print("\nResponse:\n", clean_text(output_text)) 
     
     # ===============================================
     # PPL evaluation after quantization

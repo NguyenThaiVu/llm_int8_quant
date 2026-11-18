@@ -90,7 +90,8 @@ class GroupedQueryAttention(nn.Module):
     def __init__(
             self, d_in, d_out, num_heads,
             num_kv_groups,
-            dtype=None
+            dtype=None,
+            use_flash_attention=False
         ):
         super().__init__()
         assert d_out % num_heads == 0, "d_out must be divisible by num_heads"
@@ -107,6 +108,7 @@ class GroupedQueryAttention(nn.Module):
 
         self.W_query = nn.Linear(d_in, d_out, bias=False, dtype=dtype)
         self.out_proj = nn.Linear(d_out, d_out, bias=False, dtype=dtype)
+        self.use_flash_attention = use_flash_attention
 
     def forward(self, x, mask, cos, sin):
         # b, num_tokens, d_in = x.shape
@@ -145,7 +147,7 @@ class GroupedQueryAttention(nn.Module):
         # # Shape: (num_tokens, num_heads, head_dim)
         # context_vec = attn_weights @ values
         
-        if 1:
+        if self.use_flash_attention:
             context_vec = F.scaled_dot_product_attention(
                                     queries.unsqueeze(0),
                                     keys.unsqueeze(0),
@@ -174,14 +176,17 @@ class GroupedQueryAttention(nn.Module):
     
     
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, use_flash_attention=False):
         super().__init__()
+        self.use_flash_attention = use_flash_attention
+        
         self.att = GroupedQueryAttention(
             d_in=cfg["emb_dim"],
             d_out=cfg["emb_dim"],
             num_heads=cfg["n_heads"],
             num_kv_groups=cfg["n_kv_groups"],
-            dtype=cfg["dtype"]
+            dtype=cfg["dtype"],
+            use_flash_attention=self.use_flash_attention
         )
         self.ff = FeedForward(cfg)
         self.norm1 = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
@@ -204,13 +209,15 @@ class TransformerBlock(nn.Module):
     
     
 class Llama3Model(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, use_flash_attention=False):
         super().__init__()
 
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
 
+        self.use_flash_attention = use_flash_attention
+
         self.trf_blocks = nn.ModuleList(  
-            [TransformerBlock(cfg) for _ in range(cfg["n_layers"])]
+            [TransformerBlock(cfg, use_flash_attention=self.use_flash_attention) for _ in range(cfg["n_layers"])]
         )
 
         self.final_norm = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])

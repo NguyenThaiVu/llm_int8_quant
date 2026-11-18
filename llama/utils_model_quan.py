@@ -6,7 +6,7 @@ from utils_quant import *
 import gemm_cutlass
 import custom_ops
 
-MAX_SEQ_LEN = 2112 # 576 or 1040 or 2112
+MAX_SEQ_LEN = 8448 # 576 or 1040 or 2112 or 4224 or 8448
 BATCH_SIZE = 1 # 1, 4, 16, 64, 128
 
 

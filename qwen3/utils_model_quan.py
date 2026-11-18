@@ -803,8 +803,8 @@ class TransformerBlock_Quant(nn.Module):
         cos, sin = compute_rope_params(
             head_dim=head_dim,
             theta_base=cfg["rope_base"],
-            context_length=cfg["context_length"]
-            # context_length=MAX_SEQ_LEN
+            # context_length=cfg["context_length"]
+            context_length=MAX_SEQ_LEN
         )
         self.register_buffer("cos", cos.to(cfg["dtype"]))
         self.register_buffer("sin", sin.to(cfg["dtype"]))

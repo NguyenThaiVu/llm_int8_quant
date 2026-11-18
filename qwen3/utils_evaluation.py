@@ -54,7 +54,8 @@ def load_wikitext_single_text(dataset_name="wikitext-2", split="validation", n=N
     
     if n is not None:
         if n < len(dataset):
-            dataset = dataset.shuffle().select(range(n))
+            # dataset = dataset.shuffle().select(range(n))
+            dataset = dataset.select(range(n))
 
     text = "\n".join(x["text"] for x in dataset if x["text"].strip() != "")
     return text

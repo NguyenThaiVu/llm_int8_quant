@@ -27,11 +27,21 @@ CHOOSE_MODEL = "8B"  # Options: "4B", "8B", "14B"
 MAX_NEW_TOKENS = PPL_CONTEXT_TOKENS = 2048  # Options: 2048, 4096, 8192
 EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
 PPL_STRIDE = PPL_CONTEXT_TOKENS // 2
-USE_COMPILE = True  # Use torch.compile to speed up inference
-USE_FLASH_ATTENTION = True  # Use flash attention for faster inference
+
+USE_COMPILE = False  # Use torch.compile to speed up inference
+USE_FLASH_ATTENTION = False  # Use flash attention for faster inference
 
 print(f"[INFO] Using model: Qwen3-{CHOOSE_MODEL}. With Context size: {PPL_CONTEXT_TOKENS}.\
     Compile: {USE_COMPILE}. Flash attention: {USE_FLASH_ATTENTION}.\n")
+
+
+# Hyper-parameters for ablation study
+NO_QUANTIZE_SOFTMAX = False  
+NO_QUANTIZE_SILU = False  
+NO_QUANTIZE_NORM = True
+if (NO_QUANTIZE_SOFTMAX + NO_QUANTIZE_SILU + NO_QUANTIZE_NORM) > 1:
+    raise AttributeError("Only one of the ablation study options can be True.")
+
 
 class Qwen3Model_Quant(nn.Module):
     def __init__(self, cfg):
@@ -39,9 +49,37 @@ class Qwen3Model_Quant(nn.Module):
 
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
 
-        self.trf_blocks = nn.ModuleList(
-            [TransformerBlock_Quant(cfg, use_flash_attention=USE_FLASH_ATTENTION) for i in range(cfg["n_layers"])]
-        )
+        if NO_QUANTIZE_SOFTMAX:
+            from utils_model_quan_softmax import TransformerBlock_Quant_No_Softmax
+            
+            print(f"\n[INFO] Ablation study without quantize Softmax.\n")
+            
+            self.trf_blocks = nn.ModuleList(
+                [TransformerBlock_Quant_No_Softmax(cfg, use_flash_attention=USE_FLASH_ATTENTION) for i in range(cfg["n_layers"])]
+            )
+            
+        elif NO_QUANTIZE_SILU:
+            from utils_model_quan_silu import TransformerBlock_Quant_No_SiLU
+            
+            print(f"\n[INFO] Ablation study without quantize SiLU.\n")
+            
+            self.trf_blocks = nn.ModuleList(
+                [TransformerBlock_Quant_No_SiLU(cfg, use_flash_attention=USE_FLASH_ATTENTION) for i in range(cfg["n_layers"])]
+            )
+        
+        elif NO_QUANTIZE_NORM:
+            from utils_model_quan_norm import TransformerBlock_Quant_No_Norm
+            
+            print(f"\n[INFO] Ablation study without quantize Norm.\n")
+            
+            self.trf_blocks = nn.ModuleList(
+                [TransformerBlock_Quant_No_Norm(cfg, use_flash_attention=USE_FLASH_ATTENTION) for i in range(cfg["n_layers"])]
+            )
+            
+        else:
+            self.trf_blocks = nn.ModuleList(
+                [TransformerBlock_Quant(cfg, use_flash_attention=USE_FLASH_ATTENTION) for i in range(cfg["n_layers"])]
+            )
         
         self.final_norm = RMSNorm(cfg["emb_dim"])
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
@@ -177,7 +215,7 @@ if __name__ == "__main__":
     # ================================================================
     print("\nCollecting calibration for quantization...")
     calibrate_samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET,\
-                                            split="train", n=1_000)
+                                            split="train", n=10_000)
     calibrate_tokens = evaluation_tokenizer.encode(calibrate_samples)
     
     print(f"[INFO] Load calibration with {len(calibrate_tokens)} tokens.")
@@ -221,7 +259,7 @@ if __name__ == "__main__":
     #         "Which country has a capital city named Paris?",\
     #         f"Summarize the article {input_article} in 1 sentence and extract important information into JSON format.",\
     #         "Describe the Vietnames culture in detail."]
-    list_prompts = ["Describe the Vietnamese culture in briefly."]
+    list_prompts = ["Briefly describe the Eiffel Tower in Paris."]
 
     for idx, prompt in enumerate(list_prompts):
         input_token_ids = tokenizer.encode(prompt)
@@ -252,37 +290,37 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     print(f"[INFO] Output tokens: {out_ids.shape}")
     
-    # Profiler to measure latency and memory usage
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-    ) as prof:
-        with torch.no_grad():
-            out_ids = model(input_ids)
-    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
+    # # Profiler to measure latency and memory usage
+    # with torch.profiler.profile(
+    #     activities=[
+    #         torch.profiler.ProfilerActivity.CPU,
+    #         torch.profiler.ProfilerActivity.CUDA,
+    #     ],
+    #     record_shapes=True,
+    #     profile_memory=True,
+    #     with_stack=True
+    # ) as prof:
+    #     with torch.no_grad():
+    #         out_ids = model(input_ids)
+    # print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30))
     
     # Measure power consumption
-    measure_power(model, input_ids, n_iterations=200)
+    # measure_power(model, input_ids, n_iterations=200)
 
-    # # # ================================================================
-    # # # 5. PPL evaluation
-    # # # ================================================================
-    # samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET, split="validation")
-    # ppl = compute_ppl_single_text(model,
-    #                             evaluation_tokenizer,
-    #                             samples,
-    #                             context_size=PPL_CONTEXT_TOKENS,
-    #                             stride=PPL_STRIDE)
-    # print(f"\nPPL: {ppl}")
-    # print(f"Model Information: ")
-    # print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    # print(f"Context size: {PPL_CONTEXT_TOKENS}")
-    # print(f"Dataset evaluation: {EVALUATION_DATASET}")
+    # # ================================================================
+    # # 5. PPL evaluation
+    # # ================================================================
+    samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET, split="validation")
+    ppl = compute_ppl_single_text(model,
+                                evaluation_tokenizer,
+                                samples,
+                                context_size=PPL_CONTEXT_TOKENS,
+                                stride=PPL_STRIDE)
+    print(f"\nPPL: {ppl}")
+    print(f"Model Information: ")
+    print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    print(f"Dataset evaluation: {EVALUATION_DATASET}")
     
     # # ================================================================
     # # 6. ARC-Easy evaluation

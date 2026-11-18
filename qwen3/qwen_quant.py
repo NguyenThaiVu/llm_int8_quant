@@ -23,7 +23,7 @@ USE_INSTRUCT_MODEL = False
 if (USE_BASE_MODEL + USE_REASONING_MODEL + USE_INSTRUCT_MODEL) != 1:
     raise AttributeError("Only one of the options above can be True.")
 
-CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
 
 MAX_NEW_TOKENS = PPL_CONTEXT_TOKENS = 2048  # Options: 2048, 4096, 8192
 EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
@@ -222,21 +222,21 @@ if __name__ == "__main__":
     #         "Which country has a capital city named Paris?",\
     #         f"Summarize the article {input_article} in 1 sentence and extract important information into JSON format.",\
     #         "Describe the Vietnames culture in detail."]
-    list_prompts = ["Describe the Vietnamese culture in briefly."]
+    # list_prompts = ["Describe the Vietnamese culture in briefly."]
 
-    for idx, prompt in enumerate(list_prompts):
-        input_token_ids = tokenizer.encode(prompt)
-        input_token_ids_tensor = torch.tensor(input_token_ids, device=device)
+    # for idx, prompt in enumerate(list_prompts):
+    #     input_token_ids = tokenizer.encode(prompt)
+    #     input_token_ids_tensor = torch.tensor(input_token_ids, device=device)
 
-        generated_text = func_generate_text(
-            model=model,
-            token_ids=input_token_ids_tensor,
-            max_new_tokens=MAX_NEW_TOKENS,
-            eos_token_id=tokenizer.eos_token_id
-        )
+    #     generated_text = func_generate_text(
+    #         model=model,
+    #         token_ids=input_token_ids_tensor,
+    #         max_new_tokens=MAX_NEW_TOKENS,
+    #         eos_token_id=tokenizer.eos_token_id
+    #     )
 
-        response = get_clean_generated_text(generated_text, tokenizer)
-        print(f"{idx}. Generated response: {response} \n")
+    #     response = get_clean_generated_text(generated_text, tokenizer)
+    #     print(f"{idx}. Generated response: {response} \n")
         
     # ================================================================
     # 5. Measure latency

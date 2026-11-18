@@ -1,5 +1,5 @@
 /usr/local/cuda-12.4/nsight-compute-2024.1.1/ncu \
-  --kernel-name hierarchical_silu_int8_vec4_kernel \
+  --kernel-name softmax_int8_naive_kernel \
   --set full \
-  -o report_silu_int8 \
-  python NCU_silu.py
+  -o report_softmax_naive_int8 \
+  python ncu_softmax.py

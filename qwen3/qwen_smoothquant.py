@@ -33,7 +33,7 @@ USE_INSTRUCT_MODEL = False
 if (USE_BASE_MODEL + USE_REASONING_MODEL + USE_INSTRUCT_MODEL) != 1:
     raise AttributeError("Only one of the options above can be True.")
 
-CHOOSE_MODEL = "14B"  # Options: "4B", "8B", "14B"
+CHOOSE_MODEL = "4B"  # Options: "4B", "8B", "14B"
     
 MAX_NEW_TOKENS = PPL_CONTEXT_TOKENS = 2048
 EVALUATION_DATASET = "wikitext-103"  # Options: "wikitext-2", "wikitext-103"
@@ -613,16 +613,15 @@ if __name__ == "__main__":
     # # Evaluation PPL
     # # ===============================================
     samples = load_wikitext_single_text(dataset_name=EVALUATION_DATASET)
-
-    # ppl = compute_ppl_single_text(model,
-    #                             tokenizer, 
-    #                             samples,
-    #                             context_size=PPL_CONTEXT_TOKENS,
-    #                             stride=PPL_STRIDE)
-    # print(f"\nPPL (SmoothQuant technique): {ppl} \n")
-    # print(f"Model: Qwen3-{CHOOSE_MODEL}")
-    # print(f"Context size: {PPL_CONTEXT_TOKENS}")
-    # print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")
+    ppl = compute_ppl_single_text(model,
+                                tokenizer, 
+                                samples,
+                                context_size=PPL_CONTEXT_TOKENS,
+                                stride=PPL_STRIDE)
+    print(f"\nPPL (SmoothQuant technique): {ppl} \n")
+    print(f"Model: Qwen3-{CHOOSE_MODEL}")
+    print(f"Context size: {PPL_CONTEXT_TOKENS}")
+    print(f"Data used for PPL evaluation: {EVALUATION_DATASET}")
     
     # ================================================================
     # 3. Measure latency
@@ -667,7 +666,7 @@ if __name__ == "__main__":
     avg_time = (end_time - start_time) / n_iter
     print(f"[INFO] Average inference time: {avg_time:.6f} seconds")
 
-    measure_power(model, input_ids, n_iterations=200)
+    measure_power(model, input_ids, n_iterations=n_iter)
     
     # # ================================================================
     # # 5. ARC-Easy evaluation
